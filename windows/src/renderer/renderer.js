@@ -991,43 +991,42 @@ function nextCompositeFrame() {
   return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 }
 
-async function runCapsuleMorphTransition(mutate, firstRect) {
-  if (reduceMotion || !firstRect.width) {
+async function runCapsuleMorphTransition(mutate) {
+  if (reduceMotion) {
     mutate();
     await nextCompositeFrame();
     return;
   }
 
-  // SwiftUI replaces the full and mini views with a springy .72 scale +
-  // opacity transition. Chromium's width interpolation squeezed glyphs, so
-  // finish the rigid outgoing phase before swapping layouts, then grow the
-  // incoming rigid capsule from the same visual center. The zero-opacity
-  // layout swap prevents even one distorted or flashing frame.
+  // Keep the outgoing animation holding opacity at zero until the incoming
+  // animation has already taken ownership. The old implementation cancelled
+  // before the DOM swap had composited, exposing the mini ring for two frames.
+  // A non-overlapping handoff also avoids showing full and mini capsules at
+  // once, which reads as a bright circular flash on transparent Windows.
   const outgoing = elements.capsule.animate([
     { transform: "translate3d(0, 0, 0) scale(1)", opacity: 1 },
     { transform: "translate3d(0, 0, 0) scale(.72)", opacity: 0 }
   ], {
-    duration: 155,
-    easing: "cubic-bezier(.4,0,.7,1)",
+    duration: 150,
+    easing: "cubic-bezier(.4,0,.6,1)",
     fill: "both"
   });
   try { await outgoing.finished; }
   catch { /* A newer state change or window resize may cancel the animation. */ }
-  outgoing.cancel();
 
   mutate();
-  await nextCompositeFrame();
-  const lastRect = elements.capsule.getBoundingClientRect();
-  const deltaX = firstRect.left + firstRect.width / 2 - (lastRect.left + lastRect.width / 2);
-  const deltaY = firstRect.top + firstRect.height / 2 - (lastRect.top + lastRect.height / 2);
+  await new Promise((resolve) => requestAnimationFrame(resolve));
   const incoming = elements.capsule.animate([
-    { transform: `translate3d(${deltaX}px, ${deltaY}px, 0) scale(.72)`, opacity: 0 },
+    { transform: "translate3d(0, 0, 0) scale(.72)", opacity: 0 },
     { transform: "translate3d(0, 0, 0) scale(1)", opacity: 1 }
   ], {
-    duration: 185,
-    easing: "cubic-bezier(.16,.84,.24,1)",
+    duration: 190,
+    easing: "cubic-bezier(.16,1,.3,1)",
     fill: "both"
   });
+  try { await incoming.ready; }
+  catch { /* The animation can be superseded by a newer interaction. */ }
+  outgoing.cancel();
   try { await incoming.finished; }
   catch { /* A newer state change or window resize may cancel the animation. */ }
   incoming.cancel();
@@ -1061,7 +1060,6 @@ async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
 
   try {
     if (shouldMinimize) {
-      const firstRect = elements.capsule.getBoundingClientRect();
       // Keep the full stable surface available while the shared element moves
       // from the centered capsule to the right-edge mini anchor.
       if (typeof window.pulse.setWindowShape === "function") {
@@ -1073,7 +1071,7 @@ async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
         elements.miniCapsule.setAttribute("aria-hidden", "false");
         elements.capsule.setAttribute("aria-label", `${miniStyleLabels[miniStylePreference]}，双击恢复完整胶囊`);
         if (currentState) renderMini(currentState);
-      }, firstRect);
+      });
       await window.pulse.resize("mini");
       if (typeof window.pulse.setWindowShape === "function") {
         await window.pulse.setWindowShape([{ x: 0, y: 0, width: 88, height: 88 }]);
@@ -1090,13 +1088,12 @@ async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
         await window.pulse.setWindowShape([{ x: 0, y: 0, width: 390, height: 810 }]);
       }
       await nextCompositeFrame();
-      const firstRect = elements.capsule.getBoundingClientRect();
       await runCapsuleMorphTransition(() => {
         miniMode = false;
         root.classList.remove("mini-mode");
         elements.miniCapsule.setAttribute("aria-hidden", "true");
         elements.capsule.setAttribute("aria-label", "Codex-Pulse 悬浮胶囊");
-      }, firstRect);
+      });
       if (expandAfterRestore) {
         expanded = true;
         root.classList.add("detail-expanded");
@@ -1212,14 +1209,20 @@ let pendingDrag;
 let dragFrame;
 const magnet = { x: 0, y: 0, renderX: 0, renderY: 0, vx: 0, vy: 0, targetX: 0, targetY: 0, returning: false, frame: null, lastTime: 0 };
 
-function criticallyDampedStep(value, velocity, target, deltaSeconds, angularFrequency = 18) {
-  const displacement = value - target;
-  const decay = Math.exp(-angularFrequency * deltaSeconds);
-  const velocityTerm = velocity + angularFrequency * displacement;
-  return {
-    value: target + (displacement + velocityTerm * deltaSeconds) * decay,
-    velocity: (velocity - angularFrequency * velocityTerm * deltaSeconds) * decay
-  };
+function springStep(value, velocity, target, deltaSeconds, stiffness = 155, damping = 13) {
+  // SwiftUI uses interpolatingSpring(stiffness: 155, damping: 13) when the
+  // pointer leaves. Small fixed substeps keep the same soft return on 60–240Hz
+  // displays and after a delayed Windows compositor frame.
+  const steps = Math.max(1, Math.ceil(deltaSeconds / (1 / 120)));
+  const step = deltaSeconds / steps;
+  let nextValue = value;
+  let nextVelocity = velocity;
+  for (let index = 0; index < steps; index += 1) {
+    const acceleration = -stiffness * (nextValue - target) - damping * nextVelocity;
+    nextVelocity += acceleration * step;
+    nextValue += nextVelocity * step;
+  }
+  return { value: nextValue, velocity: nextVelocity };
 }
 
 function applyMagnetFrame(timestamp) {
@@ -1239,8 +1242,8 @@ function applyMagnetFrame(timestamp) {
     magnet.vx = 0;
     magnet.vy = 0;
   } else if (magnet.returning) {
-    const horizontal = criticallyDampedStep(magnet.x, magnet.vx, magnet.targetX, deltaSeconds);
-    const vertical = criticallyDampedStep(magnet.y, magnet.vy, magnet.targetY, deltaSeconds);
+    const horizontal = springStep(magnet.x, magnet.vx, magnet.targetX, deltaSeconds);
+    const vertical = springStep(magnet.y, magnet.vy, magnet.targetY, deltaSeconds);
     magnet.x = horizontal.value;
     magnet.y = vertical.value;
     magnet.vx = horizontal.velocity;
@@ -1259,13 +1262,12 @@ function applyMagnetFrame(timestamp) {
     || Math.abs(magnet.vx) > 0.35
     || Math.abs(magnet.vy) > 0.35;
   if (moving) {
-    // Align the complete capsule to physical pixels. This keeps the macOS
-    // rigid-body magnetic feel while avoiding Chromium's fractional-glyph
-    // blur at Windows 125/150/200% display scaling.
-    const scale = Math.max(1, Number(window.devicePixelRatio) || 1);
-    magnet.renderX = Math.round(magnet.x * scale) / scale;
-    magnet.renderY = Math.round(magnet.y * scale) / scale;
-    elements.capsule.style.transform = `translate3d(${magnet.renderX}px, ${magnet.renderY}px, 0)`;
+    // Preserve subpixel coordinates. Physical-pixel rounding made the capsule
+    // jump in 0.5/0.8px steps at common Windows scale factors. The individual
+    // translate property also keeps magnetic motion separate from morphing.
+    magnet.renderX = magnet.x;
+    magnet.renderY = magnet.y;
+    elements.capsule.style.translate = `${magnet.renderX.toFixed(3)}px ${magnet.renderY.toFixed(3)}px`;
     magnet.frame = requestAnimationFrame(applyMagnetFrame);
   } else if (magnet.targetX === 0 && magnet.targetY === 0) {
     magnet.x = 0;
@@ -1276,11 +1278,13 @@ function applyMagnetFrame(timestamp) {
     magnet.renderY = 0;
     magnet.returning = false;
     magnet.lastTime = 0;
-    elements.capsule.style.transform = "translate3d(0, 0, 0)";
+    elements.capsule.style.translate = "0px 0px";
+    elements.capsule.classList.remove("magnet-active");
   }
 }
 
 function scheduleMagnet() {
+  elements.capsule.classList.add("magnet-active");
   if (!magnet.frame) {
     magnet.lastTime = 0;
     magnet.frame = requestAnimationFrame(applyMagnetFrame);
@@ -1300,7 +1304,8 @@ function resetMagnet(immediate = false) {
     magnet.renderY = 0;
     magnet.returning = false;
     magnet.lastTime = 0;
-    elements.capsule.style.transform = "translate3d(0, 0, 0)";
+    elements.capsule.style.translate = "0px 0px";
+    elements.capsule.classList.remove("magnet-active");
   } else {
     scheduleMagnet();
   }

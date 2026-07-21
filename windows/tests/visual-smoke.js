@@ -466,7 +466,7 @@ async function assertPointerDoubleClickMinimizes() {
     }).length
   }))()`, true);
   if (!activeMiniTransition.transitioning || activeMiniTransition.capsuleAnimations < 1) {
-    throw new Error(`mini transition did not animate as rigid capsules: ${JSON.stringify(activeMiniTransition)}`);
+    throw new Error(`mini transition did not stay on the compositor morph layer: ${JSON.stringify(activeMiniTransition)}`);
   }
   const transitionImage = await window.webContents.capturePage();
   fs.writeFileSync(path.join(outputDirectory, "mini-transition-mid@2x.png"), transitionImage.toPNG());

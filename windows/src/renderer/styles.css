@@ -292,11 +292,13 @@ button, .no-drag { -webkit-app-region: no-drag; }
   position: relative;
   isolation: isolate;
   -webkit-app-region: no-drag;
+  translate: 0 0;
   transform: translate3d(0, 0, 0);
-  will-change: transform;
+  will-change: auto;
   contain: layout style;
   backface-visibility: hidden;
 }
+.capsule.magnet-active { will-change: translate; }
 .capsule::before {
   content: "";
   position: absolute;
