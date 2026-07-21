@@ -1,0 +1,49 @@
+# Xcode
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+build/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift PM
+.build/
+.swiftpm/
+Package.resolved
+
+# Node / Electron
+node_modules/
+windows/node_modules/
+windows/build/
+
+# Build and verification artifacts
+dist/
+output/
+*.dmg
+*.exe
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Secrets / local
+*.entitlements.local
+.fuse_hidden*
+**/.fuse_hidden*
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~

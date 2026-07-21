@@ -1,0 +1,13 @@
+{
+  "informationBarEnabled": true,
+  "weatherLocation": {
+    "id": 1809858,
+    "name": "广州",
+    "admin1": "广东",
+    "country": "中国",
+    "countryCode": "CN",
+    "latitude": 23.12908,
+    "longitude": 113.26436,
+    "timezone": "Asia/Shanghai"
+  }
+}

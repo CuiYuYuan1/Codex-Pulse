@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  主应用需要 spawn `codex app-server` 子进程并读写本机 Codex 状态。
+	  App Sandbox 会阻止执行任意二进制；MVP 关闭沙箱。
+	  后续可用 XPC helper / 用户安装的 privileged helper 再收紧。
+	  Widget 扩展仍保持沙箱 + App Group。
+	-->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.codexpulse.shared</string>
+	</array>
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-code:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: windows/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: node --check src/main.js
+      - run: node --check src/preload.js
+      - run: node --check src/renderer/renderer.js
+
+  macos-build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build without distribution signing
+        run: |
+          xcodebuild \
+            -project CodexPulse.xcodeproj \
+            -scheme CodexPulse \
+            -configuration Debug \
+            -derivedDataPath "$RUNNER_TEMP/CodexPulse-DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build

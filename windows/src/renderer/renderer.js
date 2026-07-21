@@ -1,0 +1,1668 @@
+const elements = Object.fromEntries([
+  "capsule", "detail", "miniCapsule", "miniRingProgress", "miniValue", "weatherScene", "weatherAnimation", "weatherSpacer", "statusDot", "quotaRing", "quotaArc", "remaining", "todayTokens", "chevron",
+  "informationStrip", "weatherMiniIcon", "weatherSummary", "informationLocation", "informationWeekday", "informationTime",
+  "email", "plan", "taskBadge", "connectionMessage", "chooseCodex", "resetTime",
+  "limitTitle", "progressTrack", "progressFill", "secondaryLimit", "cardsToggle", "cardsSummary", "cardsNearest", "cardsChevron",
+  "cardsList", "tokenChart", "chartValue", "todayDetail", "totalTokens", "totalMetricLabel", "taskElapsed", "taskMetricLabel",
+  "cliInfo", "refresh", "quit", "taskTunnel", "taskTunnelCanvas", "tunnelOutputLabel",
+  "activityBandToggle", "activityBandPicker", "activityBandStyle", "activityBandStyleLabel", "activityBandStyleMenu",
+  "themePicker", "themeStyle", "themeStyleLabel", "themeStyleMenu",
+  "miniStylePicker", "miniStyle", "miniStyleLabel", "miniStyleMenu",
+  "moreSettingsToggle", "appearanceSettings",
+  "informationBarToggle", "informationLocationButton", "informationLocationLabel", "locationChooser", "locationChooserClose", "locationSearch",
+  "locationSearchStatus", "locationResults", "updateVersion", "updateStatus", "checkUpdateButton"
+].map((id) => [id, document.getElementById(id)]));
+
+let expanded = false;
+let miniMode = false;
+let cardsExpanded = false;
+let currentState;
+let hoveredChartIndex = null;
+let chartFrame;
+let collapseTimer;
+let detailAnimationTimer;
+let detailTransitionGeneration = 0;
+let cardsSignature = "";
+let chartSignature = "";
+let tunnelFrame;
+let tunnelMode = "idle";
+let tunnelLastFrame = 0;
+let activityBandPreviewTimer;
+let locationSearchTimer;
+let locationSearchRequest = 0;
+let locationResults = [];
+let capsuleSingleClickTimer;
+let miniTransitioning = false;
+let collapsedWidthFrame;
+let collapsedWidthSettleTimer;
+let windowShapeFrame;
+let lastCollapsedWindowWidth;
+let adaptiveResizeInFlight = false;
+let adaptiveResizeReleaseTimer;
+
+const exactNumber = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 });
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+function readChartPalette() {
+  const styles = getComputedStyle(document.documentElement);
+  return {
+    blue: styles.getPropertyValue("--blue").trim() || "#1890ff",
+    muted: styles.getPropertyValue("--muted").trim() || "rgba(255,255,255,.5)",
+    line: styles.getPropertyValue("--line").trim() || "rgba(255,255,255,.1)"
+  };
+}
+let chartPalette = readChartPalette();
+const activityBandPreferenceKey = "codexPulse.activityBand";
+const activityBandStyles = new Set(["classic", "aurora", "lava", "neon", "mono"]);
+const activityBandLabels = Object.freeze({ classic: "经典", aurora: "极光", lava: "熔岩", neon: "霓虹", mono: "单色" });
+let activityBandPreference = loadActivityBandPreference();
+const themePreferenceKey = "codexPulse.theme";
+const themeStyles = new Set(["classic", "midnight", "graphite", "forest", "amethyst"]);
+const themeLabels = Object.freeze({
+  classic: "经典玻璃",
+  midnight: "午夜 HUD",
+  graphite: "石墨哑光",
+  forest: "森林柔雾",
+  amethyst: "紫晶棱镜"
+});
+let themePreference = loadThemePreference();
+const miniStylePreferenceKey = "codexPulse.miniStyle";
+const miniStyles = new Set(["quota", "tokens", "status", "weather", "time"]);
+const miniStyleLabels = Object.freeze({
+  quota: "剩余额度",
+  tokens: "今日 Token",
+  status: "任务状态",
+  weather: "天气温度",
+  time: "当地时间"
+});
+let miniStylePreference = loadMiniStylePreference();
+let activePreferenceMenu = null;
+
+const weatherKinds = Object.freeze({
+  clear: "晴",
+  cloudy: "多云",
+  overcast: "阴",
+  fog: "雾",
+  rain: "雨",
+  snow: "雪",
+  thunder: "雷雨",
+  night: "晴",
+  unknown: "天气"
+});
+
+function weatherKind(code, isDay = true) {
+  const number = Number(code);
+  if (!Number.isFinite(number)) return "unknown";
+  if (number === 0) return isDay ? "clear" : "night";
+  if (number === 1 || number === 2) return "cloudy";
+  if (number === 3) return "overcast";
+  if (number === 45 || number === 48) return "fog";
+  if ((number >= 51 && number <= 67) || (number >= 80 && number <= 82)) return "rain";
+  if ((number >= 71 && number <= 77) || number === 85 || number === 86) return "snow";
+  if (number === 95 || number === 96 || number === 99) return "thunder";
+  return "unknown";
+}
+
+function weatherLabel(code, isDay) {
+  const kind = weatherKind(code, isDay);
+  return weatherKinds[kind] || weatherKinds.unknown;
+}
+
+function weatherAssetName(code, isDay = true) {
+  const number = Number(code);
+  if (!Number.isFinite(number)) return isDay ? "partly-cloudy-day" : "partly-cloudy-night";
+  if (number === 0) return isDay ? "clear-day" : "clear-night";
+  if (number === 1 || number === 2) return isDay ? "partly-cloudy-day" : "partly-cloudy-night";
+  if (number === 3) return isDay ? "overcast-day" : "overcast-night";
+  if (number === 45 || number === 48) return isDay ? "fog-day" : "fog-night";
+  if (number >= 51 && number <= 57) return isDay ? "partly-cloudy-day-drizzle" : "partly-cloudy-night-drizzle";
+  if ((number >= 61 && number <= 67) || (number >= 80 && number <= 82)) {
+    return isDay ? "partly-cloudy-day-rain" : "partly-cloudy-night-rain";
+  }
+  if ((number >= 71 && number <= 77) || number === 85 || number === 86) {
+    return isDay ? "partly-cloudy-day-snow" : "partly-cloudy-night-snow";
+  }
+  if (number === 95 || number === 96 || number === 99) {
+    return isDay ? "thunderstorms-day-rain" : "thunderstorms-night-rain";
+  }
+  return isDay ? "partly-cloudy-day" : "partly-cloudy-night";
+}
+
+function weatherAssetPath(code, isDay = true) {
+  const motionVariant = reduceMotion ? "static" : "animated";
+  return `assets/weather-animated/${motionVariant}/${weatherAssetName(code, isDay)}.svg`;
+}
+
+function syncPreferencePicker(trigger, label, menu, value, labels, disabled = false) {
+  setText(label, labels[value] || value);
+  trigger.disabled = disabled;
+  trigger.setAttribute("aria-disabled", String(disabled));
+  menu.querySelectorAll(".preference-option").forEach((option) => {
+    const selected = option.dataset.value === value;
+    option.setAttribute("aria-selected", String(selected));
+    option.tabIndex = selected ? 0 : -1;
+  });
+}
+
+function closePreferenceMenu(restoreFocus = false) {
+  if (!activePreferenceMenu) return;
+  const { picker, trigger, menu } = activePreferenceMenu;
+  picker.classList.remove("open");
+  trigger.setAttribute("aria-expanded", "false");
+  menu.hidden = true;
+  activePreferenceMenu = null;
+  if (restoreFocus) trigger.focus();
+}
+
+function openPreferenceMenu(picker, trigger, menu) {
+  if (trigger.disabled) return;
+  if (activePreferenceMenu?.picker === picker) {
+    closePreferenceMenu();
+    return;
+  }
+  closePreferenceMenu();
+  picker.classList.add("open");
+  trigger.setAttribute("aria-expanded", "true");
+  menu.hidden = false;
+  activePreferenceMenu = { picker, trigger, menu };
+  const selected = menu.querySelector('[aria-selected="true"]') || menu.querySelector(".preference-option");
+  requestAnimationFrame(() => selected?.focus({ preventScroll: true }));
+}
+
+function bindPreferencePicker({ picker, trigger, menu, onSelect }) {
+  trigger.addEventListener("click", () => openPreferenceMenu(picker, trigger, menu));
+  trigger.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault();
+    openPreferenceMenu(picker, trigger, menu);
+  });
+  menu.addEventListener("click", (event) => {
+    const option = event.target.closest(".preference-option");
+    if (!option) return;
+    onSelect(option.dataset.value);
+    closePreferenceMenu(true);
+  });
+  menu.addEventListener("keydown", (event) => {
+    const options = [...menu.querySelectorAll(".preference-option")];
+    const index = options.indexOf(document.activeElement);
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closePreferenceMenu(true);
+      return;
+    }
+    let nextIndex = null;
+    if (event.key === "ArrowDown") nextIndex = Math.min(options.length - 1, Math.max(0, index + 1));
+    if (event.key === "ArrowUp") nextIndex = Math.max(0, index < 0 ? 0 : index - 1);
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = options.length - 1;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    options[nextIndex]?.focus({ preventScroll: true });
+  });
+}
+
+function loadThemePreference() {
+  try {
+    const saved = localStorage.getItem(themePreferenceKey);
+    return themeStyles.has(saved) ? saved : "classic";
+  } catch {
+    return "classic";
+  }
+}
+
+function applyThemePreference() {
+  document.documentElement.dataset.theme = themePreference;
+  syncPreferencePicker(elements.themeStyle, elements.themeStyleLabel, elements.themeStyleMenu, themePreference, themeLabels);
+  try {
+    localStorage.setItem(themePreferenceKey, themePreference);
+  } catch { /* 设置仍在本次运行内生效。 */ }
+  requestAnimationFrame(() => {
+    chartPalette = readChartPalette();
+    scheduleChartDraw();
+  });
+}
+
+function loadActivityBandPreference() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(activityBandPreferenceKey) || "null");
+    return {
+      enabled: saved?.enabled !== false,
+      style: activityBandStyles.has(saved?.style) ? saved.style : "classic"
+    };
+  } catch {
+    return { enabled: true, style: "classic" };
+  }
+}
+
+function applyActivityBandPreference() {
+  const { enabled, style } = activityBandPreference;
+  elements.capsule.classList.toggle("activity-band-disabled", !enabled);
+  elements.capsule.dataset.activityStyle = style;
+  elements.activityBandToggle.setAttribute("aria-pressed", String(enabled));
+  syncPreferencePicker(
+    elements.activityBandStyle,
+    elements.activityBandStyleLabel,
+    elements.activityBandStyleMenu,
+    style,
+    activityBandLabels,
+    !enabled
+  );
+  try {
+    localStorage.setItem(activityBandPreferenceKey, JSON.stringify(activityBandPreference));
+  } catch { /* 设置仍在本次运行内生效。 */ }
+}
+
+function loadMiniStylePreference() {
+  try {
+    const saved = localStorage.getItem(miniStylePreferenceKey);
+    return miniStyles.has(saved) ? saved : "quota";
+  } catch {
+    return "quota";
+  }
+}
+
+function applyMiniStylePreference() {
+  elements.capsule.dataset.miniStyle = miniStylePreference;
+  syncPreferencePicker(
+    elements.miniStyle,
+    elements.miniStyleLabel,
+    elements.miniStyleMenu,
+    miniStylePreference,
+    miniStyleLabels
+  );
+  try {
+    localStorage.setItem(miniStylePreferenceKey, miniStylePreference);
+  } catch { /* 设置仍在本次运行内生效。 */ }
+  if (currentState) renderMini(currentState);
+}
+
+function previewActivityBand() {
+  clearTimeout(activityBandPreviewTimer);
+  elements.capsule.classList.remove("activity-band-preview");
+  // 强制重新创建动画时间线，确保连续切换预设时也从左侧完整预览。
+  void elements.capsule.offsetWidth;
+  if (!activityBandPreference.enabled) return;
+  elements.capsule.classList.add("activity-band-preview");
+  activityBandPreviewTimer = setTimeout(() => {
+    elements.capsule.classList.remove("activity-band-preview");
+  }, 1900);
+}
+
+applyThemePreference();
+applyActivityBandPreference();
+applyMiniStylePreference();
+
+function formatTokens(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  if (Math.abs(number) >= 1_000_000_000) return `${(number / 1_000_000_000).toFixed(1)}B`;
+  if (Math.abs(number) >= 1_000_000) return `${(number / 1_000_000).toFixed(1)}M`;
+  if (Math.abs(number) >= 1_000) return `${(number / 1_000).toFixed(1)}K`;
+  return exactNumber.format(number);
+}
+
+function formatUsageTokens(value) {
+  return formatTokens(value);
+}
+
+function isCustomProviderState(state) {
+  const provider = String(state?.modelProvider || "").trim().toLowerCase();
+  return Boolean(provider) && provider !== "openai";
+}
+
+function usesLocalUsageState(state) {
+  return state?.connection === "connected"
+    && (isCustomProviderState(state) || state.account?.auth !== "ChatGPT");
+}
+
+function setText(element, value) {
+  const text = String(value);
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function setClass(element, value) {
+  if (element.className !== value) element.className = value;
+}
+
+function escapeHTML(value) {
+  return String(value).replace(/[&<>'"]/g, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
+  })[character]);
+}
+
+function limitSummary(limit) {
+  if (!limit) return "—";
+  return `剩余 ${Math.round(limit.remainingPercent)}% · ${formatCountdown(limit.resetsAt)}`;
+}
+
+function usageColor(remaining) {
+  if (!Number.isFinite(remaining)) return "var(--orange)";
+  if (remaining < 20) return "var(--red)";
+  if (remaining < 60) return "var(--orange)";
+  return "var(--green)";
+}
+
+function formatCountdown(timestamp) {
+  if (!timestamp) return "—";
+  const seconds = Math.max(0, Math.floor(timestamp * 1000 - Date.now()) / 1000);
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return days ? `${days}d ${hours}h 后重置` : hours ? `${hours}h ${minutes}m 后重置` : `${minutes}m 后重置`;
+}
+
+function formatElapsed(startedAt) {
+  if (!startedAt) return "—";
+  const total = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return minutes ? `${minutes}:${String(seconds).padStart(2, "0")}` : `${seconds}s`;
+}
+
+function informationDateParts(info, now = new Date()) {
+  const timezone = info?.weather?.timezone || info?.location?.timezone || undefined;
+  try {
+    const options = { timeZone: timezone, hour: "2-digit", minute: "2-digit", hour12: false };
+    const time = new Intl.DateTimeFormat("zh-CN", options).format(now).replace(/^24:/, "00:");
+    const weekday = new Intl.DateTimeFormat("zh-CN", { timeZone: timezone, weekday: "short" }).format(now);
+    return { time, weekday };
+  } catch {
+    const time = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(now).replace(/^24:/, "00:");
+    const weekday = new Intl.DateTimeFormat("zh-CN", { weekday: "short" }).format(now);
+    return { time, weekday };
+  }
+}
+
+function updateInformationClock() {
+  const info = currentState?.informationBar;
+  if (!info?.enabled) return;
+  const parts = informationDateParts(info);
+  setText(elements.informationWeekday, parts.weekday);
+  setText(elements.informationTime, parts.time);
+}
+
+function renderMini(state, now = new Date()) {
+  if (!state) return;
+  const primary = state.limits?.[0];
+  const remaining = Number(primary?.remainingPercent);
+  const mode = modeFor(state);
+  const weather = state.informationBar?.weather;
+  const dateParts = informationDateParts(state.informationBar, now);
+  let value = "—";
+  let progress = 0;
+  let color = "var(--blue)";
+  let title = miniStyleLabels[miniStylePreference];
+
+  switch (miniStylePreference) {
+    case "tokens":
+      value = state.connection === "connected"
+        ? formatUsageTokens(state.usage?.today, state.usage?.todayEstimated === true)
+        : "—";
+      progress = 72;
+      color = "var(--blue)";
+      title = `今日 Token · ${value}`;
+      break;
+    case "status":
+      value = mode === "attention" ? "授" : mode === "working" ? "思" : mode === "idle" ? "•" : "—";
+      progress = mode === "working" || mode === "attention" ? 100 : mode === "idle" ? 24 : 0;
+      color = mode === "attention" ? "var(--red)" : mode === "working" ? "var(--orange)" : "var(--green)";
+      title = mode === "attention" ? "等待授权" : mode === "working" ? "思考中" : mode === "idle" ? "空闲" : "未连接";
+      break;
+    case "weather": {
+      const temperature = Number(weather?.temperature);
+      value = Number.isFinite(temperature) ? `${Math.round(temperature)}°` : "—";
+      progress = Number.isFinite(temperature) ? 64 : 0;
+      color = weather?.isDay === false ? "#8ebcff" : "#55b8ff";
+      title = Number.isFinite(temperature)
+        ? `${weatherLabel(weather.code, weather.isDay !== false)} ${Math.round(temperature)}${weather.unit || "°C"}`
+        : "天气暂不可用";
+      break;
+    }
+    case "time": {
+      value = dateParts.time || "--:--";
+      const timeParts = value.split(":").map(Number);
+      progress = Number.isFinite(timeParts[1]) ? timeParts[1] / 60 * 100 : 0;
+      color = "var(--blue)";
+      title = `${dateParts.weekday || ""} ${value}`.trim();
+      break;
+    }
+    case "quota":
+    default: {
+      const apiFallback = state.connection === "connected"
+        && state.account?.auth === "API Key"
+        && !primary;
+      value = apiFallback ? "API" : Number.isFinite(remaining) ? `${Math.round(remaining)}%` : "—";
+      progress = apiFallback ? 100 : Number.isFinite(remaining) ? Math.max(0, Math.min(100, remaining)) : 0;
+      color = apiFallback ? "var(--blue)" : usageColor(remaining);
+      title = apiFallback ? "API 按量计费" : Number.isFinite(remaining) ? `剩余额度 ${Math.round(remaining)}%` : "暂无额度";
+      break;
+    }
+  }
+
+  // 68px 缩小态下，98% 的 2% 缺口不足一个稳定视觉单位，容易被误认为圆环断裂。
+  // 中心数字继续展示真实值；仅将接近满额的微型环视觉闭合。
+  const visualProgress = miniStylePreference === "quota" && progress >= 98 ? 100 : progress;
+  setText(elements.miniValue, value);
+  elements.miniCapsule.style.setProperty("--mini-progress", `${visualProgress}`);
+  elements.miniCapsule.style.setProperty("--mini-color", color);
+  elements.miniRingProgress.style.setProperty("--mini-progress", `${visualProgress}`);
+  elements.miniRingProgress.style.setProperty("--mini-color", color);
+  elements.miniRingProgress.classList.toggle("is-complete", visualProgress >= 100);
+  elements.miniCapsule.title = `${title} · 双击恢复完整胶囊`;
+}
+
+function renderInformationBar(info = {}) {
+  const enabled = Boolean(info.enabled && info.location);
+  const weather = info.weather || null;
+  const kind = weatherKind(weather?.code, weather?.isDay !== false);
+  const dayClass = weather?.isDay === false ? "is-night" : "is-day";
+  const wasEnabled = elements.capsule.classList.contains("information-enabled");
+  elements.capsule.classList.toggle("information-enabled", enabled);
+  elements.informationStrip.hidden = !enabled;
+  elements.informationBarToggle.setAttribute("aria-pressed", String(enabled));
+  elements.informationLocationButton.disabled = !enabled;
+  elements.informationLocationButton.setAttribute("aria-disabled", String(!enabled));
+  setText(elements.informationLocationLabel, info.location?.name || "选择地区");
+  elements.informationLocationButton.title = info.location
+    ? [info.location.name, info.location.admin1, info.location.country].filter(Boolean).join(" · ")
+    : "选择地区";
+  elements.weatherScene.className = `weather-scene weather-${kind} weather-${dayClass}${info.status === "error" ? " weather-error" : ""}`;
+  const weatherAnimationPath = weatherAssetPath(weather?.code, weather?.isDay !== false);
+  if (elements.weatherAnimation.getAttribute("src") !== weatherAnimationPath) {
+    elements.weatherAnimation.setAttribute("src", weatherAnimationPath);
+  }
+  elements.weatherMiniIcon.className = `weather-mini-icon weather-${kind} weather-${dayClass}`;
+  elements.informationStrip.dataset.weather = kind;
+  if (!enabled) {
+    clearTimeout(collapsedWidthSettleTimer);
+    lastCollapsedWindowWidth = undefined;
+    setText(elements.weatherSummary, "天气同步中");
+    setText(elements.informationLocation, "选择地区");
+    setText(elements.informationWeekday, "—");
+    setText(elements.informationTime, "--:--");
+    if (wasEnabled !== enabled && !expanded) scheduleCollapsedWindowWidthSync(false);
+    return;
+  }
+  const temperature = Number(weather?.temperature);
+  const weatherAge = Number.isFinite(Number(weather?.fetchedAt))
+    ? Math.max(0, Date.now() - Number(weather.fetchedAt))
+    : null;
+  const weatherIsStale = weatherAge !== null && weatherAge > 10 * 60 * 1000;
+  const weatherIsExpired = weatherAge !== null && weatherAge > 24 * 60 * 60 * 1000;
+  const weatherIsCached = info.status === "error" || (info.status === "loading" && weatherIsStale);
+  elements.informationStrip.classList.toggle("weather-expired", weatherIsExpired);
+  const weatherText = Number.isFinite(temperature)
+    ? `${weatherLabel(weather.code, weather.isDay !== false)} ${Math.round(temperature)}${weather.unit || "°C"}${weatherIsExpired ? " · 过期" : weatherIsCached ? " · 缓存" : ""}`
+    : info.status === "error" ? "天气不可用" : "天气同步中";
+  setText(elements.weatherSummary, weatherText);
+  elements.weatherSummary.title = weatherIsExpired
+    ? "天气数据已超过 24 小时，当前结果可能已过期；点击面板内刷新按钮重试"
+    : info.message || (weatherIsCached ? "天气显示的是上次成功同步的结果" : "天气数据来自 Open-Meteo");
+  setText(elements.informationLocation, info.location?.name || "—");
+  elements.informationLocation.title = info.location
+    ? `Location data by GeoNames · ${[info.location.name, info.location.admin1, info.location.country].filter(Boolean).join(" · ")}`
+    : "Location data by GeoNames";
+  updateInformationClock();
+  if (wasEnabled !== enabled && !expanded) scheduleCollapsedWindowWidthSync(false);
+}
+
+function scheduleCollapsedWindowWidthSync(syncAfterRingTransition = true) {
+  if (collapsedWidthFrame) cancelAnimationFrame(collapsedWidthFrame);
+  if (syncAfterRingTransition) {
+    clearTimeout(collapsedWidthSettleTimer);
+    collapsedWidthSettleTimer = setTimeout(
+      () => scheduleCollapsedWindowWidthSync(false),
+      260
+    );
+  }
+  collapsedWidthFrame = requestAnimationFrame(() => {
+    collapsedWidthFrame = undefined;
+    if (expanded || miniMode || miniTransitioning) return;
+    const stage = document.querySelector(".stage");
+    const stageStyle = getComputedStyle(stage);
+    const horizontalPadding = parseFloat(stageStyle.paddingLeft) + parseFloat(stageStyle.paddingRight);
+    const informationEnabled = elements.capsule.classList.contains("information-enabled");
+    const widthProperty = informationEnabled
+      ? "--information-capsule-width"
+      : "--compact-capsule-width";
+    // Measure intrinsic content first, then apply the exact macOS base width.
+    // Only a long Token value is allowed to grow the capsule toward the right.
+    elements.capsule.style.setProperty(widthProperty, "max-content");
+    const naturalCapsuleWidth = elements.capsule.getBoundingClientRect().width;
+    const macBaseWidth = informationEnabled ? 275 : 235;
+    const expandedCapsuleWidth = Math.max(macBaseWidth, Math.ceil(naturalCapsuleWidth));
+    elements.capsule.style.setProperty(
+      widthProperty,
+      `${expandedCapsuleWidth}px`
+    );
+    elements.capsule.dataset.naturalWidth = String(naturalCapsuleWidth);
+    elements.capsule.dataset.expandedWidth = String(expandedCapsuleWidth);
+    scheduleWindowShapeSync();
+    const targetWidth = Math.max(283, Math.min(471, Math.ceil(
+      expandedCapsuleWidth + horizontalPadding
+    )));
+    if (lastCollapsedWindowWidth === targetWidth) return;
+    lastCollapsedWindowWidth = targetWidth;
+    adaptiveResizeInFlight = true;
+    clearTimeout(adaptiveResizeReleaseTimer);
+    void window.pulse.resize({
+      mode: "collapsed",
+      width: targetWidth,
+      informationEnabled
+    }).finally(() => {
+      adaptiveResizeReleaseTimer = setTimeout(() => {
+        adaptiveResizeInFlight = false;
+      }, 80);
+    });
+  });
+}
+
+function paddedShapeRect(element, horizontalPadding, verticalPadding = horizontalPadding) {
+  const rect = element.getBoundingClientRect();
+  const left = Math.max(0, Math.floor(rect.left - horizontalPadding));
+  const top = Math.max(0, Math.floor(rect.top - verticalPadding));
+  const right = Math.min(innerWidth, Math.ceil(rect.right + horizontalPadding));
+  const bottom = Math.min(innerHeight, Math.ceil(rect.bottom + verticalPadding));
+  return { x: left, y: top, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
+}
+
+function currentWindowShape(expandedState = expanded) {
+  if (miniMode) return [];
+  // Keep the independently rendered hover/activity halo inside the native
+  // Windows shape. Without this extra transparent perimeter setShape clips
+  // the blur back to a thin colored line at the capsule edge.
+  const capsuleRect = paddedShapeRect(elements.capsule, 14, 10);
+  if (expandedState) {
+    // The detail card starts at scale(.96) like macOS and grows to 1.0.
+    // Keep enough native shape headroom for its final bounds throughout the
+    // animation so the last few pixels never become temporarily non-clickable.
+    const detailRect = paddedShapeRect(elements.detail, 18, 28);
+    const left = Math.min(capsuleRect.x, detailRect.x);
+    const top = Math.min(capsuleRect.y, detailRect.y);
+    const right = Math.max(capsuleRect.x + capsuleRect.width, detailRect.x + detailRect.width);
+    const bottom = Math.max(capsuleRect.y + capsuleRect.height, detailRect.y + detailRect.height);
+    return [{ x: left, y: top, width: right - left, height: bottom - top }];
+  }
+  const rects = [capsuleRect];
+  if (!elements.informationStrip.hidden) rects.push(paddedShapeRect(elements.informationStrip, 18, 16));
+  return rects;
+}
+
+async function syncWindowShape(expandedState = expanded) {
+  if (typeof window.pulse.setWindowShape !== "function") return false;
+  try { return await window.pulse.setWindowShape(currentWindowShape(expandedState)); }
+  catch { return false; }
+}
+
+function scheduleWindowShapeSync() {
+  if (windowShapeFrame) cancelAnimationFrame(windowShapeFrame);
+  windowShapeFrame = requestAnimationFrame(() => {
+    windowShapeFrame = null;
+    void syncWindowShape();
+  });
+}
+
+function modeFor(state) {
+  if (state.connection !== "connected") return "offline";
+  return state.task?.state || "idle";
+}
+
+function updateTaskMetric(state, mode = modeFor(state)) {
+  const hasActiveTask = mode === "working" || mode === "attention";
+  setText(elements.taskMetricLabel, hasActiveTask ? "任务时间" : "在线天数");
+  setText(
+    elements.taskElapsed,
+    hasActiveTask
+      ? formatElapsed(state.task?.startedAt)
+      : state.connection === "connected" && Number.isFinite(Number(state.usage?.streakDays))
+        ? `${Math.max(0, Math.round(Number(state.usage.streakDays)))}天`
+        : "—"
+  );
+}
+
+function tunnelPoint(progress, lane, width, height) {
+  const centerY = height * 0.52;
+  const mergeX = width * 0.47;
+  const mergeProgress = 0.60;
+  if (progress > mergeProgress) {
+    const t = (progress - mergeProgress) / (1 - mergeProgress);
+    return { x: mergeX + (width - mergeX) * t, y: centerY };
+  }
+  const t = progress / mergeProgress;
+  const inverse = 1 - t;
+  const p0 = { x: 0, y: centerY + lane * height * .43 };
+  const p1 = { x: width * .16, y: p0.y };
+  const p2 = { x: mergeX - width * .12, y: centerY + lane * height * .055 };
+  const p3 = { x: mergeX, y: centerY };
+  return {
+    x: inverse ** 3 * p0.x + 3 * inverse ** 2 * t * p1.x + 3 * inverse * t ** 2 * p2.x + t ** 3 * p3.x,
+    y: inverse ** 3 * p0.y + 3 * inverse ** 2 * t * p1.y + 3 * inverse * t ** 2 * p2.y + t ** 3 * p3.y
+  };
+}
+
+function drawTaskTunnel(timestamp = performance.now()) {
+  const canvas = elements.taskTunnelCanvas;
+  if (!canvas || tunnelMode === "idle") return;
+  const width = 304;
+  const height = 52;
+  const dpr = Math.min(1.5, window.devicePixelRatio || 1);
+  if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+  }
+  const context = canvas.getContext("2d", { alpha: true });
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  context.clearRect(0, 0, width, height);
+  const centerY = height * .52;
+  const mergeX = width * .47;
+  const attention = tunnelMode === "attention";
+  const accent = attention ? "255,69,58" : "255,159,10";
+  const incoming = "61,184,255";
+
+  context.lineWidth = .7;
+  for (let index = 0; index < 12; index += 1) {
+    const lane = index / 11 * 2 - 1;
+    const startY = centerY + lane * height * .43;
+    context.beginPath();
+    context.moveTo(0, startY);
+    context.bezierCurveTo(width * .16, startY, mergeX - width * .12, centerY + lane * height * .055, mergeX, centerY);
+    context.strokeStyle = `rgba(${incoming},.20)`;
+    context.stroke();
+  }
+
+  const outputGradient = context.createLinearGradient(mergeX, 0, width, 0);
+  outputGradient.addColorStop(0, `rgba(${accent},.72)`);
+  outputGradient.addColorStop(1, `rgba(${accent},.12)`);
+  context.beginPath();
+  context.moveTo(mergeX, centerY);
+  context.lineTo(width, centerY);
+  context.strokeStyle = outputGradient;
+  context.lineWidth = 1;
+  context.stroke();
+
+  const pulse = .75 + Math.sin(timestamp / (attention ? 260 : 420)) * .18;
+  context.beginPath();
+  context.arc(mergeX, centerY, 5.5, 0, Math.PI * 2);
+  context.fillStyle = `rgba(${accent},${.08 * pulse})`;
+  context.fill();
+  context.beginPath();
+  context.arc(mergeX, centerY, 2.1, 0, Math.PI * 2);
+  context.fillStyle = `rgba(${accent},${.9 * pulse})`;
+  context.fill();
+
+  const seconds = timestamp / 1000;
+  const speed = attention ? .10 : .23;
+  for (let index = 0; index < 9; index += 1) {
+    const progress = (index / 9 + seconds * speed) % 1;
+    const lane = (((index * 7 + 3) % 12) / 11) * 2 - 1;
+    const point = tunnelPoint(progress, lane, width, height);
+    const tail = tunnelPoint(Math.max(0, progress - .045), lane, width, height);
+    const particleColor = progress < .60 ? incoming : accent;
+    const trail = context.createLinearGradient(tail.x, tail.y, point.x, point.y);
+    trail.addColorStop(0, `rgba(${particleColor},0)`);
+    trail.addColorStop(1, `rgba(${particleColor},.95)`);
+    context.beginPath();
+    context.moveTo(tail.x, tail.y);
+    context.lineTo(point.x, point.y);
+    context.strokeStyle = trail;
+    context.lineWidth = 1.5;
+    context.stroke();
+    context.beginPath();
+    context.arc(point.x, point.y, 1.45, 0, Math.PI * 2);
+    context.fillStyle = `rgba(${particleColor},.98)`;
+    context.fill();
+  }
+}
+
+function animateTaskTunnel(timestamp) {
+  tunnelFrame = null;
+  if (!expanded || tunnelMode === "idle") return;
+  if (timestamp - tunnelLastFrame >= 32) {
+    tunnelLastFrame = timestamp;
+    drawTaskTunnel(timestamp);
+  }
+  tunnelFrame = requestAnimationFrame(animateTaskTunnel);
+}
+
+function updateTaskTunnel(mode) {
+  tunnelMode = mode === "working" || mode === "attention" ? mode : "idle";
+  const visible = tunnelMode !== "idle";
+  elements.taskTunnel.classList.toggle("active", visible);
+  elements.taskTunnel.setAttribute("aria-hidden", String(!visible));
+  elements.taskTunnel.style.setProperty("--tunnel-color", tunnelMode === "attention" ? "var(--red)" : "var(--orange)");
+  setText(elements.tunnelOutputLabel, tunnelMode === "attention" ? "等待继续" : "响应流");
+  if (tunnelFrame) cancelAnimationFrame(tunnelFrame);
+  tunnelFrame = null;
+  if (visible) drawTaskTunnel();
+  if (visible && expanded && !reduceMotion) tunnelFrame = requestAnimationFrame(animateTaskTunnel);
+}
+
+function render(state) {
+  currentState = state;
+  renderInformationBar(state.informationBar || {});
+  const mode = modeFor(state);
+  const primary = state.limits?.[0];
+  const secondary = state.limits?.[1];
+  const remaining = primary?.remainingPercent;
+  const connected = state.connection === "connected";
+  const localUsageMode = usesLocalUsageState(state);
+  const apiUsageFallback = localUsageMode && (!primary || isCustomProviderState(state));
+  const taskActive = mode === "working" || mode === "attention";
+
+  elements.capsule.classList.toggle("task-active", taskActive);
+  elements.capsule.classList.toggle("task-attention", mode === "attention");
+  elements.detail.classList.toggle("connected", connected);
+  elements.detail.classList.toggle("task-active", taskActive);
+  elements.cliInfo.setAttribute("aria-hidden", String(taskActive));
+  setClass(elements.statusDot, `status-dot ${mode}`);
+  setClass(elements.taskBadge, `task-badge ${mode}`);
+  setText(elements.taskBadge, mode === "offline" ? "未连接" : state.task.label);
+  const quotaValue = apiUsageFallback ? "API" : (remaining === undefined ? "—" : `${Math.round(remaining)}%`);
+  setClass(elements.quotaRing, `quota-ring${apiUsageFallback ? " api" : ""}${quotaValue.length >= 4 ? " wide" : ""}`);
+  setText(elements.remaining, quotaValue);
+  const quotaProgress = Math.max(0, Math.min(100, remaining || 0));
+  elements.quotaArc.style.setProperty("--quota", `${quotaProgress >= 98 ? 100 : quotaProgress}%`);
+  setText(elements.todayTokens, connected
+    ? formatUsageTokens(state.usage?.today, state.usage?.todayEstimated === true)
+    : "—");
+  setText(elements.email, state.account?.maskedEmail || "—");
+  const providerLabel = isCustomProviderState(state) ? state.modelProvider : state.account?.plan;
+  setText(elements.plan, `${providerLabel || "—"} · ${state.account?.auth || "—"}`);
+  const genericConnectedMessage = !state.message || state.message === "已连接";
+  const connectionMessage = connected && genericConnectedMessage
+    ? localUsageMode
+      ? state.usage?.todayEstimated
+        ? "已连接 · 本机 session 估算，非账单"
+        : "已连接 · 本机 session 汇总，非账单"
+      : `已连接 · 更新于 ${new Date(state.updatedAt || Date.now()).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`
+    : state.message || "—";
+  setText(elements.connectionMessage, connectionMessage);
+  elements.connectionMessage.title = localUsageMode
+    ? "第三方/API Key 模式下今日和近 7 日来自本机 Codex session；无法替代服务商账单"
+    : connectionMessage;
+  setText(elements.chooseCodex, state.connection === "discovering"
+    ? "获取中…"
+    : state.connection === "connecting" ? "连接中…" : "获取路径");
+  elements.chooseCodex.disabled = state.connection === "discovering" || state.connection === "connecting";
+  elements.chooseCodex.hidden = connected;
+  setText(elements.limitTitle, apiUsageFallback ? "API 用量" : "每周用量");
+  setText(elements.resetTime, apiUsageFallback ? "按 Token 计费" : limitSummary(primary));
+  const remainingWidth = Math.max(0, Math.min(100, Number(remaining) || 0));
+  elements.progressFill.style.width = `${remainingWidth}%`;
+  elements.progressFill.style.setProperty("--progress-color", usageColor(remaining));
+  elements.progressTrack.hidden = apiUsageFallback;
+  setText(elements.secondaryLimit, apiUsageFallback
+    ? "第三方/API Key 不使用 ChatGPT 额度 · Token 为本机汇总，非账单"
+    : secondary
+      ? `${secondary.name} · 剩余 ${Math.round(secondary.remainingPercent)}% · ${formatCountdown(secondary.resetsAt)}`
+      : "5 小时用量 · 暂无数据");
+  elements.cardsToggle.hidden = apiUsageFallback;
+  elements.cardsList.hidden = apiUsageFallback;
+  if (apiUsageFallback && cardsExpanded) {
+    cardsExpanded = false;
+    elements.cardsToggle.setAttribute("aria-expanded", "false");
+    elements.cardsList.classList.remove("open");
+    elements.detail.classList.remove("cards-open");
+  }
+  setText(elements.todayDetail, connected
+    ? formatUsageTokens(state.usage?.today, state.usage?.todayEstimated === true)
+    : "—");
+  const hasLocalDaily = state.usage?.localDailyAvailable === true;
+  setText(elements.totalTokens, localUsageMode
+    ? hasLocalDaily
+      ? formatUsageTokens(state.usage?.localSevenDayTokens, state.usage?.localHistoryEstimated === true)
+      : "—"
+    : connected ? formatTokens(state.usage?.total) : "—");
+  setText(elements.totalMetricLabel, localUsageMode ? "本机近 7 日" : "累计");
+  elements.totalTokens.title = localUsageMode
+    ? "本机 Codex session 近 7 日汇总，不是 OpenAI 账户累计或账单"
+    : "账户累计 Token";
+  const usageSource = localUsageMode
+    ? state.usage?.todayEstimated
+      ? "第三方模型未提供 usage；当前数字来自本机 session 文本估算，不是服务商账单"
+      : "第三方/API Key 模式：今日与近 7 日来自本机全部 session 的真实 token_count/usage 汇总"
+    : "今日 Token 取 Codex App Server 与本机当天全部 session 汇总中的较大值；切换账号后立即更新";
+  elements.todayTokens.title = usageSource;
+  elements.todayDetail.title = usageSource;
+
+  const update = state.appUpdate || {};
+  setText(elements.updateVersion, `CodexPulse v${update.currentVersion || "—"}`);
+  setText(elements.updateStatus, update.message || "启动时自动检查 GitHub Releases");
+  elements.checkUpdateButton.disabled = update.status === "checking";
+  elements.checkUpdateButton.textContent = update.status === "available" ? "下载更新" : update.status === "checking" ? "检查中…" : "检查更新";
+  elements.tokenChart.title = usageSource;
+  updateTaskMetric(state, mode);
+  setText(elements.cliInfo, state.cliPath ? `Codex：${state.cliPath}` : "Codex 路径：等待自动检测");
+  updateTaskTunnel(mode);
+  renderMini(state);
+
+  const nextCardsSignature = JSON.stringify(state.resetCards || []);
+  if (cardsSignature !== nextCardsSignature) {
+    cardsSignature = nextCardsSignature;
+    renderCards();
+  }
+  const nextChartSignature = JSON.stringify(state.usage?.daily || []);
+  if (chartSignature !== nextChartSignature) {
+    chartSignature = nextChartSignature;
+    scheduleChartDraw();
+  }
+  scheduleCollapsedWindowWidthSync();
+  scheduleWindowShapeSync();
+}
+
+function renderCards() {
+  const cards = [...(currentState?.resetCards || [])].sort((left, right) => {
+    if (left.available !== right.available) return left.available ? -1 : 1;
+    return (left.expiresAt || Number.MAX_SAFE_INTEGER) - (right.expiresAt || Number.MAX_SAFE_INTEGER);
+  });
+  const availableCount = cards.filter((card) => card.available).length;
+  const nearest = cards.find((card) => card.available && card.expiresAt)?.expiresAt;
+  setText(elements.cardsSummary, cards.length ? `${availableCount} 张可用 · 共 ${cards.length} 张` : "暂无明细");
+  setText(elements.cardsNearest, nearest ? `最近 ${relativeExpiration(nearest)}` : "");
+  elements.cardsList.innerHTML = cards.length
+    ? cards.map((card, index) => {
+        const expiration = card.expiresAt ? resetCardExpiration(card.expiresAt) : "官方明细暂未返回";
+        const expirationClass = expirationColorClass(card.expiresAt);
+        const types = Array.isArray(card.applicableLimitTypes) ? card.applicableLimitTypes : [];
+        const statusIcon = card.available
+          ? '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="7"/><path d="m4.8 8.1 2 2 4.4-4.5"/></svg>'
+          : '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="7"/><path d="m5.5 5.5 5 5m0-5-5 5"/></svg>';
+        return `<div class="card-item">
+          <span class="card-status-icon${card.available ? "" : " unavailable"}" aria-hidden="true">${statusIcon}</span>
+          <div class="card-copy">
+            <div class="card-title-row"><strong>重置卡 ${index + 1}</strong><span class="card-availability${card.available ? "" : " unavailable"}">${card.available ? "可用" : "不可用"}</span></div>
+            <div class="card-expiry"><span>到期</span><strong class="${expirationClass}">${escapeHTML(expiration)}</strong></div>
+            ${types.length ? `<div class="card-applicable">适用：${escapeHTML(types.join("、"))}</div>` : ""}
+          </div>
+        </div>`;
+      }).join("")
+    : '<div class="card-item empty-card"><span class="card-status-icon unavailable" aria-hidden="true"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="7"/><path d="M5 8h6"/></svg></span><span>暂无重置卡数据</span></div>';
+}
+
+function relativeExpiration(timestamp) {
+  const seconds = Math.round(timestamp * 1000 - Date.now()) / 1000;
+  if (seconds <= 0) return "已到期";
+  if (seconds < 3600) return `${Math.max(1, Math.ceil(seconds / 60))}分钟后`;
+  if (seconds < 48 * 3600) return `${Math.ceil(seconds / 3600)}小时后`;
+  const days = Math.ceil(seconds / 86400);
+  if (days < 14) return `${days}天后`;
+  if (days < 60) return `${Math.ceil(days / 7)}周后`;
+  return `${Math.ceil(days / 30)}个月后`;
+}
+
+function resetCardExpiration(timestamp) {
+  const date = new Date(timestamp * 1000);
+  const now = new Date();
+  const sameYear = date.getFullYear() === now.getFullYear();
+  const prefix = sameYear ? "" : `${date.getFullYear()}年`;
+  const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  return `${prefix}${date.getMonth() + 1}月${date.getDate()}日 ${time}（${relativeExpiration(timestamp)}）`;
+}
+
+function expirationColorClass(timestamp) {
+  if (!timestamp) return "";
+  const remaining = timestamp * 1000 - Date.now();
+  if (remaining <= 24 * 3600 * 1000) return "urgent";
+  if (remaining < 3 * 24 * 3600 * 1000) return "warning";
+  return "";
+}
+
+function drawChart() {
+  const canvas = elements.tokenChart;
+  const dpr = window.devicePixelRatio || 1;
+  const width = 304;
+  const height = 130;
+  if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+  }
+  const context = canvas.getContext("2d");
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  context.clearRect(0, 0, width, height);
+  const data = currentState?.usage?.daily?.length ? currentState.usage.daily : Array.from({ length: 7 }, (_, index) => ({ date: `0${index + 1}`, tokens: 0 }));
+  const pad = { left: 8, right: 8, top: 12, bottom: 19 };
+  const plotWidth = width - pad.left - pad.right;
+  const plotHeight = height - pad.top - pad.bottom;
+  const peak = Math.max(1, ...data.map((item) => Number(item.tokens) || 0)) * 1.15;
+  const points = data.map((item, index) => ({
+    x: pad.left + (plotWidth * index) / Math.max(1, data.length - 1),
+    y: pad.top + plotHeight - ((Number(item.tokens) || 0) / peak) * plotHeight,
+    item
+  }));
+
+  const { blue, muted, line } = chartPalette;
+  context.lineWidth = 1;
+  context.strokeStyle = line;
+  for (let row = 0; row < 3; row += 1) {
+    const y = pad.top + (plotHeight * row) / 2;
+    context.beginPath(); context.moveTo(pad.left, y); context.lineTo(width - pad.right, y); context.stroke();
+  }
+
+  const gradient = context.createLinearGradient(0, pad.top, 0, height - pad.bottom);
+  gradient.addColorStop(0, "rgba(24,144,255,.26)");
+  gradient.addColorStop(1, "rgba(24,144,255,.01)");
+  context.beginPath();
+  points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
+  context.lineTo(points[points.length - 1].x, height - pad.bottom);
+  context.lineTo(points[0].x, height - pad.bottom);
+  context.closePath(); context.fillStyle = gradient; context.fill();
+
+  context.beginPath();
+  points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
+  context.strokeStyle = blue; context.lineWidth = 2; context.lineJoin = "round"; context.stroke();
+  context.font = "8px Segoe UI";
+  context.textAlign = "center";
+  points.forEach((point, index) => {
+    const selected = index === hoveredChartIndex;
+    if (selected) {
+      context.save(); context.setLineDash([3, 3]); context.strokeStyle = "rgba(24,144,255,.48)"; context.lineWidth = 1;
+      context.beginPath(); context.moveTo(point.x, pad.top); context.lineTo(point.x, height - pad.bottom); context.stroke(); context.restore();
+    }
+    context.beginPath(); context.arc(point.x, point.y, selected ? 4.5 : 2.3, 0, Math.PI * 2); context.fillStyle = blue; context.fill();
+    context.fillStyle = muted; context.fillText(String(point.item.date).slice(-5), point.x, height - 4);
+  });
+
+  if (hoveredChartIndex !== null && points[hoveredChartIndex]) {
+    const item = points[hoveredChartIndex].item;
+    elements.chartValue.textContent = `${item.date}\n${exactNumber.format(item.tokens)} Token`;
+  } else {
+    const sum = data.reduce((total, item) => total + (Number(item.tokens) || 0), 0);
+    elements.chartValue.textContent = `合计 ${formatTokens(sum)}`;
+  }
+}
+
+function scheduleChartDraw() {
+  if (chartFrame) return;
+  chartFrame = requestAnimationFrame(() => {
+    chartFrame = null;
+    drawChart();
+  });
+}
+
+function setMoreSettingsExpanded(nextExpanded) {
+  const settingsExpanded = Boolean(nextExpanded);
+  closePreferenceMenu();
+  elements.moreSettingsToggle.setAttribute("aria-expanded", String(settingsExpanded));
+  elements.appearanceSettings.hidden = !settingsExpanded;
+  elements.detail.classList.toggle("settings-open", settingsExpanded);
+  requestAnimationFrame(scheduleWindowShapeSync);
+}
+
+function nextCompositeFrame() {
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+async function runCapsuleMorphTransition(mutate, firstRect) {
+  if (reduceMotion || !firstRect.width) {
+    mutate();
+    await nextCompositeFrame();
+    return;
+  }
+
+  // SwiftUI replaces the full and mini views with a springy .72 scale +
+  // opacity transition. Chromium's width interpolation squeezed glyphs, so
+  // finish the rigid outgoing phase before swapping layouts, then grow the
+  // incoming rigid capsule from the same visual center. The zero-opacity
+  // layout swap prevents even one distorted or flashing frame.
+  const outgoing = elements.capsule.animate([
+    { transform: "translate3d(0, 0, 0) scale(1)", opacity: 1 },
+    { transform: "translate3d(0, 0, 0) scale(.72)", opacity: 0 }
+  ], {
+    duration: 155,
+    easing: "cubic-bezier(.4,0,.7,1)",
+    fill: "both"
+  });
+  try { await outgoing.finished; }
+  catch { /* A newer state change or window resize may cancel the animation. */ }
+  outgoing.cancel();
+
+  mutate();
+  await nextCompositeFrame();
+  const lastRect = elements.capsule.getBoundingClientRect();
+  const deltaX = firstRect.left + firstRect.width / 2 - (lastRect.left + lastRect.width / 2);
+  const deltaY = firstRect.top + firstRect.height / 2 - (lastRect.top + lastRect.height / 2);
+  const incoming = elements.capsule.animate([
+    { transform: `translate3d(${deltaX}px, ${deltaY}px, 0) scale(.72)`, opacity: 0 },
+    { transform: "translate3d(0, 0, 0) scale(1)", opacity: 1 }
+  ], {
+    duration: 185,
+    easing: "cubic-bezier(.16,.84,.24,1)",
+    fill: "both"
+  });
+  try { await incoming.finished; }
+  catch { /* A newer state change or window resize may cancel the animation. */ }
+  incoming.cancel();
+}
+
+async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
+  const shouldMinimize = Boolean(nextMiniMode);
+  if (miniTransitioning || miniMode === shouldMinimize) {
+    if (expandAfterRestore && !miniMode && !miniTransitioning) setExpanded(true);
+    return;
+  }
+  miniTransitioning = true;
+  clearTimeout(capsuleSingleClickTimer);
+  clearTimeout(collapseTimer);
+  const root = document.documentElement;
+  elements.capsule.classList.remove("hovering");
+  pendingGlow = null;
+
+  if (shouldMinimize && expanded) {
+    expanded = false;
+    root.classList.remove("detail-expanded");
+    elements.capsule.setAttribute("aria-expanded", "false");
+    elements.detail.setAttribute("aria-hidden", "true");
+    elements.detail.classList.remove("open");
+    closePreferenceMenu();
+    closeLocationChooser();
+  }
+
+  root.classList.add("mini-transitioning", "mini-transition-layout");
+  resetMagnet(true);
+
+  try {
+    if (shouldMinimize) {
+      const firstRect = elements.capsule.getBoundingClientRect();
+      // Keep the full stable surface available while the shared element moves
+      // from the centered capsule to the right-edge mini anchor.
+      if (typeof window.pulse.setWindowShape === "function") {
+        await window.pulse.setWindowShape([{ x: 0, y: 0, width: innerWidth, height: innerHeight }]);
+      }
+      await runCapsuleMorphTransition(() => {
+        miniMode = true;
+        root.classList.add("mini-mode");
+        elements.miniCapsule.setAttribute("aria-hidden", "false");
+        elements.capsule.setAttribute("aria-label", `${miniStyleLabels[miniStylePreference]}，双击恢复完整胶囊`);
+        if (currentState) renderMini(currentState);
+      }, firstRect);
+      await window.pulse.resize("mini");
+      if (typeof window.pulse.setWindowShape === "function") {
+        await window.pulse.setWindowShape([{ x: 0, y: 0, width: 88, height: 88 }]);
+      }
+    } else {
+      if (expandAfterRestore) {
+        root.classList.toggle(
+          "compact-detail-window",
+          elements.capsule.classList.contains("information-enabled")
+        );
+      }
+      await window.pulse.resize(expandAfterRestore ? true : false);
+      if (typeof window.pulse.setWindowShape === "function") {
+        await window.pulse.setWindowShape([{ x: 0, y: 0, width: 390, height: 810 }]);
+      }
+      await nextCompositeFrame();
+      const firstRect = elements.capsule.getBoundingClientRect();
+      await runCapsuleMorphTransition(() => {
+        miniMode = false;
+        root.classList.remove("mini-mode");
+        elements.miniCapsule.setAttribute("aria-hidden", "true");
+        elements.capsule.setAttribute("aria-label", "Codex-Pulse 悬浮胶囊");
+      }, firstRect);
+      if (expandAfterRestore) {
+        expanded = true;
+        root.classList.add("detail-expanded");
+        clearTimeout(collapseTimer);
+        elements.capsule.setAttribute("aria-expanded", "true");
+        elements.detail.setAttribute("aria-hidden", "false");
+        setMoreSettingsExpanded(false);
+        elements.capsule.classList.remove("hovering");
+        pendingGlow = null;
+        updateTaskTunnel(currentState ? modeFor(currentState) : "idle");
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (expanded) elements.detail.classList.add("open");
+        }));
+      } else {
+        root.classList.remove("detail-expanded");
+      }
+      await syncWindowShape(expandAfterRestore);
+    }
+  } finally {
+    root.classList.remove("mini-transitioning", "mini-transition-layout");
+    miniTransitioning = false;
+    // The magnetic surface returns independently from the content. Keeping
+    // the return spring alive avoids the lateral snap that Chromium showed
+    // when a click landed while the hover attraction was still displaced.
+    resetMagnet(false);
+    scheduleWindowShapeSync();
+  }
+
+  if (expandAfterRestore && !expanded) setExpanded(true);
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function revealDetailAfterResize(generation) {
+  try { await window.pulse.resize(true); }
+  catch { return; }
+  if (generation !== detailTransitionGeneration || !expanded || miniMode) return;
+  await syncWindowShape(true);
+  // BrowserWindow resize resolves after setBounds, but Chromium needs two
+  // composites before a large transparent/backdrop surface is safe to reveal.
+  await nextCompositeFrame();
+  if (generation !== detailTransitionGeneration || !expanded || miniMode) return;
+  elements.detail.classList.add("open");
+  setTimeout(() => {
+    if (generation === detailTransitionGeneration && expanded && !miniMode) {
+      void syncWindowShape(true);
+    }
+  }, reduceMotion ? 0 : 380);
+}
+
+async function collapseDetailBeforeResize(generation) {
+  // Let opacity/transform finish while the expanded texture still exists.
+  await wait(reduceMotion ? 0 : 380);
+  if (generation !== detailTransitionGeneration || expanded || miniMode) return;
+  await nextCompositeFrame();
+  if (generation !== detailTransitionGeneration || expanded || miniMode) return;
+  await syncWindowShape(false);
+  try { await window.pulse.resize(false); }
+  catch { return; }
+  if (generation !== detailTransitionGeneration || expanded || miniMode) return;
+  await nextCompositeFrame();
+  elements.detail.setAttribute("aria-hidden", "true");
+  document.documentElement.classList.remove("compact-detail-window");
+}
+
+function setExpanded(nextExpanded) {
+  if (nextExpanded && miniMode) {
+    void setMiniMode(false, { expandAfterRestore: true });
+    return;
+  }
+  if (miniTransitioning) return;
+  if (expanded === nextExpanded) return;
+  expanded = nextExpanded;
+  document.documentElement.classList.toggle("detail-expanded", expanded);
+  const transitionGeneration = ++detailTransitionGeneration;
+  clearTimeout(collapseTimer);
+  elements.capsule.setAttribute("aria-expanded", String(expanded));
+  clearTimeout(detailAnimationTimer);
+  elements.detail.classList.add("animating");
+  detailAnimationTimer = setTimeout(() => elements.detail.classList.remove("animating"), reduceMotion ? 0 : 380);
+  if (expanded) {
+    elements.detail.setAttribute("aria-hidden", "false");
+    document.documentElement.classList.toggle(
+      "compact-detail-window",
+      elements.capsule.classList.contains("information-enabled")
+    );
+    setMoreSettingsExpanded(false);
+    elements.capsule.classList.remove("hovering");
+    pendingGlow = null;
+    resetMagnet(true);
+    updateTaskTunnel(currentState ? modeFor(currentState) : "idle");
+    void revealDetailAfterResize(transitionGeneration);
+  } else {
+    closePreferenceMenu();
+    closeLocationChooser();
+    if (tunnelFrame) cancelAnimationFrame(tunnelFrame);
+    tunnelFrame = null;
+    elements.detail.classList.remove("open");
+    void collapseDetailBeforeResize(transitionGeneration);
+  }
+}
+
+function toggleExpanded() {
+  setExpanded(!expanded);
+}
+
+let capsulePointer;
+let pendingGlow;
+let glowFrame;
+let pendingDrag;
+let dragFrame;
+const magnet = { x: 0, y: 0, renderX: 0, renderY: 0, vx: 0, vy: 0, targetX: 0, targetY: 0, returning: false, frame: null, lastTime: 0 };
+
+function criticallyDampedStep(value, velocity, target, deltaSeconds, angularFrequency = 18) {
+  const displacement = value - target;
+  const decay = Math.exp(-angularFrequency * deltaSeconds);
+  const velocityTerm = velocity + angularFrequency * displacement;
+  return {
+    value: target + (displacement + velocityTerm * deltaSeconds) * decay,
+    velocity: (velocity - angularFrequency * velocityTerm * deltaSeconds) * decay
+  };
+}
+
+function applyMagnetFrame(timestamp) {
+  magnet.frame = null;
+  const deltaSeconds = magnet.lastTime
+    ? Math.min(1 / 30, Math.max(1 / 240, (timestamp - magnet.lastTime) / 1000))
+    : 1 / 60;
+  magnet.lastTime = timestamp;
+  if (capsulePointer?.moved) {
+    magnet.x = 0;
+    magnet.y = 0;
+    magnet.vx = 0;
+    magnet.vy = 0;
+  } else if (reduceMotion) {
+    magnet.x = magnet.targetX;
+    magnet.y = magnet.targetY;
+    magnet.vx = 0;
+    magnet.vy = 0;
+  } else if (magnet.returning) {
+    const horizontal = criticallyDampedStep(magnet.x, magnet.vx, magnet.targetX, deltaSeconds);
+    const vertical = criticallyDampedStep(magnet.y, magnet.vy, magnet.targetY, deltaSeconds);
+    magnet.x = horizontal.value;
+    magnet.y = vertical.value;
+    magnet.vx = horizontal.velocity;
+    magnet.vy = vertical.velocity;
+  } else {
+    // Time-based exponential following keeps the same feel at 60/90/120Hz
+    // and across brief Windows compositor stalls.
+    const blend = 1 - Math.exp(-deltaSeconds / 0.055);
+    magnet.vx = 0;
+    magnet.vy = 0;
+    magnet.x += (magnet.targetX - magnet.x) * blend;
+    magnet.y += (magnet.targetY - magnet.y) * blend;
+  }
+  const moving = Math.abs(magnet.targetX - magnet.x) > 0.03
+    || Math.abs(magnet.targetY - magnet.y) > 0.03
+    || Math.abs(magnet.vx) > 0.35
+    || Math.abs(magnet.vy) > 0.35;
+  if (moving) {
+    // Align the complete capsule to physical pixels. This keeps the macOS
+    // rigid-body magnetic feel while avoiding Chromium's fractional-glyph
+    // blur at Windows 125/150/200% display scaling.
+    const scale = Math.max(1, Number(window.devicePixelRatio) || 1);
+    magnet.renderX = Math.round(magnet.x * scale) / scale;
+    magnet.renderY = Math.round(magnet.y * scale) / scale;
+    elements.capsule.style.transform = `translate3d(${magnet.renderX}px, ${magnet.renderY}px, 0)`;
+    magnet.frame = requestAnimationFrame(applyMagnetFrame);
+  } else if (magnet.targetX === 0 && magnet.targetY === 0) {
+    magnet.x = 0;
+    magnet.y = 0;
+    magnet.vx = 0;
+    magnet.vy = 0;
+    magnet.renderX = 0;
+    magnet.renderY = 0;
+    magnet.returning = false;
+    magnet.lastTime = 0;
+    elements.capsule.style.transform = "translate3d(0, 0, 0)";
+  }
+}
+
+function scheduleMagnet() {
+  if (!magnet.frame) {
+    magnet.lastTime = 0;
+    magnet.frame = requestAnimationFrame(applyMagnetFrame);
+  }
+}
+
+function resetMagnet(immediate = false) {
+  magnet.targetX = 0;
+  magnet.targetY = 0;
+  magnet.returning = !immediate;
+  if (immediate) {
+    magnet.x = 0;
+    magnet.y = 0;
+    magnet.vx = 0;
+    magnet.vy = 0;
+    magnet.renderX = 0;
+    magnet.renderY = 0;
+    magnet.returning = false;
+    magnet.lastTime = 0;
+    elements.capsule.style.transform = "translate3d(0, 0, 0)";
+  } else {
+    scheduleMagnet();
+  }
+}
+
+function scheduleGlow(x, y, edge = "top") {
+  pendingGlow = { x, y, edge };
+  if (glowFrame) return;
+  glowFrame = requestAnimationFrame(() => {
+    glowFrame = null;
+    if (!pendingGlow) return;
+    elements.capsule.style.setProperty("--glow-x", `${pendingGlow.x}px`);
+    elements.capsule.style.setProperty("--glow-y", `${pendingGlow.y}px`);
+    elements.capsule.dataset.glowEdge = pendingGlow.edge;
+  });
+}
+
+function nearestCapsuleEdgePoint(x, y, width, height) {
+  const distances = [x, width - x, y, height - y];
+  const nearest = distances.indexOf(Math.min(...distances));
+  switch (nearest) {
+    case 0: return { x: 0, y, edge: "left" };
+    case 1: return { x: width, y, edge: "right" };
+    case 2: return { x, y: 0, edge: "top" };
+    default: return { x, y: height, edge: "bottom" };
+  }
+}
+
+function scheduleWindowDrag(x, y) {
+  pendingDrag = { x, y };
+  if (dragFrame) return;
+  dragFrame = requestAnimationFrame(() => {
+    dragFrame = null;
+    if (pendingDrag) window.pulse.dragTo(pendingDrag.x, pendingDrag.y);
+  });
+}
+
+elements.capsule.addEventListener("pointerenter", () => {
+  if (!expanded && !miniMode) elements.capsule.classList.add("hovering");
+});
+
+elements.capsule.addEventListener("pointerleave", () => {
+  if (capsulePointer) return;
+  elements.capsule.classList.remove("hovering");
+  pendingGlow = null;
+  resetMagnet();
+});
+
+elements.capsule.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  capsulePointer = {
+    id: event.pointerId,
+    startX: event.screenX,
+    startY: event.screenY,
+    moved: false
+  };
+  elements.capsule.setPointerCapture(event.pointerId);
+  window.pulse.beginDrag(event.screenX, event.screenY);
+});
+
+elements.capsule.addEventListener("pointermove", (event) => {
+  const rect = elements.capsule.getBoundingClientRect();
+  // getBoundingClientRect includes the current magnetic transform. Remove it
+  // before mapping the pointer so the target does not feed back into itself.
+  const localX = event.clientX - (rect.left - magnet.renderX);
+  const localY = event.clientY - (rect.top - magnet.renderY);
+  if (!expanded && !miniMode) {
+    const glowPoint = nearestCapsuleEdgePoint(localX, localY, rect.width, rect.height);
+    scheduleGlow(glowPoint.x, glowPoint.y, glowPoint.edge);
+  }
+
+  if (!expanded && !miniMode && !capsulePointer && !reduceMotion) {
+    if (adaptiveResizeInFlight) {
+      magnet.targetX = 0;
+      magnet.targetY = 0;
+    } else {
+      const normalizedX = Math.max(-1, Math.min(1, (localX / rect.width - 0.5) * 2));
+      const normalizedY = Math.max(-1, Math.min(1, (localY / rect.height - 0.5) * 2));
+      magnet.returning = false;
+      magnet.targetX = normalizedX * 12;
+      magnet.targetY = normalizedY * 8;
+    }
+    scheduleMagnet();
+  }
+
+  if (!capsulePointer || capsulePointer.id !== event.pointerId) return;
+  const distance = Math.hypot(event.screenX - capsulePointer.startX, event.screenY - capsulePointer.startY);
+  if (distance >= 4 && !capsulePointer.moved) {
+    capsulePointer.moved = true;
+    resetMagnet(true);
+  }
+  if (capsulePointer.moved) {
+    elements.capsule.classList.add("dragging");
+    scheduleWindowDrag(event.screenX, event.screenY);
+  }
+});
+
+function finishCapsulePointer(event) {
+  if (!capsulePointer || capsulePointer.id !== event.pointerId) return;
+  const shouldToggle = !capsulePointer.moved;
+  capsulePointer = null;
+  pendingDrag = null;
+  elements.capsule.classList.remove("dragging");
+  window.pulse.endDrag();
+  if (elements.capsule.hasPointerCapture(event.pointerId)) {
+    elements.capsule.releasePointerCapture(event.pointerId);
+  }
+  if (!elements.capsule.matches(":hover")) {
+    elements.capsule.classList.remove("hovering");
+    pendingGlow = null;
+  }
+  resetMagnet(false);
+  if (shouldToggle) {
+    clearTimeout(capsuleSingleClickTimer);
+    capsuleSingleClickTimer = setTimeout(() => {
+      if (miniMode) setExpanded(true);
+      else toggleExpanded();
+    }, 300);
+  }
+}
+
+elements.capsule.addEventListener("pointerup", finishCapsulePointer);
+elements.capsule.addEventListener("dblclick", (event) => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  clearTimeout(capsuleSingleClickTimer);
+  void setMiniMode(!miniMode);
+});
+elements.capsule.addEventListener("pointercancel", (event) => {
+  capsulePointer = null;
+  pendingDrag = null;
+  elements.capsule.classList.remove("dragging");
+  elements.capsule.classList.remove("hovering");
+  window.pulse.endDrag();
+  resetMagnet(true);
+  if (elements.capsule.hasPointerCapture(event.pointerId)) {
+    elements.capsule.releasePointerCapture(event.pointerId);
+  }
+});
+elements.capsule.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    if (miniMode) void setMiniMode(false);
+    else toggleExpanded();
+  }
+});
+
+elements.cardsToggle.addEventListener("click", () => {
+  cardsExpanded = !cardsExpanded;
+  elements.cardsToggle.setAttribute("aria-expanded", String(cardsExpanded));
+  elements.cardsList.classList.toggle("open", cardsExpanded);
+  elements.detail.classList.toggle("cards-open", cardsExpanded);
+  requestAnimationFrame(scheduleWindowShapeSync);
+});
+elements.moreSettingsToggle.addEventListener("click", () => {
+  setMoreSettingsExpanded(elements.moreSettingsToggle.getAttribute("aria-expanded") !== "true");
+});
+elements.activityBandToggle.addEventListener("click", () => {
+  activityBandPreference = { ...activityBandPreference, enabled: !activityBandPreference.enabled };
+  applyActivityBandPreference();
+  previewActivityBand();
+});
+bindPreferencePicker({
+  picker: elements.activityBandPicker,
+  trigger: elements.activityBandStyle,
+  menu: elements.activityBandStyleMenu,
+  onSelect: (value) => {
+    const style = activityBandStyles.has(value) ? value : "classic";
+    activityBandPreference = { ...activityBandPreference, style };
+    applyActivityBandPreference();
+    previewActivityBand();
+  }
+});
+bindPreferencePicker({
+  picker: elements.miniStylePicker,
+  trigger: elements.miniStyle,
+  menu: elements.miniStyleMenu,
+  onSelect: (value) => {
+    miniStylePreference = miniStyles.has(value) ? value : "quota";
+    applyMiniStylePreference();
+  }
+});
+bindPreferencePicker({
+  picker: elements.themePicker,
+  trigger: elements.themeStyle,
+  menu: elements.themeStyleMenu,
+  onSelect: (value) => {
+    themePreference = themeStyles.has(value) ? value : "classic";
+    applyThemePreference();
+  }
+});
+
+function locationResultLabel(location) {
+  return [location?.name, location?.admin1, location?.country].filter(Boolean).join(" · ");
+}
+
+function renderLocationResults(results) {
+  locationResults = Array.isArray(results) ? results : [];
+  elements.locationResults.innerHTML = locationResults.length
+    ? locationResults.map((location, index) => `
+        <button class="location-result" type="button" role="option" data-index="${index}">
+          <strong>${escapeHTML(location.name || "—")}</strong>
+          <small>${escapeHTML([location.admin1, location.country].filter(Boolean).join(" · ") || "—")}</small>
+        </button>`).join("")
+    : "";
+}
+
+function openLocationChooser() {
+  closePreferenceMenu();
+  elements.locationChooser.hidden = false;
+  elements.locationSearchStatus.textContent = "输入至少 2 个字符开始搜索";
+  if (!elements.locationResults.children.length) renderLocationResults([]);
+  requestAnimationFrame(() => elements.locationSearch.focus({ preventScroll: true }));
+}
+
+function closeLocationChooser() {
+  elements.locationChooser.hidden = true;
+  locationSearchRequest += 1;
+}
+
+async function searchLocationInput() {
+  const query = elements.locationSearch.value.trim();
+  clearTimeout(locationSearchTimer);
+  if (query.length < 2) {
+    locationSearchRequest += 1;
+    renderLocationResults([]);
+    elements.locationSearchStatus.textContent = "输入至少 2 个字符开始搜索";
+    return;
+  }
+  const requestId = ++locationSearchRequest;
+  elements.locationSearchStatus.textContent = "正在搜索…";
+  locationSearchTimer = setTimeout(async () => {
+    try {
+      const response = await window.pulse.searchLocations(query);
+      if (requestId !== locationSearchRequest) return;
+      if (response?.error) {
+        renderLocationResults([]);
+        elements.locationSearchStatus.textContent = response.error;
+        return;
+      }
+      renderLocationResults(response?.results || []);
+      elements.locationSearchStatus.textContent = response?.results?.length ? "选择一个匹配的地区" : "没有找到匹配地区";
+    } catch (error) {
+      if (requestId !== locationSearchRequest) return;
+      renderLocationResults([]);
+      elements.locationSearchStatus.textContent = String(error?.message || "地区搜索失败");
+    }
+  }, 320);
+}
+
+async function chooseLocation(location) {
+  elements.locationSearchStatus.textContent = "正在保存地区…";
+  elements.locationResults.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  try {
+    const nextState = await window.pulse.setInformationBarLocation(location);
+    if (nextState?.informationError) {
+      elements.locationSearchStatus.textContent = nextState.informationError;
+      return;
+    }
+    closeLocationChooser();
+    render(nextState);
+  } catch (error) {
+    elements.locationSearchStatus.textContent = String(error?.message || "地区保存失败");
+  } finally {
+    elements.locationResults.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+  }
+}
+
+elements.informationBarToggle.addEventListener("click", async () => {
+  const current = Boolean(currentState?.informationBar?.enabled);
+  elements.informationBarToggle.disabled = true;
+  try {
+    const nextState = await window.pulse.setInformationBarEnabled(!current);
+    render(nextState);
+    if (!current && !nextState?.informationBar?.enabled) openLocationChooser();
+    if (current) closeLocationChooser();
+  } catch (error) {
+    elements.locationSearchStatus.textContent = String(error?.message || "信息任务栏设置失败");
+  } finally {
+    elements.informationBarToggle.disabled = false;
+  }
+});
+elements.informationLocationButton.addEventListener("click", () => {
+  if (!elements.informationLocationButton.disabled) openLocationChooser();
+});
+elements.locationChooserClose.addEventListener("click", closeLocationChooser);
+elements.locationSearch.addEventListener("input", searchLocationInput);
+elements.locationResults.addEventListener("click", (event) => {
+  const button = event.target.closest(".location-result");
+  if (!button) return;
+  const index = Number(button.dataset.index);
+  if (locationResults[index]) void chooseLocation(locationResults[index]);
+});
+document.querySelectorAll("[data-external-link]").forEach((link) => {
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    void window.pulse.openExternal(link.href);
+  });
+});
+
+elements.tokenChart.addEventListener("mousemove", (event) => {
+  const rect = elements.tokenChart.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const plotLeft = 8;
+  const plotWidth = 288;
+  const nextIndex = Math.max(0, Math.min(6, Math.round(((x - plotLeft) / plotWidth) * 6)));
+  if (nextIndex !== hoveredChartIndex) {
+    hoveredChartIndex = nextIndex;
+    scheduleChartDraw();
+  }
+});
+elements.tokenChart.addEventListener("mouseleave", () => { hoveredChartIndex = null; scheduleChartDraw(); });
+elements.chooseCodex.addEventListener("click", () => window.pulse.clearCodexPath());
+elements.refresh.addEventListener("click", () => window.pulse.refresh());
+elements.checkUpdateButton.addEventListener("click", () => {
+  if (currentState?.appUpdate?.status === "available") void window.pulse.openUpdate();
+  else void window.pulse.checkForUpdates();
+});
+elements.quit.addEventListener("click", () => window.pulse.quit());
+
+// 展开后点击窗口内的透明留白区域也收起；详情卡和胶囊自身保持正常交互。
+document.addEventListener("pointerdown", (event) => {
+  if (activePreferenceMenu && !activePreferenceMenu.picker.contains(event.target)) {
+    closePreferenceMenu();
+  }
+  if (!expanded) return;
+  if (elements.capsule.contains(event.target) || elements.detail.contains(event.target)) return;
+  setExpanded(false);
+}, true);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && activePreferenceMenu) {
+    event.preventDefault();
+    closePreferenceMenu(true);
+    return;
+  }
+  if (event.key === "Escape" && !elements.locationChooser.hidden) {
+    event.preventDefault();
+    closeLocationChooser();
+  }
+});
+
+setInterval(() => {
+  if (currentState) {
+    updateTaskMetric(currentState);
+    updateInformationClock();
+    const primary = currentState.limits?.[0];
+    const apiUsageFallback = usesLocalUsageState(currentState)
+      && (!primary || isCustomProviderState(currentState));
+    setText(elements.resetTime, apiUsageFallback ? "按 Token 计费" : limitSummary(primary));
+    renderMini(currentState);
+  }
+}, 1000);
+
+window.pulse.onState(render);
+window.pulse.onCollapse(() => {
+  // Window blur means “close details”, not “leave mini mode”. Keeping mini
+  // stable lets users click anywhere on the desktop without restoring the
+  // full capsule. Explicit tray/menu expand events still restore it below.
+  if (!miniMode) setExpanded(false);
+});
+window.pulse.onExpand(() => {
+  if (miniMode) void setMiniMode(false, { expandAfterRestore: true });
+  else setExpanded(true);
+});
+window.pulse.getState().then(render);

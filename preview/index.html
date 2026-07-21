@@ -1,0 +1,1145 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Codex-Pulse — Liquid Glass Preview</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      color-scheme: light;
+      --green: #30d158;
+      --blue: #0a84ff;
+      --yellow: #ffd60a;
+      --orange: #ff9f0a;
+      --red: #ff453a;
+      --gray: #8e8e93;
+      --text: #1d1d1f;
+      --text-2: rgba(29, 29, 31, 0.62);
+      --text-3: rgba(29, 29, 31, 0.42);
+      --font: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+      --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+      --r-lg: 18px;
+      --r-xl: 24px;
+      --status: var(--blue);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { min-height: 100%; }
+    body {
+      font-family: var(--font);
+      color: var(--text);
+      line-height: 1.4;
+      overflow-x: hidden;
+      background: #7eb8e8;
+    }
+
+    /* Living macOS-like wallpaper — soft aurora mesh, not flat dark SaaS */
+    .wallpaper {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      overflow: hidden;
+      background:
+        radial-gradient(ellipse 80% 60% at 15% 20%, rgba(120, 190, 255, 0.95) 0%, transparent 55%),
+        radial-gradient(ellipse 70% 50% at 85% 15%, rgba(180, 140, 255, 0.55) 0%, transparent 50%),
+        radial-gradient(ellipse 60% 70% at 70% 80%, rgba(100, 220, 200, 0.55) 0%, transparent 55%),
+        radial-gradient(ellipse 50% 40% at 20% 85%, rgba(255, 190, 140, 0.45) 0%, transparent 50%),
+        linear-gradient(160deg, #6eb5f0 0%, #8ec5f5 35%, #b8d4f0 70%, #c9e2f5 100%);
+    }
+    .wallpaper::before {
+      content: "";
+      position: absolute;
+      width: 140%;
+      height: 140%;
+      left: -20%;
+      top: -20%;
+      background:
+        radial-gradient(circle at 30% 40%, rgba(255,255,255,0.35) 0%, transparent 25%),
+        radial-gradient(circle at 70% 60%, rgba(255,255,255,0.2) 0%, transparent 30%);
+      animation: drift 18s ease-in-out infinite alternate;
+    }
+    @keyframes drift {
+      from { transform: translate(0, 0) scale(1); }
+      to { transform: translate(-3%, 2%) scale(1.04); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .wallpaper::before { animation: none; }
+      * { transition: none !important; }
+    }
+
+    .shell {
+      position: relative;
+      z-index: 1;
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 28px 20px 72px;
+    }
+
+    /* —— Top chrome —— */
+    .topbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 22px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-mark {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(145deg, rgba(255,255,255,0.7), rgba(255,255,255,0.25));
+      border: 1px solid rgba(255,255,255,0.55);
+      box-shadow: 0 4px 16px rgba(0,0,0,0.1), inset 0 1px 0 rgba(255,255,255,0.8);
+      backdrop-filter: blur(12px);
+    }
+    .brand-mark svg { width: 18px; height: 18px; }
+    .brand h1 {
+      font-size: 17px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    .brand p {
+      font-size: 12px;
+      color: var(--text-2);
+      margin-top: 1px;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    /* Glass chip / button */
+    .glass-btn {
+      appearance: none;
+      border: 1px solid rgba(255,255,255,0.45);
+      background: linear-gradient(180deg, rgba(255,255,255,0.55), rgba(255,255,255,0.28));
+      backdrop-filter: blur(20px) saturate(160%);
+      -webkit-backdrop-filter: blur(20px) saturate(160%);
+      color: var(--text);
+      font: inherit;
+      font-size: 12.5px;
+      font-weight: 500;
+      padding: 8px 13px;
+      border-radius: 999px;
+      cursor: pointer;
+      box-shadow:
+        0 2px 8px rgba(0,0,0,0.06),
+        inset 0 1px 0 rgba(255,255,255,0.7);
+      transition: transform 160ms ease, background 160ms ease, box-shadow 160ms ease;
+    }
+    .glass-btn:hover {
+      background: linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,255,255,0.4));
+      box-shadow: 0 4px 14px rgba(0,0,0,0.1), inset 0 1px 0 rgba(255,255,255,0.85);
+    }
+    .glass-btn:active { transform: scale(0.97); }
+    .glass-btn:focus-visible {
+      outline: 2px solid var(--blue);
+      outline-offset: 2px;
+    }
+    .glass-btn.primary {
+      background: linear-gradient(180deg, rgba(10,132,255,0.92), rgba(0,102,220,0.88));
+      border-color: rgba(255,255,255,0.35);
+      color: #fff;
+      box-shadow: 0 4px 14px rgba(10,132,255,0.35), inset 0 1px 0 rgba(255,255,255,0.35);
+    }
+    .glass-btn.primary:hover {
+      filter: brightness(1.05);
+      background: linear-gradient(180deg, rgba(10,132,255,0.96), rgba(0,102,220,0.92));
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-2);
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.35);
+      border: 1px solid rgba(255,255,255,0.45);
+      backdrop-filter: blur(16px);
+    }
+    .pill .led {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--status);
+      box-shadow: 0 0 0 2px rgba(255,255,255,0.5), 0 0 10px var(--status);
+    }
+
+    /* Tabs */
+    .tabs {
+      display: inline-flex;
+      gap: 4px;
+      padding: 4px;
+      margin-bottom: 20px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.28);
+      border: 1px solid rgba(255,255,255,0.4);
+      backdrop-filter: blur(20px) saturate(160%);
+      -webkit-backdrop-filter: blur(20px) saturate(160%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.5);
+    }
+    .tab {
+      border: none;
+      background: transparent;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-2);
+      padding: 8px 16px;
+      border-radius: 11px;
+      cursor: pointer;
+      transition: background 180ms ease, color 180ms ease, box-shadow 180ms ease;
+    }
+    .tab:hover { color: var(--text); }
+    .tab[aria-selected="true"] {
+      background: rgba(255,255,255,0.72);
+      color: var(--text);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08), inset 0 1px 0 #fff;
+    }
+    .tab:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+
+    .panel { display: none; }
+    .panel.active { display: block; animation: rise 220ms ease; }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: none; }
+    }
+
+    /* —— Core glass surface —— */
+    .glass {
+      background: linear-gradient(
+        155deg,
+        rgba(255, 255, 255, 0.62) 0%,
+        rgba(255, 255, 255, 0.32) 45%,
+        rgba(255, 255, 255, 0.24) 100%
+      );
+      backdrop-filter: blur(40px) saturate(180%);
+      -webkit-backdrop-filter: blur(40px) saturate(180%);
+      border: 1px solid rgba(255, 255, 255, 0.48);
+      border-radius: var(--r-lg);
+      box-shadow:
+        0 18px 48px rgba(0, 0, 0, 0.16),
+        0 2px 8px rgba(0, 0, 0, 0.05),
+        inset 0 1px 0 rgba(255, 255, 255, 0.72),
+        inset 0 -1px 0 rgba(255, 255, 255, 0.08);
+    }
+    .glass-dark {
+      background: linear-gradient(
+        160deg,
+        rgba(48, 50, 56, 0.72) 0%,
+        rgba(24, 26, 30, 0.58) 100%
+      );
+      backdrop-filter: blur(40px) saturate(170%);
+      -webkit-backdrop-filter: blur(40px) saturate(170%);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      box-shadow:
+        0 22px 50px rgba(0, 0, 0, 0.4),
+        inset 0 1px 0 rgba(255, 255, 255, 0.12);
+      color: #f5f5f7;
+    }
+    .glass-dark .muted { color: rgba(245,245,247,0.62) !important; }
+    .glass-dark .dim { color: rgba(245,245,247,0.42) !important; }
+    .glass-dark .hairline { background: rgba(255,255,255,0.1) !important; }
+    .glass-dark .bar-track { background: rgba(255,255,255,0.1) !important; }
+    .glass-dark .step-box {
+      background: rgba(255,255,255,0.06) !important;
+      border-color: rgba(255,255,255,0.1) !important;
+    }
+    .glass-dark .glass-btn {
+      color: #f5f5f7;
+      background: linear-gradient(180deg, rgba(255,255,255,0.14), rgba(255,255,255,0.06));
+      border-color: rgba(255,255,255,0.14);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.12);
+    }
+
+    .muted { color: var(--text-2); }
+    .dim { color: var(--text-3); }
+    .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .hairline { height: 1px; background: rgba(29,29,31,0.08); margin: 11px 0; }
+
+    /* —— Menu bar stage —— */
+    .stage {
+      border-radius: 20px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.35);
+      box-shadow: 0 30px 80px rgba(20, 40, 80, 0.25);
+      background: rgba(255,255,255,0.08);
+    }
+    .fake-mb {
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 14px;
+      font-size: 12px;
+      color: rgba(0,0,0,0.72);
+      background: linear-gradient(180deg, rgba(255,255,255,0.55), rgba(255,255,255,0.28));
+      backdrop-filter: blur(24px) saturate(180%);
+      -webkit-backdrop-filter: blur(24px) saturate(180%);
+      border-bottom: 1px solid rgba(255,255,255,0.35);
+      user-select: none;
+    }
+    .fake-mb .l, .fake-mb .r { display: flex; gap: 14px; align-items: center; }
+    .mb-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 500;
+      transition: background 150ms ease;
+    }
+    .mb-item:hover, .mb-item.open { background: rgba(0,0,0,0.08); }
+    .mb-item .led {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--status);
+      box-shadow: 0 0 8px var(--status);
+    }
+    .desktop {
+      min-height: 460px;
+      padding: 32px 28px;
+      position: relative;
+      /* show wallpaper through — stage is transparent over body wallpaper */
+      background: transparent;
+    }
+
+    /* Popover */
+    .popover {
+      width: 332px;
+      margin-left: auto;
+      padding: 14px 14px 12px;
+      position: relative;
+    }
+    .popover.hidden { display: none; }
+    .popover::before {
+      /* specular highlight strip */
+      content: "";
+      position: absolute;
+      left: 12%;
+      right: 12%;
+      top: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.9), transparent);
+      opacity: 0.85;
+      pointer-events: none;
+    }
+
+    .pop-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+    }
+    .pop-head h2 {
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    .pop-head .sub { font-size: 11px; margin-top: 2px; }
+    .status-orb {
+      width: 10px; height: 10px; border-radius: 50%;
+      margin-top: 4px;
+      background: var(--status);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--status) 25%, transparent),
+                  0 0 12px var(--status);
+    }
+
+    .account .email { font-size: 13px; font-weight: 600; }
+    .account .meta { font-size: 11px; margin-top: 2px; }
+
+    /* Signature: liquid progress bar */
+    .limit { margin-bottom: 10px; }
+    .limit:last-of-type { margin-bottom: 0; }
+    .limit-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      font-size: 11px;
+      margin-bottom: 5px;
+    }
+    .limit-top .val {
+      font-family: var(--mono);
+      font-weight: 600;
+      font-size: 12px;
+      color: var(--text);
+    }
+    .glass-dark .limit-top .val { color: #f5f5f7; }
+
+    .liquid-track {
+      height: 9px;
+      border-radius: 99px;
+      position: relative;
+      overflow: hidden;
+      background: rgba(0,0,0,0.08);
+      box-shadow: inset 0 1px 2px rgba(0,0,0,0.08), inset 0 0 0 1px rgba(255,255,255,0.25);
+    }
+    .liquid-track.sm { height: 5px; }
+    .liquid-fill {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 0%;
+      border-radius: 99px;
+      transition: width 550ms cubic-bezier(0.2, 0.85, 0.25, 1);
+      background: linear-gradient(90deg, var(--bar-a), var(--bar-b));
+      box-shadow: 0 0 12px color-mix(in srgb, var(--bar-b) 55%, transparent);
+    }
+    .liquid-fill::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      background: linear-gradient(180deg, rgba(255,255,255,0.45) 0%, transparent 55%);
+      pointer-events: none;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+    .metric label {
+      display: block;
+      font-size: 10px;
+      color: var(--text-3);
+      margin-bottom: 2px;
+      letter-spacing: 0.01em;
+    }
+    .metric b {
+      font-size: 13px;
+      font-weight: 600;
+      font-family: var(--mono);
+    }
+    .glass-dark .metric label { color: rgba(245,245,247,0.42); }
+
+    .task-state {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--blue);
+    }
+    .task-state.idle { color: inherit; }
+    .task-meta { font-size: 11px; margin-top: 3px; }
+    .step-box {
+      margin-top: 8px;
+      font-size: 11px;
+      padding: 7px 9px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.35);
+      border: 1px solid rgba(255,255,255,0.4);
+      color: var(--text-2);
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .actions .spacer { flex: 1; }
+    .actions .glass-btn { padding: 6px 11px; font-size: 12px; border-radius: 10px; }
+
+    /* —— Dashboard bento —— */
+    .bento {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 12px;
+    }
+    @media (max-width: 860px) {
+      .bento { grid-template-columns: 1fr 1fr; }
+      .span-2, .span-3, .span-4, .span-6 { grid-column: span 2 !important; }
+    }
+    @media (max-width: 520px) {
+      .bento { grid-template-columns: 1fr; }
+      .span-2, .span-3, .span-4, .span-6 { grid-column: span 1 !important; }
+    }
+    .span-2 { grid-column: span 2; }
+    .span-3 { grid-column: span 3; }
+    .span-4 { grid-column: span 4; }
+    .span-6 { grid-column: span 6; }
+
+    .tile {
+      padding: 16px;
+      border-radius: var(--r-xl);
+      min-height: 120px;
+    }
+    .tile h3 {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-3);
+      margin-bottom: 12px;
+    }
+    .kv {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 13px;
+      padding: 5px 0;
+      border-bottom: 1px solid rgba(29,29,31,0.06);
+    }
+    .kv:last-child { border-bottom: none; }
+    .kv span { color: var(--text-2); }
+    .kv b { font-weight: 500; font-family: var(--mono); font-size: 12px; }
+
+    .hero-num {
+      font-size: 42px;
+      font-weight: 700;
+      font-family: var(--mono);
+      letter-spacing: -0.04em;
+      line-height: 1;
+      margin: 4px 0 8px;
+    }
+    .hero-num small {
+      font-size: 18px;
+      font-weight: 600;
+      opacity: 0.55;
+      margin-left: 2px;
+    }
+
+    .chart {
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+      height: 132px;
+      padding-top: 4px;
+    }
+    .chart .col {
+      flex: 1;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 6px;
+    }
+    .chart .fill {
+      width: 100%;
+      border-radius: 8px 8px 4px 4px;
+      min-height: 4px;
+      background: linear-gradient(180deg, rgba(100,210,255,0.95), rgba(10,132,255,0.85));
+      box-shadow: 0 4px 12px rgba(10,132,255,0.25);
+      transition: height 400ms ease;
+    }
+    .chart .lbl {
+      font-size: 10px;
+      font-family: var(--mono);
+      color: var(--text-3);
+    }
+
+    .task-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(29,29,31,0.06);
+    }
+    .task-row:last-child { border-bottom: none; }
+    .task-row .dot {
+      width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+    }
+    .task-row .dot.ok { background: var(--green); box-shadow: 0 0 8px rgba(48,209,88,0.5); }
+    .task-row .dot.fail { background: var(--red); box-shadow: 0 0 8px rgba(255,69,58,0.45); }
+    .task-row .info { flex: 1; min-width: 0; }
+    .task-row .info strong { display: block; font-size: 13px; font-weight: 560; }
+    .task-row .info em {
+      font-style: normal; font-size: 11px; color: var(--text-2);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block;
+    }
+    .task-row .nums {
+      text-align: right;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-2);
+    }
+
+    /* —— Widget —— */
+    .widget-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 28px;
+      align-items: flex-start;
+    }
+    .widget-label {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-2);
+      margin-bottom: 10px;
+    }
+    .widget {
+      width: 340px;
+      height: 158px;
+      padding: 16px 18px;
+      border-radius: 26px;
+      display: flex;
+      gap: 16px;
+      position: relative;
+      overflow: hidden;
+    }
+    .widget::before {
+      content: "";
+      position: absolute;
+      left: 10%;
+      right: 10%;
+      top: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.85), transparent);
+      pointer-events: none;
+    }
+    .w-left { flex: 1.1; display: flex; flex-direction: column; min-width: 0; }
+    .w-right { flex: 1; display: flex; flex-direction: column; justify-content: space-between; min-width: 0; }
+    .w-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-2);
+    }
+    .w-top .led {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--status);
+      box-shadow: 0 0 8px var(--status);
+    }
+    .w-big {
+      font-size: 36px;
+      font-weight: 700;
+      font-family: var(--mono);
+      letter-spacing: -0.04em;
+      line-height: 1.05;
+      margin: 6px 0 2px;
+    }
+    .w-metric label {
+      display: block;
+      font-size: 10px;
+      color: var(--text-3);
+      margin-bottom: 1px;
+    }
+    .w-metric b {
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: block;
+    }
+
+    .footnote {
+      margin-top: 28px;
+      padding: 14px 16px;
+      border-radius: 14px;
+      font-size: 12.5px;
+      color: var(--text-2);
+      line-height: 1.55;
+    }
+    .footnote code {
+      font-family: var(--mono);
+      font-size: 11.5px;
+      padding: 1px 6px;
+      border-radius: 5px;
+      background: rgba(255,255,255,0.45);
+      border: 1px solid rgba(255,255,255,0.5);
+    }
+    .footnote a { color: #0060df; }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 50;
+      padding: 12px 16px;
+      border-radius: 14px;
+      font-size: 13px;
+      max-width: 280px;
+      transform: translateY(12px);
+      opacity: 0;
+      pointer-events: none;
+      transition: 220ms ease;
+    }
+    .toast.show { transform: none; opacity: 1; }
+
+    .theme-toggle.active {
+      background: linear-gradient(180deg, rgba(30,30,32,0.75), rgba(20,20,22,0.65));
+      color: #f5f5f7;
+      border-color: rgba(255,255,255,0.18);
+    }
+  </style>
+</head>
+<body>
+  <div class="wallpaper" aria-hidden="true"></div>
+
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#1d1d1f" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 14c2-4 4-6 8-6s6 2 8 6" />
+            <path d="M4 10c2 4 4 6 8 6s6-2 8-6" />
+            <circle cx="12" cy="12" r="1.6" fill="#0a84ff" stroke="none"/>
+          </svg>
+        </div>
+        <div>
+          <h1>Codex-Pulse</h1>
+          <p>macOS Liquid Glass · 菜单栏与小组件预览</p>
+        </div>
+      </div>
+      <div class="controls">
+        <span class="pill"><span class="led" id="modeLed"></span> Mock 实时</span>
+        <button class="glass-btn theme-toggle" id="btnTheme" type="button">深色玻璃</button>
+        <button class="glass-btn" id="btnSim" type="button">暂停模拟</button>
+        <button class="glass-btn" id="btnSpike" type="button">额度冲高</button>
+        <button class="glass-btn primary" id="btnRefresh" type="button">刷新</button>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist" aria-label="预览界面">
+      <button class="tab" role="tab" aria-selected="true" data-tab="menubar">菜单栏</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="dashboard">看板</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="widget">小组件</button>
+    </nav>
+
+    <!-- Menu bar -->
+    <section class="panel active" id="panel-menubar" role="tabpanel">
+      <div class="stage">
+        <div class="fake-mb">
+          <div class="l">
+            <strong style="opacity:.8"></strong>
+            <span>CodexPulse</span>
+            <span class="dim">文件</span>
+            <span class="dim">编辑</span>
+          </div>
+          <div class="r">
+            <span class="mono dim" id="clock">--:--</span>
+            <div class="mb-item open" id="mbIcon" role="button" tabindex="0" aria-label="打开 Codex-Pulse">
+              <span class="led" id="mbLed"></span>
+              <span id="mbPercent">62%</span>
+            </div>
+          </div>
+        </div>
+        <div class="desktop">
+          <div class="popover glass" id="popover">
+            <div class="pop-head">
+              <div>
+                <h2>Codex-Pulse</h2>
+                <div class="sub muted" id="connLabel">演示模式 · 本地 Mock</div>
+              </div>
+              <div class="status-orb" id="popOrb" aria-hidden="true"></div>
+            </div>
+            <div class="hairline"></div>
+            <div class="account">
+              <div class="email" id="email">dev@example.com</div>
+              <div class="meta muted" id="planAuth">Pro · ChatGPT</div>
+            </div>
+            <div class="hairline"></div>
+            <div class="limit">
+              <div class="limit-top">
+                <span class="muted" id="pName">主额度窗口</span>
+                <span><span class="dim">剩余</span> <span class="val" id="pPct">62%</span> <span class="dim">·</span> <span class="dim mono" id="pCd">2h 18m</span></span>
+              </div>
+              <div class="liquid-track bar-track"><div class="liquid-fill" id="pBar"></div></div>
+            </div>
+            <div class="limit">
+              <div class="limit-top">
+                <span class="muted" id="sName">周额度</span>
+                <span><span class="val" id="sPct">28%</span> <span class="dim">·</span> <span class="dim mono" id="sCd">3d</span></span>
+              </div>
+              <div class="liquid-track sm bar-track"><div class="liquid-fill" id="sBar"></div></div>
+            </div>
+            <div class="dim" style="font-size:11px;margin-top:8px" id="resetCards">重置卡 ×1</div>
+            <div class="hairline"></div>
+            <div class="metrics">
+              <div class="metric"><label>今日 Token</label><b id="tokToday">142.0K</b></div>
+              <div class="metric"><label>累计</label><b id="tokTotal">4.8M</b></div>
+              <div class="metric"><label>连续</label><b id="streak">12 天</b></div>
+            </div>
+            <div class="hairline"></div>
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:baseline">
+                <div class="task-state" id="taskState">正在生成代码</div>
+                <div class="dim mono" id="taskElapsed" style="font-size:11px">7:00</div>
+              </div>
+              <div class="task-meta muted" id="taskProject">Codex-Pulse · o3 · high</div>
+              <div class="step-box" id="taskStep">编写菜单栏面板</div>
+            </div>
+            <div class="hairline"></div>
+            <div class="actions">
+              <button class="glass-btn" type="button" id="popRefresh">刷新</button>
+              <button class="glass-btn" type="button" data-goto="dashboard">看板</button>
+              <span class="spacer"></span>
+              <button class="glass-btn" type="button" id="btnDiag">诊断</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Dashboard -->
+    <section class="panel" id="panel-dashboard" role="tabpanel">
+      <div class="bento">
+        <div class="tile glass span-2">
+          <h3>主额度 · 剩余</h3>
+          <div class="hero-num mono" id="dHeroPct">62<small>%</small></div>
+          <div class="liquid-track bar-track" style="margin:10px 0 8px"><div class="liquid-fill" id="dHeroBar"></div></div>
+          <div class="muted" style="font-size:12px">重置 <span class="mono" id="dHeroCd">2h 18m</span></div>
+        </div>
+        <div class="tile glass span-2">
+          <h3>账号</h3>
+          <div class="kv"><span>邮箱</span><b id="dEmail">—</b></div>
+          <div class="kv"><span>套餐</span><b id="dPlan">—</b></div>
+          <div class="kv"><span>认证</span><b id="dAuth">—</b></div>
+          <div class="kv"><span>CLI</span><b id="dCli">—</b></div>
+        </div>
+        <div class="tile glass span-2">
+          <h3>Token</h3>
+          <div class="kv"><span>今日</span><b id="dTokToday">—</b></div>
+          <div class="kv"><span>近 7 天</span><b id="dTok7">—</b></div>
+          <div class="kv"><span>累计</span><b id="dTokTotal">—</b></div>
+          <div class="kv"><span>连续</span><b id="dStreak">—</b></div>
+        </div>
+        <div class="tile glass span-3">
+          <h3>当前任务</h3>
+          <div class="kv"><span>状态</span><b id="dTaskState">—</b></div>
+          <div class="kv"><span>项目</span><b id="dTaskProj">—</b></div>
+          <div class="kv"><span>模型</span><b id="dTaskModel">—</b></div>
+          <div class="kv"><span>已运行</span><b id="dTaskElapsed">—</b></div>
+          <div class="step-box" id="dTaskStep" style="margin-top:10px">—</div>
+        </div>
+        <div class="tile glass span-3">
+          <h3>次级额度</h3>
+          <div class="kv"><span>周额度</span><b id="dSecPct">—</b></div>
+          <div class="liquid-track bar-track" style="margin:12px 0"><div class="liquid-fill" id="dSecBar"></div></div>
+          <div class="kv"><span>重置</span><b id="dSecCd">—</b></div>
+          <div class="kv"><span>重置卡</span><b id="dCards">—</b></div>
+        </div>
+        <div class="tile glass span-3">
+          <h3>近 7 日 Token</h3>
+          <div class="chart" id="chart"></div>
+        </div>
+        <div class="tile glass span-3">
+          <h3>最近任务</h3>
+          <div id="recentList"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Widget -->
+    <section class="panel" id="panel-widget" role="tabpanel">
+      <div class="widget-row">
+        <div>
+          <div class="widget-label">中尺寸 · 浅色玻璃</div>
+          <div class="widget glass" id="widgetLight">
+            <div class="w-left">
+              <div class="w-top">Codex-Pulse <span class="led" id="wlLed"></span></div>
+              <div class="w-big" id="wlPct">62%</div>
+              <div class="muted" style="font-size:11px" id="wlName">主额度窗口</div>
+              <div class="liquid-track bar-track" style="margin:8px 0 6px"><div class="liquid-fill" id="wlBar"></div></div>
+              <div class="dim" style="font-size:11px">重置 <span class="mono" id="wlCd">2h 18m</span></div>
+            </div>
+            <div class="w-right">
+              <div class="w-metric"><label>次级额度</label><b id="wlSec">28%</b></div>
+              <div class="w-metric"><label>今日 Token</label><b id="wlTok">142.0K</b></div>
+              <div class="w-metric"><label>任务</label><b id="wlTask">正在生成代码</b></div>
+              <div class="w-metric"><label>模型</label><b id="wlModel">o3</b></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="widget-label">中尺寸 · 深色玻璃</div>
+          <div class="widget glass-dark" id="widgetDark">
+            <div class="w-left">
+              <div class="w-top" style="color:rgba(245,245,247,.62)">Codex-Pulse <span class="led" id="wdLed"></span></div>
+              <div class="w-big" id="wdPct">62%</div>
+              <div style="font-size:11px;color:rgba(245,245,247,.62)" id="wdName">主额度窗口</div>
+              <div class="liquid-track bar-track" style="margin:8px 0 6px;background:rgba(255,255,255,.1)"><div class="liquid-fill" id="wdBar"></div></div>
+              <div style="font-size:11px;color:rgba(245,245,247,.42)">重置 <span class="mono" id="wdCd">2h 18m</span></div>
+            </div>
+            <div class="w-right">
+              <div class="w-metric"><label style="color:rgba(245,245,247,.42)">次级额度</label><b id="wdSec">28%</b></div>
+              <div class="w-metric"><label style="color:rgba(245,245,247,.42)">今日 Token</label><b id="wdTok">142.0K</b></div>
+              <div class="w-metric"><label style="color:rgba(245,245,247,.42)">任务</label><b id="wdTask">正在生成代码</b></div>
+              <div class="w-metric"><label style="color:rgba(245,245,247,.42)">模型</label><b id="wdModel">o3</b></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer class="footnote glass">
+      视觉参考 <a href="https://github.com/nextlevelbuilder/ui-ux-pro-max-skill" target="_blank" rel="noopener">ui-ux-pro-max-skill</a>
+      中的 Glassmorphism / Liquid Glass / Spatial UI：毛玻璃 <code>blur(40px) saturate(180%)</code>、半透明层、内高光边、液态进度条。
+      设计令牌见 <code>design-system/MASTER.md</code>。SwiftUI 使用 <code>.ultraThinMaterial</code> 对齐同一套材质。
+    </footer>
+  </div>
+
+  <div class="toast glass" id="toast" role="status"></div>
+
+  <script>
+    const STATES = ["正在思考", "正在生成代码", "正在执行命令", "正在修改文件", "正在调用工具"];
+    const STEPS = ["分析项目结构", "编写菜单栏面板", "更新 Widget 数据", "运行单元测试", "格式化代码"];
+
+    const state = {
+      simulating: true,
+      darkPopover: false,
+      primary: 62,
+      secondary: 28,
+      primaryReset: 2 * 3600 + 18 * 60,
+      secondaryReset: 3 * 24 * 3600,
+      todayTokens: 142000,
+      totalTokens: 4820000,
+      last7: 986000,
+      streak: 12,
+      email: "dev@example.com",
+      plan: "Pro",
+      auth: "ChatGPT",
+      cli: "0.45.0",
+      taskState: "正在生成代码",
+      taskActive: true,
+      project: "Codex-Pulse",
+      branch: "main",
+      model: "o3",
+      effort: "high",
+      step: "编写菜单栏面板",
+      filesChanged: 6,
+      elapsed: 420,
+      resetCards: 1,
+      daily: [
+        { d: "09", v: 120000 }, { d: "10", v: 85000 }, { d: "11", v: 210000 },
+        { d: "12", v: 156000 }, { d: "13", v: 98000 }, { d: "14", v: 175000 }, { d: "15", v: 142000 }
+      ],
+      recent: [
+        { name: "Codex-Pulse", summary: "实现菜单栏额度面板", tokens: 48200, dur: 720, ok: true },
+        { name: "api-gateway", summary: "修复 JWT 刷新逻辑", tokens: 22100, dur: 340, ok: true },
+        { name: "mobile-app", summary: "集成推送失败后回滚", tokens: 61000, dur: 1100, ok: false }
+      ]
+    };
+
+    const fmtTokens = n => n >= 1e6 ? (n/1e6).toFixed(1)+"M" : n >= 1e3 ? (n/1e3).toFixed(1)+"K" : String(n);
+    const fmtPct = p => Math.round(p) + "%";
+    const fmtCd = sec => {
+      sec = Math.max(0, Math.floor(sec));
+      const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+      if (h >= 24) return Math.floor(h/24) + "d " + (h%24) + "h";
+      if (h > 0) return h + "h " + String(m).padStart(2,"0") + "m";
+      if (m > 0) return m + "m " + String(s).padStart(2,"0") + "s";
+      return s + "s";
+    };
+    const fmtDur = sec => {
+      sec = Math.max(0, Math.floor(sec));
+      const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+      return h > 0 ? h+":"+String(m).padStart(2,"0")+":"+String(s).padStart(2,"0") : m+":"+String(s).padStart(2,"0");
+    };
+    const barColors = p => {
+      // p = remaining percent
+      if (p <= 0) return { a: "#ff6b63", b: "#ff453a", c: "var(--red)" };
+      if (p < 15) return { a: "#ff6b63", b: "#ff453a", c: "var(--red)" };
+      if (p < 30) return { a: "#ffb340", b: "#ff9f0a", c: "var(--orange)" };
+      if (p < 50) return { a: "#ffe04a", b: "#ffd60a", c: "var(--yellow)" };
+      return { a: "#5eea8a", b: "#30d158", c: "var(--green)" };
+    };
+    const statusColor = () => {
+      const rem = 100 - state.primary;
+      if (state.primary >= 100 || rem <= 0) return "var(--red)";
+      if (rem < 15) return "var(--red)";
+      if (rem < 30) return "var(--yellow)";
+      if (state.taskActive) return "var(--blue)";
+      return "var(--green)";
+    };
+
+    function toast(msg) {
+      const el = document.getElementById("toast");
+      el.textContent = msg;
+      el.classList.add("show");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => el.classList.remove("show"), 2200);
+    }
+
+    function setBar(el, pct, colors) {
+      el.style.width = Math.min(100, pct) + "%";
+      el.style.setProperty("--bar-a", colors.a);
+      el.style.setProperty("--bar-b", colors.b);
+      el.style.background = `linear-gradient(90deg, ${colors.a}, ${colors.b})`;
+    }
+
+    function render() {
+      const sc = statusColor();
+      const pc = barColors(100 - state.primary);
+      const sc2 = barColors(100 - state.secondary);
+      document.documentElement.style.setProperty("--status", sc);
+
+      document.getElementById("mbPercent").textContent = fmtPct(100 - state.primary);
+      document.getElementById("mbLed").style.background = sc;
+      document.getElementById("mbLed").style.boxShadow = "0 0 8px " + sc;
+      document.getElementById("modeLed").style.background = sc;
+      document.getElementById("popOrb").style.background = sc;
+
+      document.getElementById("email").textContent = state.email;
+      document.getElementById("planAuth").textContent = state.plan + " · " + state.auth;
+      document.getElementById("pPct").textContent = fmtPct(100 - state.primary);
+      document.getElementById("pCd").textContent = fmtCd(state.primaryReset);
+      setBar(document.getElementById("pBar"), 100 - state.primary, pc);
+      document.getElementById("sPct").textContent = fmtPct(100 - state.secondary);
+      document.getElementById("sCd").textContent = fmtCd(state.secondaryReset);
+      setBar(document.getElementById("sBar"), 100 - state.secondary, sc2);
+      document.getElementById("resetCards").textContent = "重置卡 ×" + state.resetCards;
+      document.getElementById("tokToday").textContent = fmtTokens(state.todayTokens);
+      document.getElementById("tokTotal").textContent = fmtTokens(state.totalTokens);
+      document.getElementById("streak").textContent = state.streak + " 天";
+
+      const ts = document.getElementById("taskState");
+      ts.textContent = state.taskState;
+      ts.classList.toggle("idle", !state.taskActive);
+      document.getElementById("taskElapsed").textContent = state.taskActive ? fmtDur(state.elapsed) : "—";
+      document.getElementById("taskProject").textContent = `${state.project} · ${state.model} · ${state.effort}`;
+      document.getElementById("taskStep").textContent = state.step;
+
+      // dashboard
+      document.getElementById("dHeroPct").innerHTML = Math.round(100 - state.primary) + "<small>%</small>";
+      setBar(document.getElementById("dHeroBar"), 100 - state.primary, pc);
+      document.getElementById("dHeroCd").textContent = fmtCd(state.primaryReset);
+      document.getElementById("dEmail").textContent = state.email;
+      document.getElementById("dPlan").textContent = state.plan;
+      document.getElementById("dAuth").textContent = state.auth;
+      document.getElementById("dCli").textContent = state.cli;
+      document.getElementById("dTokToday").textContent = fmtTokens(state.todayTokens);
+      document.getElementById("dTok7").textContent = fmtTokens(state.last7);
+      document.getElementById("dTokTotal").textContent = fmtTokens(state.totalTokens);
+      document.getElementById("dStreak").textContent = state.streak + " 天";
+      document.getElementById("dTaskState").textContent = state.taskState;
+      document.getElementById("dTaskProj").textContent = state.project;
+      document.getElementById("dTaskModel").textContent = state.model + " · " + state.effort;
+      document.getElementById("dTaskElapsed").textContent = state.taskActive ? fmtDur(state.elapsed) : "—";
+      document.getElementById("dTaskStep").textContent = state.step;
+      document.getElementById("dSecPct").textContent = fmtPct(100 - state.secondary);
+      setBar(document.getElementById("dSecBar"), 100 - state.secondary, sc2);
+      document.getElementById("dSecCd").textContent = fmtCd(state.secondaryReset);
+      document.getElementById("dCards").textContent = "×" + state.resetCards;
+
+      const maxV = Math.max(...state.daily.map(x => x.v), 1);
+      document.getElementById("chart").innerHTML = state.daily.map(x => {
+        const h = Math.max(4, Math.round((x.v / maxV) * 110));
+        return `<div class="col"><div class="fill" style="height:${h}px"></div><div class="lbl">${x.d}</div></div>`;
+      }).join("");
+
+      document.getElementById("recentList").innerHTML = state.recent.map(r => `
+        <div class="task-row">
+          <div class="dot ${r.ok ? "ok" : "fail"}"></div>
+          <div class="info"><strong>${r.name}</strong><em>${r.summary}</em></div>
+          <div class="nums">${fmtTokens(r.tokens)}<br>${fmtDur(r.dur)}</div>
+        </div>`).join("");
+
+      // widgets
+      [["wl","wd"]].flat().forEach(prefix => {
+        document.getElementById(prefix + "Pct").textContent = fmtPct(100 - state.primary);
+        document.getElementById(prefix + "Name").textContent = "主额度窗口";
+        document.getElementById(prefix + "Cd").textContent = fmtCd(state.primaryReset);
+        setBar(document.getElementById(prefix + "Bar"), 100 - state.primary, pc);
+        document.getElementById(prefix + "Led").style.background = sc;
+        document.getElementById(prefix + "Led").style.boxShadow = "0 0 8px " + sc;
+        document.getElementById(prefix + "Sec").textContent = fmtPct(100 - state.secondary);
+        document.getElementById(prefix + "Tok").textContent = fmtTokens(state.todayTokens);
+        document.getElementById(prefix + "Task").textContent = state.taskState;
+        document.getElementById(prefix + "Model").textContent = state.model;
+      });
+    }
+
+    function tickClock() {
+      const n = new Date();
+      document.getElementById("clock").textContent =
+        String(n.getHours()).padStart(2,"0") + ":" + String(n.getMinutes()).padStart(2,"0");
+    }
+
+    function simTick() {
+      if (!state.simulating) return;
+      state.primary = Math.min(99.4, state.primary + Math.random() * 0.28);
+      state.secondary = Math.min(80, state.secondary + Math.random() * 0.06);
+      state.primaryReset = Math.max(0, state.primaryReset - 1);
+      state.secondaryReset = Math.max(0, state.secondaryReset - 1);
+      if (state.taskActive) {
+        state.elapsed += 1;
+        if (Math.random() < 0.07) {
+          state.taskState = STATES[Math.floor(Math.random() * STATES.length)];
+          state.step = STEPS[Math.floor(Math.random() * STEPS.length)];
+          state.todayTokens += Math.floor(Math.random() * 350);
+          state.daily[6].v = state.todayTokens;
+        }
+      }
+      if (state.primary >= 85 && state.primary < 85.35) toast("主额度已达 85%");
+      render();
+    }
+
+    document.querySelectorAll(".tab").forEach(tab => {
+      tab.addEventListener("click", () => {
+        document.querySelectorAll(".tab").forEach(t => t.setAttribute("aria-selected", "false"));
+        tab.setAttribute("aria-selected", "true");
+        document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+        document.getElementById("panel-" + tab.dataset.tab).classList.add("active");
+      });
+    });
+    document.querySelectorAll("[data-goto]").forEach(btn => {
+      btn.addEventListener("click", () => document.querySelector(`.tab[data-tab="${btn.dataset.goto}"]`).click());
+    });
+
+    const togglePop = () => {
+      document.getElementById("popover").classList.toggle("hidden");
+      document.getElementById("mbIcon").classList.toggle("open");
+    };
+    document.getElementById("mbIcon").addEventListener("click", togglePop);
+    document.getElementById("mbIcon").addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); togglePop(); }
+    });
+
+    document.getElementById("btnTheme").addEventListener("click", () => {
+      state.darkPopover = !state.darkPopover;
+      const pop = document.getElementById("popover");
+      pop.classList.toggle("glass", !state.darkPopover);
+      pop.classList.toggle("glass-dark", state.darkPopover);
+      document.getElementById("btnTheme").classList.toggle("active", state.darkPopover);
+      document.getElementById("btnTheme").textContent = state.darkPopover ? "浅色玻璃" : "深色玻璃";
+      toast(state.darkPopover ? "菜单栏：深色玻璃" : "菜单栏：浅色玻璃");
+    });
+
+    document.getElementById("btnSim").addEventListener("click", () => {
+      state.simulating = !state.simulating;
+      document.getElementById("btnSim").textContent = state.simulating ? "暂停模拟" : "继续模拟";
+      toast(state.simulating ? "模拟已恢复" : "模拟已暂停");
+    });
+    document.getElementById("btnSpike").addEventListener("click", () => {
+      state.primary = Math.min(98, state.primary + 12 + Math.random() * 8);
+      render();
+      toast("主额度 " + fmtPct(state.primary));
+    });
+    document.getElementById("btnRefresh").addEventListener("click", () => {
+      state.todayTokens += Math.floor(Math.random() * 1800);
+      state.daily[6].v = state.todayTokens;
+      render();
+      toast("已刷新");
+    });
+    document.getElementById("popRefresh").addEventListener("click", () => document.getElementById("btnRefresh").click());
+    document.getElementById("btnDiag").addEventListener("click", () => {
+      const text = `Codex-Pulse Diagnostics\nConnected: Mock\nEmail: ${state.email}\nPrimary: ${fmtPct(100 - state.primary)}\nTask: ${state.taskState}`;
+      navigator.clipboard?.writeText(text).then(() => toast("诊断已复制")).catch(() => toast(text));
+    });
+
+    tickClock();
+    setInterval(tickClock, 1000);
+    setInterval(simTick, 1000);
+    render();
+  </script>
+</body>
+</html>

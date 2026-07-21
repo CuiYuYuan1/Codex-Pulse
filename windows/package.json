@@ -1,0 +1,57 @@
+{
+  "name": "codex-pulse-windows",
+  "version": "0.1.23",
+  "private": true,
+  "description": "Codex-Pulse for Windows",
+  "main": "src/main.js",
+  "author": "Codex-Pulse",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "test": "node tests/local-usage-history.test.js && node tests/mac-parity-contract.test.js",
+    "pack:win": "electron-builder --win nsis --x64",
+    "pack:win:portable": "electron-builder --win portable --x64 --config.win.artifactName=CodexPulse-Windows-Portable-\\${version}-\\${arch}.\\${ext}"
+  },
+  "devDependencies": {
+    "electron": "^37.2.3",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.codexpulse.windows",
+    "productName": "CodexPulse",
+    "asar": true,
+    "files": [
+      "src/**/*",
+      "!src/renderer/assets/weather/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "../dist/windows"
+    },
+    "extraResources": [
+      {
+        "from": "../CodexPulse/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon-256.png",
+        "to": "icon.png"
+      }
+    ],
+    "win": {
+      "icon": "../CodexPulse/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon-256.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "CodexPulse-Windows-Setup-${version}-${arch}.${ext}",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
