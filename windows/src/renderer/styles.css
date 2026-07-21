@@ -573,7 +573,7 @@ html[data-theme] .capsule::after {
 .capsule.information-enabled .token-metric { width: auto; align-items: flex-start; text-align: left; }
 .capsule.information-enabled .chevron { grid-column: 9; margin-left: 0; justify-self: end; }
 .mini-capsule { display: none; }
-html.mini-mode .stage { padding: 10px; }
+html.mini-mode .stage { padding: 10px; align-items: flex-end; }
 html.mini-mode.mini-transition-layout .stage {
   display: flex;
   justify-content: flex-end;
@@ -1099,12 +1099,12 @@ html[data-theme] .detail {
 html[data-theme="classic"] .detail {
   box-shadow: 0 5px 12px rgba(0,0,0,.08), 0 -1px 1px rgba(255,255,255,.12);
 }
-html[data-theme="midnight"] .capsule,
-html[data-theme="midnight"] .detail,
-html[data-theme="forest"] .capsule,
-html[data-theme="forest"] .detail,
-html[data-theme="amethyst"] .capsule,
-html[data-theme="amethyst"] .detail {
+/* Chromium cannot blur the desktop behind a transparent BrowserWindow the
+   way NSVisualEffectView does. These filters only create an expensive
+   offscreen pass while the synthetic glass gradients already provide the
+   complete material. Disable them for every theme. */
+html[data-theme] .capsule,
+html[data-theme] .detail {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
 }

@@ -23,9 +23,9 @@ ipcMain.handle("visual:resize", (event, mode) => {
     window.visualCollapsedWidth = Math.max(283, Math.min(471, Math.round(Number(mode.width))));
     window.visualInformationEnabled = mode.informationEnabled === true;
   }
-  const target = resolvedMode === "mini"
-      ? { width: 88, height: 88 }
-      : { width: 390, height: 810 };
+  // Production Windows keeps one DirectComposition surface in every mode;
+  // only the native hit-test shape changes between full and mini layouts.
+  const target = { width: 390, height: 810 };
   const old = window.getBounds();
   const area = screen.getDisplayMatching(old).workArea;
   const usesLeftEdgeAnchor = adaptiveRequest && resolvedMode === "collapsed";
@@ -316,8 +316,8 @@ async function captureFixture(fixture, expanded = false, theme = "classic", outp
 
 async function captureMini(style, taskMode = null, activityStyle = null, theme = null) {
   const window = new BrowserWindow({
-    width: 88,
-    height: 88,
+    width: 390,
+    height: 810,
     show: false,
     frame: false,
     transparent: true,
@@ -364,8 +364,8 @@ async function captureMini(style, taskMode = null, activityStyle = null, theme =
   fs.writeFileSync(path.join(outputDirectory, `mini-${style}${suffix}@2x.png`), image.toPNG());
 
   if (style === "quota" && !taskMode) {
-    window.webContents.sendInputEvent({ type: "mouseDown", x: 44, y: 44, button: "left", clickCount: 1 });
-    window.webContents.sendInputEvent({ type: "mouseUp", x: 44, y: 44, button: "left", clickCount: 1 });
+    window.webContents.sendInputEvent({ type: "mouseDown", x: 346, y: 44, button: "left", clickCount: 1 });
+    window.webContents.sendInputEvent({ type: "mouseUp", x: 346, y: 44, button: "left", clickCount: 1 });
     await wait(850);
     const interaction = await window.webContents.executeJavaScript(`({
       isMini: document.documentElement.classList.contains("mini-mode"),
@@ -477,8 +477,8 @@ async function assertPointerDoubleClickMinimizes() {
   );
   if (!isMini) throw new Error("real pointer double click did not enable mini mode");
   const bounds = window.getBounds();
-  if (bounds.width !== 88 || bounds.height !== 88) {
-    throw new Error(`mini window did not finish resizing: ${JSON.stringify(bounds)}`);
+  if (bounds.width !== 390 || bounds.height !== 810) {
+    throw new Error(`mini mode changed the stable native surface: ${JSON.stringify(bounds)}`);
   }
   const miniLayout = await window.webContents.executeJavaScript(`(() => {
     const capsule = document.getElementById("capsule").getBoundingClientRect();
@@ -493,9 +493,10 @@ async function assertPointerDoubleClickMinimizes() {
     && miniLayout.mini.top >= 0
     && miniLayout.mini.left + miniLayout.mini.width <= miniLayout.viewport.width
     && miniLayout.mini.top + miniLayout.mini.height <= miniLayout.viewport.height;
+  const expectedMiniLeft = miniLayout.viewport.width - 78;
   if (Math.abs(miniLayout.capsule.width - 68) > 0.5
       || Math.abs(miniLayout.capsule.height - 68) > 0.5
-      || Math.abs(miniLayout.capsule.left - 10) > 0.5
+      || Math.abs(miniLayout.capsule.left - expectedMiniLeft) > 0.5
       || Math.abs(miniLayout.capsule.top - 10) > 0.5
       || !visible) {
     throw new Error(`mini capsule is clipped or outside the window: ${JSON.stringify(miniLayout)}`);
@@ -509,15 +510,16 @@ async function assertPointerDoubleClickMinimizes() {
   const afterBlurBounds = window.getBounds();
   if (!afterDesktopBlur.isMini
       || Math.abs(afterDesktopBlur.capsuleWidth - 68) > 0.5
-      || afterBlurBounds.width !== 88
-      || afterBlurBounds.height !== 88) {
+      || afterBlurBounds.width !== 390
+      || afterBlurBounds.height !== 810) {
     throw new Error(`desktop blur restored the full capsule: ${JSON.stringify({ afterDesktopBlur, afterBlurBounds })}`);
   }
 
   // Match the macOS event contract: a second double-click restores the full
   // collapsed capsule, while a single click from mini restores and opens the
   // detail card. Neither path may leave a pending single-click behind.
-  click(2, 44, 44);
+  const miniCenterX = 346;
+  click(2, miniCenterX, 44);
   await wait(720);
   const restored = await window.webContents.executeJavaScript(`({
     isMini: document.documentElement.classList.contains('mini-mode'),
@@ -542,7 +544,7 @@ async function assertPointerDoubleClickMinimizes() {
     true
   );
   if (!minimizedAgain) throw new Error('second double click cycle did not return to mini mode');
-  click(1, 44, 44);
+  click(1, miniCenterX, 44);
   await wait(980);
   const expandedFromMini = await window.webContents.executeJavaScript(`({
     isMini: document.documentElement.classList.contains('mini-mode'),
@@ -590,8 +592,26 @@ async function assertMagnetAndDetailStayStable(fixture = "clear") {
   })()`, true);
   const hoverX = Math.round(base.left + base.width - 8);
   const hoverY = Math.round(base.top + base.height / 2);
+  const rapidSweep = [
+    { x: Math.round(base.left + 8), y: hoverY },
+    { x: Math.round(base.left + base.width / 2), y: Math.round(base.top + base.height - 7) },
+    { x: hoverX, y: hoverY },
+    { x: Math.round(base.left + base.width / 2), y: Math.round(base.top + 7) }
+  ];
+  for (const point of rapidSweep) {
+    window.webContents.sendInputEvent({ type: "mouseMove", x: point.x, y: point.y });
+    await wait(12);
+  }
+  await wait(24);
+  const rapidResult = await window.webContents.executeJavaScript(`(() => {
+    const rect = document.getElementById("capsule").getBoundingClientRect();
+    return { dx: rect.left - ${base.left}, dy: rect.top - ${base.top} };
+  })()`, true);
+  if (rapidResult.dy > -3.5 || Math.abs(rapidResult.dx) > 2.5) {
+    throw new Error(`rapid magnetic sweep lagged behind the final pointer direction: ${JSON.stringify(rapidResult)}`);
+  }
   window.webContents.sendInputEvent({ type: "mouseMove", x: hoverX, y: hoverY });
-  await wait(450);
+  await wait(48);
   const attracted = await window.webContents.executeJavaScript(`(() => {
     const rect = document.getElementById("capsule").getBoundingClientRect();
     const surface = document.querySelector(".capsule-theme-edge").getBoundingClientRect();

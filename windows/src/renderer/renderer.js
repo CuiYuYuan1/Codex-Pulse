@@ -534,6 +534,7 @@ function scheduleCollapsedWindowWidthSync(syncAfterRingTransition = true) {
       widthProperty,
       `${expandedCapsuleWidth}px`
     );
+    hoverGeometry = null;
     elements.capsule.dataset.naturalWidth = String(naturalCapsuleWidth);
     elements.capsule.dataset.expandedWidth = String(expandedCapsuleWidth);
     scheduleWindowShapeSync();
@@ -566,7 +567,7 @@ function paddedShapeRect(element, horizontalPadding, verticalPadding = horizonta
 }
 
 function currentWindowShape(expandedState = expanded) {
-  if (miniMode) return [];
+  if (miniMode) return [paddedShapeRect(elements.capsule, 10, 10)];
   // Keep the independently rendered hover/activity halo inside the native
   // Windows shape. Without this extra transparent perimeter setShape clips
   // the blur back to a thin colored line at the capsule edge.
@@ -1003,6 +1004,7 @@ async function runCapsuleMorphTransition(mutate) {
   // before the DOM swap had composited, exposing the mini ring for two frames.
   // A non-overlapping handoff also avoids showing full and mini capsules at
   // once, which reads as a bright circular flash on transparent Windows.
+  let incoming;
   const outgoing = elements.capsule.animate([
     { transform: "translate3d(0, 0, 0) scale(1)", opacity: 1 },
     { transform: "translate3d(0, 0, 0) scale(.72)", opacity: 0 }
@@ -1014,9 +1016,16 @@ async function runCapsuleMorphTransition(mutate) {
   try { await outgoing.finished; }
   catch { /* A newer state change or window resize may cancel the animation. */ }
 
+  // Freeze the fully transparent outgoing state in ordinary inline style,
+  // then dispose its compositor animation before changing the layout. This
+  // prevents DirectComposition from retaining an old mini-ring animation
+  // surface while the full quota ring is entering.
+  elements.capsule.style.opacity = "0";
+  elements.capsule.style.transform = "translate3d(0, 0, 0) scale(.72)";
+  outgoing.cancel();
   mutate();
   await new Promise((resolve) => requestAnimationFrame(resolve));
-  const incoming = elements.capsule.animate([
+  incoming = elements.capsule.animate([
     { transform: "translate3d(0, 0, 0) scale(.72)", opacity: 0 },
     { transform: "translate3d(0, 0, 0) scale(1)", opacity: 1 }
   ], {
@@ -1026,7 +1035,8 @@ async function runCapsuleMorphTransition(mutate) {
   });
   try { await incoming.ready; }
   catch { /* The animation can be superseded by a newer interaction. */ }
-  outgoing.cancel();
+  elements.capsule.style.removeProperty("opacity");
+  elements.capsule.style.removeProperty("transform");
   try { await incoming.finished; }
   catch { /* A newer state change or window resize may cancel the animation. */ }
   incoming.cancel();
@@ -1044,6 +1054,7 @@ async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
   const root = document.documentElement;
   elements.capsule.classList.remove("hovering");
   pendingGlow = null;
+  hoverGeometry = null;
 
   if (shouldMinimize && expanded) {
     expanded = false;
@@ -1073,9 +1084,7 @@ async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
         if (currentState) renderMini(currentState);
       });
       await window.pulse.resize("mini");
-      if (typeof window.pulse.setWindowShape === "function") {
-        await window.pulse.setWindowShape([{ x: 0, y: 0, width: 88, height: 88 }]);
-      }
+      await syncWindowShape(false);
     } else {
       if (expandAfterRestore) {
         root.classList.toggle(
@@ -1185,6 +1194,7 @@ function setExpanded(nextExpanded) {
     setMoreSettingsExpanded(false);
     elements.capsule.classList.remove("hovering");
     pendingGlow = null;
+    hoverGeometry = null;
     resetMagnet(true);
     updateTaskTunnel(currentState ? modeFor(currentState) : "idle");
     void revealDetailAfterResize(transitionGeneration);
@@ -1205,6 +1215,8 @@ function toggleExpanded() {
 let capsulePointer;
 let pendingGlow;
 let glowFrame;
+let lastGlowPaintAt = 0;
+let hoverGeometry;
 let pendingDrag;
 let dragFrame;
 const magnet = { x: 0, y: 0, renderX: 0, renderY: 0, vx: 0, vy: 0, targetX: 0, targetY: 0, returning: false, frame: null, lastTime: 0 };
@@ -1227,6 +1239,7 @@ function springStep(value, velocity, target, deltaSeconds, stiffness = 155, damp
 
 function applyMagnetFrame(timestamp) {
   magnet.frame = null;
+  let directFollow = false;
   const deltaSeconds = magnet.lastTime
     ? Math.min(1 / 30, Math.max(1 / 240, (timestamp - magnet.lastTime) / 1000))
     : 1 / 60;
@@ -1249,26 +1262,28 @@ function applyMagnetFrame(timestamp) {
     magnet.vx = horizontal.velocity;
     magnet.vy = vertical.velocity;
   } else {
-    // Time-based exponential following keeps the same feel at 60/90/120Hz
-    // and across brief Windows compositor stalls.
-    const blend = 1 - Math.exp(-deltaSeconds / 0.055);
+    // Pointer movement is already coalesced by requestAnimationFrame. Apply
+    // its newest target immediately on that compositor frame instead of
+    // adding a second low-pass filter, which accumulated visible lag during
+    // fast left/right or up/down movement.
     magnet.vx = 0;
     magnet.vy = 0;
-    magnet.x += (magnet.targetX - magnet.x) * blend;
-    magnet.y += (magnet.targetY - magnet.y) * blend;
+    magnet.x = magnet.targetX;
+    magnet.y = magnet.targetY;
+    directFollow = true;
   }
   const moving = Math.abs(magnet.targetX - magnet.x) > 0.03
     || Math.abs(magnet.targetY - magnet.y) > 0.03
     || Math.abs(magnet.vx) > 0.35
     || Math.abs(magnet.vy) > 0.35;
-  if (moving) {
+  if (directFollow || moving) {
     // Preserve subpixel coordinates. Physical-pixel rounding made the capsule
     // jump in 0.5/0.8px steps at common Windows scale factors. The individual
     // translate property also keeps magnetic motion separate from morphing.
     magnet.renderX = magnet.x;
     magnet.renderY = magnet.y;
     elements.capsule.style.translate = `${magnet.renderX.toFixed(3)}px ${magnet.renderY.toFixed(3)}px`;
-    magnet.frame = requestAnimationFrame(applyMagnetFrame);
+    if (moving) magnet.frame = requestAnimationFrame(applyMagnetFrame);
   } else if (magnet.targetX === 0 && magnet.targetY === 0) {
     magnet.x = 0;
     magnet.y = 0;
@@ -1314,13 +1329,24 @@ function resetMagnet(immediate = false) {
 function scheduleGlow(x, y, edge = "top") {
   pendingGlow = { x, y, edge };
   if (glowFrame) return;
-  glowFrame = requestAnimationFrame(() => {
+  const paint = (timestamp) => {
     glowFrame = null;
     if (!pendingGlow) return;
-    elements.capsule.style.setProperty("--glow-x", `${pendingGlow.x}px`);
-    elements.capsule.style.setProperty("--glow-y", `${pendingGlow.y}px`);
-    elements.capsule.dataset.glowEdge = pendingGlow.edge;
-  });
+    // Updating gradient centers invalidates masks and blur paint. Limit that
+    // decorative work to 30fps so the 60/120Hz magnetic translate stays on
+    // the compositor and responds first.
+    if (timestamp - lastGlowPaintAt < 32) {
+      glowFrame = requestAnimationFrame(paint);
+      return;
+    }
+    const glow = pendingGlow;
+    pendingGlow = null;
+    lastGlowPaintAt = timestamp;
+    elements.capsule.style.setProperty("--glow-x", `${glow.x}px`);
+    elements.capsule.style.setProperty("--glow-y", `${glow.y}px`);
+    elements.capsule.dataset.glowEdge = glow.edge;
+  };
+  glowFrame = requestAnimationFrame(paint);
 }
 
 function nearestCapsuleEdgePoint(x, y, width, height) {
@@ -1343,14 +1369,32 @@ function scheduleWindowDrag(x, y) {
   });
 }
 
-elements.capsule.addEventListener("pointerenter", () => {
-  if (!expanded && !miniMode) elements.capsule.classList.add("hovering");
+elements.capsule.addEventListener("pointerenter", (event) => {
+  if (!expanded && !miniMode) {
+    const rect = elements.capsule.getBoundingClientRect();
+    hoverGeometry = {
+      left: rect.left - magnet.renderX,
+      top: rect.top - magnet.renderY,
+      width: rect.width,
+      height: rect.height
+    };
+    elements.capsule.classList.add("hovering");
+    if (!adaptiveResizeInFlight && !reduceMotion) {
+      const localX = event.clientX - hoverGeometry.left;
+      const localY = event.clientY - hoverGeometry.top;
+      magnet.returning = false;
+      magnet.targetX = Math.max(-1, Math.min(1, (localX / hoverGeometry.width - 0.5) * 2)) * 12;
+      magnet.targetY = Math.max(-1, Math.min(1, (localY / hoverGeometry.height - 0.5) * 2)) * 8;
+      scheduleMagnet();
+    }
+  }
 });
 
 elements.capsule.addEventListener("pointerleave", () => {
   if (capsulePointer) return;
   elements.capsule.classList.remove("hovering");
   pendingGlow = null;
+  hoverGeometry = null;
   resetMagnet();
 });
 
@@ -1367,13 +1411,19 @@ elements.capsule.addEventListener("pointerdown", (event) => {
 });
 
 elements.capsule.addEventListener("pointermove", (event) => {
-  const rect = elements.capsule.getBoundingClientRect();
-  // getBoundingClientRect includes the current magnetic transform. Remove it
-  // before mapping the pointer so the target does not feed back into itself.
-  const localX = event.clientX - (rect.left - magnet.renderX);
-  const localY = event.clientY - (rect.top - magnet.renderY);
+  if (!hoverGeometry) {
+    const rect = elements.capsule.getBoundingClientRect();
+    hoverGeometry = {
+      left: rect.left - magnet.renderX,
+      top: rect.top - magnet.renderY,
+      width: rect.width,
+      height: rect.height
+    };
+  }
+  const localX = event.clientX - hoverGeometry.left;
+  const localY = event.clientY - hoverGeometry.top;
   if (!expanded && !miniMode) {
-    const glowPoint = nearestCapsuleEdgePoint(localX, localY, rect.width, rect.height);
+    const glowPoint = nearestCapsuleEdgePoint(localX, localY, hoverGeometry.width, hoverGeometry.height);
     scheduleGlow(glowPoint.x, glowPoint.y, glowPoint.edge);
   }
 
@@ -1382,8 +1432,8 @@ elements.capsule.addEventListener("pointermove", (event) => {
       magnet.targetX = 0;
       magnet.targetY = 0;
     } else {
-      const normalizedX = Math.max(-1, Math.min(1, (localX / rect.width - 0.5) * 2));
-      const normalizedY = Math.max(-1, Math.min(1, (localY / rect.height - 0.5) * 2));
+      const normalizedX = Math.max(-1, Math.min(1, (localX / hoverGeometry.width - 0.5) * 2));
+      const normalizedY = Math.max(-1, Math.min(1, (localY / hoverGeometry.height - 0.5) * 2));
       magnet.returning = false;
       magnet.targetX = normalizedX * 12;
       magnet.targetY = normalizedY * 8;
@@ -1416,6 +1466,7 @@ function finishCapsulePointer(event) {
   if (!elements.capsule.matches(":hover")) {
     elements.capsule.classList.remove("hovering");
     pendingGlow = null;
+    hoverGeometry = null;
   }
   resetMagnet(false);
   if (shouldToggle) {
@@ -1439,6 +1490,7 @@ elements.capsule.addEventListener("pointercancel", (event) => {
   pendingDrag = null;
   elements.capsule.classList.remove("dragging");
   elements.capsule.classList.remove("hovering");
+  hoverGeometry = null;
   window.pulse.endDrag();
   resetMagnet(true);
   if (elements.capsule.hasPointerCapture(event.pointerId)) {

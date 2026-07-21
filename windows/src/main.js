@@ -2178,10 +2178,13 @@ function resizeWindow(mode) {
   const mini = resolvedMode === "mini";
   const expanded = resolvedMode === true || resolvedMode === "expanded";
   const informationSize = { ...INFORMATION_COLLAPSED_SIZE, width: informationCollapsedWidth };
-  const target = mini
-    ? MINI_SIZE
-    : USE_STABLE_DESKTOP_SURFACE
+  // A transparent Windows DirectComposition surface can retain an old frame
+  // when it is resized between 390x810 and 88x88. Keep one native surface for
+  // every mode and let setShape define the interactive/visible region.
+  const target = USE_STABLE_DESKTOP_SURFACE
     ? EXPANDED_SIZE
+    : mini
+    ? MINI_SIZE
     : expanded
     ? { ...EXPANDED_SIZE, width: state.informationBar?.enabled ? Math.max(INFORMATION_COLLAPSED_SIZE.width, informationCollapsedWidth) : EXPANDED_SIZE.width }
     : informationLayout ? informationSize : { ...COLLAPSED_SIZE, width: collapsedWidth };
@@ -2201,11 +2204,9 @@ function resizeWindow(mode) {
   // Windows 的透明无边框窗口在系统级尺寸动画期间会重复重绘整张纹理。
   // 立即调整透明窗口边界，展开/收起动效只交给 renderer 的 transform/opacity。
   windowRef.setBounds({ x, y, ...target }, false);
-  if (USE_STABLE_DESKTOP_SURFACE && (mini || old.width <= MINI_SIZE.width)) {
-    // Mini/full transitions resize the native surface only after the DOM
-    // shared-element animation. Reset the shape atomically with setBounds so
-    // Chromium never paints the mini at the right edge through an old 88px
-    // region located at the expanded window's left edge.
+  if (USE_STABLE_DESKTOP_SURFACE && old.width <= MINI_SIZE.width) {
+    // One-time migration for a window created by an older build that still
+    // used an 88px native mini surface. New transitions never enter this path.
     const fullTargetShape = [{ x: 0, y: 0, width: target.width, height: target.height }];
     windowShapeBounds = unionShapeBounds(fullTargetShape);
     windowShapeSignature = JSON.stringify(fullTargetShape);

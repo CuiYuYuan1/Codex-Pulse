@@ -40,7 +40,7 @@ includes(css, ".divider { width: 1px; height: 22px;", "Windows divider");
 // Mini mode contract: 68px visual inside a 10px safe area, 49px value width.
 includes(swift, ".frame(width: 68, height: 68)", "macOS mini diameter");
 includes(swift, ".padding(10)", "macOS mini safe area");
-includes(css, "html.mini-mode .stage { padding: 10px; }", "Windows mini safe area");
+includes(css, "html.mini-mode .stage { padding: 10px; align-items: flex-end; }", "Windows mini safe area and anchor");
 includes(css, "width: 49px;", "Windows mini value width");
 includes(swift, ".frame(width: 49)", "macOS mini value width");
 
@@ -49,12 +49,15 @@ includes(swift, "magneticOffset = CGSize(width: normalizedX * 12, height: normal
 includes(renderer, "magnet.targetX = normalizedX * 12;", "Windows horizontal magnet travel");
 includes(renderer, "magnet.targetY = normalizedY * 8;", "Windows vertical magnet travel");
 includes(renderer, "function springStep", "Windows SwiftUI-matched magnetic return");
-includes(renderer, "deltaSeconds / 0.055", "Windows refresh-rate independent magnetic follow");
+includes(renderer, "magnet.x = magnet.targetX;", "Windows next-frame direct magnetic follow");
+includes(renderer, "timestamp - lastGlowPaintAt < 32", "Windows decorative glow throttle");
 includes(renderer, "magnet.renderX = magnet.x;", "Windows subpixel magnetic motion");
 includes(renderer, "elements.capsule.style.translate = `${magnet.renderX.toFixed(3)}px", "Windows isolated magnetic translate channel");
 includes(renderer, "rect.left - magnet.renderX", "Windows stable pointer mapping during magnetic motion");
 includes(main, "if (signature === windowShapeSignature) return true;", "Windows native shape deduplication");
 includes(main, "windowRef.setShape(fullTargetShape);", "Windows atomic mini/full native shape reset");
+includes(main, "const target = USE_STABLE_DESKTOP_SURFACE", "Windows stable native surface in mini mode");
+includes(renderer, "if (miniMode) return [paddedShapeRect(elements.capsule, 10, 10)]", "Windows mini hit-region shape");
 includes(main, "const limitsInterval = active ? 3_000 : 8_000;", "Windows live quota refresh cadence");
 includes(main, "const usageInterval = active ? 5_000 : 12_000;", "Windows live usage refresh cadence");
 includes(pulseStore, "private let activePollingInterval: TimeInterval = 5", "macOS live quota polling cadence");
