@@ -15,7 +15,9 @@ const pulseStore = fs.readFileSync(path.join(root, "Shared/Services/PulseStore.s
 const formatters = fs.readFileSync(path.join(root, "Shared/Utilities/Formatters.swift"), "utf8");
 const appServerClient = fs.readFileSync(path.join(root, "Shared/Services/StdioCodexAppServerClient.swift"), "utf8");
 const updateService = fs.readFileSync(path.join(root, "CodexPulse/Services/AppUpdateService.swift"), "utf8");
-const releaseWorkflow = fs.readFileSync(path.join(root, ".github/workflows/release.yml"), "utf8");
+const releaseWorkflow = fs
+  .readFileSync(path.join(root, ".github/workflows/release.yml"), "utf8")
+  .replace(/\r\n/g, "\n");
 
 function includes(source, fragment, label) {
   assert(source.includes(fragment), `${label} drifted; missing ${JSON.stringify(fragment)}`);
