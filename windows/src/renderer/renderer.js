@@ -1239,10 +1239,10 @@ function springStep(value, velocity, target, deltaSeconds, stiffness = 155, damp
 
 function applyMagnetFrame(timestamp) {
   magnet.frame = null;
-  let directFollow = false;
+  let followingPointer = false;
   const deltaSeconds = magnet.lastTime
     ? Math.min(1 / 30, Math.max(1 / 240, (timestamp - magnet.lastTime) / 1000))
-    : 1 / 60;
+    : 1 / 90;
   magnet.lastTime = timestamp;
   if (capsulePointer?.moved) {
     magnet.x = 0;
@@ -1262,21 +1262,21 @@ function applyMagnetFrame(timestamp) {
     magnet.vx = horizontal.velocity;
     magnet.vy = vertical.velocity;
   } else {
-    // Pointer movement is already coalesced by requestAnimationFrame. Apply
-    // its newest target immediately on that compositor frame instead of
-    // adding a second low-pass filter, which accumulated visible lag during
-    // fast left/right or up/down movement.
+    // Retarget a fast ease-out on every compositor frame. A 20ms time
+    // constant reaches 90% in about 46ms: visibly attracted rather than
+    // teleported, but far quicker than the previous 55ms/126ms response.
+    const blend = 1 - Math.exp(-deltaSeconds / 0.020);
     magnet.vx = 0;
     magnet.vy = 0;
-    magnet.x = magnet.targetX;
-    magnet.y = magnet.targetY;
-    directFollow = true;
+    magnet.x += (magnet.targetX - magnet.x) * blend;
+    magnet.y += (magnet.targetY - magnet.y) * blend;
+    followingPointer = true;
   }
   const moving = Math.abs(magnet.targetX - magnet.x) > 0.03
     || Math.abs(magnet.targetY - magnet.y) > 0.03
     || Math.abs(magnet.vx) > 0.35
     || Math.abs(magnet.vy) > 0.35;
-  if (directFollow || moving) {
+  if (followingPointer || moving) {
     // Preserve subpixel coordinates. Physical-pixel rounding made the capsule
     // jump in 0.5/0.8px steps at common Windows scale factors. The individual
     // translate property also keeps magnetic motion separate from morphing.

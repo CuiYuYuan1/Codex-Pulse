@@ -49,7 +49,7 @@ includes(swift, "magneticOffset = CGSize(width: normalizedX * 12, height: normal
 includes(renderer, "magnet.targetX = normalizedX * 12;", "Windows horizontal magnet travel");
 includes(renderer, "magnet.targetY = normalizedY * 8;", "Windows vertical magnet travel");
 includes(renderer, "function springStep", "Windows SwiftUI-matched magnetic return");
-includes(renderer, "magnet.x = magnet.targetX;", "Windows next-frame direct magnetic follow");
+includes(renderer, "deltaSeconds / 0.020", "Windows fast eased magnetic follow");
 includes(renderer, "timestamp - lastGlowPaintAt < 32", "Windows decorative glow throttle");
 includes(renderer, "magnet.renderX = magnet.x;", "Windows subpixel magnetic motion");
 includes(renderer, "elements.capsule.style.translate = `${magnet.renderX.toFixed(3)}px", "Windows isolated magnetic translate channel");
