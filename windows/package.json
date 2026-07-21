@@ -1,6 +1,6 @@
 {
   "name": "codex-pulse-windows",
-  "version": "0.1.23",
+  "version": "0.1.24",
   "private": true,
   "description": "Codex-Pulse for Windows",
   "main": "src/main.js",
@@ -39,7 +39,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "artifactName": "CodexPulse-Windows-Setup-${version}-${arch}.${ext}",
