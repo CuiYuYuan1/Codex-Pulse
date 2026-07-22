@@ -26,6 +26,7 @@ const WEATHER_CACHE_TTL_MS = 10 * 60 * 1000;
 const WEATHER_REFRESH_MS = 15 * 60 * 1000;
 const WEATHER_REQUEST_TIMEOUT_MS = 9000;
 const GEOCODING_CACHE_TTL_MS = 30 * 60 * 1000;
+const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 let windowRef;
 let startupCapsuleShown = false;
@@ -70,6 +71,9 @@ let localUsageDayTimer;
 const LOCAL_HISTORY_MIN_REFRESH_MS = 1500;
 const localHistoryCache = new Map();
 let weatherRefreshTimer;
+let updateRefreshTimer;
+let updateCheckInFlight = false;
+let lastAutomaticUpdateCheckAt = 0;
 let weatherRequestGeneration = 0;
 const weatherCache = new Map();
 const geocodingCache = new Map();
@@ -77,7 +81,6 @@ let dragState;
 let windowShapeBounds = null;
 let windowShapeSignature = null;
 let connectionAttempt = 0;
-let updatePromptedVersion = null;
 let state = {
   connection: "discovering",
   message: "正在自动获取 Codex 路径…",
@@ -100,8 +103,10 @@ let state = {
   appUpdate: {
     currentVersion: APP_VERSION,
     status: "idle",
-    message: "启动时自动检查 GitHub Releases",
+    message: "启动后及每 5 分钟自动检查 GitHub Releases",
     availableVersion: null,
+    releaseTitle: null,
+    releaseNotes: null,
     downloadURL: null,
     releasePageURL: GITHUB_RELEASES_URL,
     checkedAt: null
@@ -265,31 +270,17 @@ function updateAppUpdateState(patch) {
   publish({ appUpdate: { ...state.appUpdate, ...patch } });
 }
 
-async function showAvailableUpdatePrompt(release, userInitiated) {
-  const version = normalizedVersion(release?.tag_name);
-  if (!userInitiated && updatePromptedVersion === version) return;
-  updatePromptedVersion = version;
-  const downloadURL = safeReleaseURL(preferredWindowsReleaseURL(release?.assets, release?.html_url));
-  const detail = String(release?.body || "新版本已发布，可前往 GitHub 下载并安装。")
-    .trim().slice(0, 900);
-  const options = {
-    type: "info",
-    title: "CodexPulse 更新",
-    message: `发现新版本 v${version}`,
-    detail: `当前版本 v${APP_VERSION}\n\n${detail}`,
-    buttons: ["下载更新", "稍后"],
-    defaultId: 0,
-    cancelId: 1,
-    noLink: true
-  };
-  const result = windowRef && !windowRef.isDestroyed()
-    ? await dialog.showMessageBox(windowRef, options)
-    : await dialog.showMessageBox(options);
-  if (result.response === 0 && downloadURL) await shell.openExternal(downloadURL);
-}
-
-async function checkForUpdates(userInitiated = false) {
-  updateAppUpdateState({ status: "checking", message: "正在检查 GitHub Releases…" });
+async function checkForUpdates(userInitiated = false, force = false) {
+  const now = Date.now();
+  if (updateCheckInFlight) return state.appUpdate;
+  if (!userInitiated && !force && now - lastAutomaticUpdateCheckAt < UPDATE_CHECK_INTERVAL_MS) {
+    return state.appUpdate;
+  }
+  if (!userInitiated) lastAutomaticUpdateCheckAt = now;
+  updateCheckInFlight = true;
+  if (userInitiated || state.appUpdate.status === "idle" || state.appUpdate.status === "error") {
+    updateAppUpdateState({ status: "checking", message: "正在检查 GitHub Releases…" });
+  }
   try {
     const response = await fetch(GITHUB_LATEST_RELEASE_API, {
       method: "GET",
@@ -305,6 +296,8 @@ async function checkForUpdates(userInitiated = false) {
         status: "current",
         message: "GitHub 暂无已发布版本",
         availableVersion: null,
+        releaseTitle: null,
+        releaseNotes: null,
         downloadURL: null,
         checkedAt: Date.now()
       });
@@ -318,21 +311,41 @@ async function checkForUpdates(userInitiated = false) {
     const remoteVersion = normalizedVersion(release?.tag_name);
     const releasePageURL = safeReleaseURL(release?.html_url) || GITHUB_RELEASES_URL;
     const downloadURL = safeReleaseURL(preferredWindowsReleaseURL(release?.assets, releasePageURL));
+    const releaseTitle = String(release?.name || `CodexPulse v${remoteVersion}`).trim().slice(0, 180);
+    const releaseNotes = String(release?.body || "新版本已发布，可前往 GitHub 下载并安装。")
+      .trim().slice(0, 6_000);
     if (remoteVersion && isVersionNewer(remoteVersion, APP_VERSION)) {
-      updateAppUpdateState({
-        status: "available",
-        message: `发现新版本 v${remoteVersion}`,
-        availableVersion: remoteVersion,
-        downloadURL,
-        releasePageURL,
-        checkedAt: Date.now()
-      });
-      await showAvailableUpdatePrompt(release, userInitiated);
+      const skippedVersion = normalizedVersion(readSettings().skippedUpdateVersion);
+      if (skippedVersion === remoteVersion) {
+        updateAppUpdateState({
+          status: "skipped",
+          message: `已跳过版本 v${remoteVersion}`,
+          availableVersion: null,
+          releaseTitle: null,
+          releaseNotes: null,
+          downloadURL: null,
+          releasePageURL,
+          checkedAt: Date.now()
+        });
+      } else {
+        updateAppUpdateState({
+          status: "available",
+          message: `发现新版本 v${remoteVersion}`,
+          availableVersion: remoteVersion,
+          releaseTitle,
+          releaseNotes,
+          downloadURL,
+          releasePageURL,
+          checkedAt: Date.now()
+        });
+      }
     } else {
       updateAppUpdateState({
         status: "current",
         message: `当前已是最新版 v${APP_VERSION}`,
         availableVersion: null,
+        releaseTitle: null,
+        releaseNotes: null,
         downloadURL: null,
         releasePageURL,
         checkedAt: Date.now()
@@ -342,11 +355,45 @@ async function checkForUpdates(userInitiated = false) {
       });
     }
   } catch (error) {
-    updateAppUpdateState({ status: "error", message: `检查更新失败：${error.message}`, checkedAt: Date.now() });
+    if (!userInitiated && state.appUpdate.status === "available") {
+      updateAppUpdateState({ checkedAt: Date.now() });
+    } else {
+      updateAppUpdateState({ status: "error", message: `检查更新失败：${error.message}`, checkedAt: Date.now() });
+    }
     if (userInitiated) await dialog.showMessageBox({
       type: "warning", title: "CodexPulse 更新", message: "检查更新失败", detail: error.message, buttons: ["好"]
     });
+  } finally {
+    updateCheckInFlight = false;
   }
+  return state.appUpdate;
+}
+
+function armAutomaticUpdateCheck(delay = UPDATE_CHECK_INTERVAL_MS) {
+  clearTimeout(updateRefreshTimer);
+  updateRefreshTimer = setTimeout(() => {
+    void checkForUpdates(false).finally(() => armAutomaticUpdateCheck());
+  }, Math.max(1_000, delay));
+}
+
+function triggerAutomaticUpdateCheck(force = false) {
+  void checkForUpdates(false, force).finally(() => armAutomaticUpdateCheck());
+}
+
+function skipAvailableUpdate(version) {
+  const availableVersion = normalizedVersion(state.appUpdate?.availableVersion);
+  const requestedVersion = normalizedVersion(version);
+  if (!availableVersion || requestedVersion !== availableVersion) return state.appUpdate;
+  writeSettings({ skippedUpdateVersion: availableVersion });
+  updateAppUpdateState({
+    status: "skipped",
+    message: `已跳过版本 v${availableVersion}`,
+    availableVersion: null,
+    releaseTitle: null,
+    releaseNotes: null,
+    downloadURL: null,
+    checkedAt: Date.now()
+  });
   return state.appUpdate;
 }
 
@@ -2320,7 +2367,7 @@ function scheduleBackgroundStartup() {
     if (!tray) createTray();
     if (state.informationBar?.enabled) void refreshWeather(false);
     void connect();
-    setTimeout(() => { void checkForUpdates(false); }, 1_800);
+    setTimeout(() => { triggerAutomaticUpdateCheck(true); }, 1_800);
   }, 50);
 }
 
@@ -2382,12 +2429,14 @@ ipcMain.handle("pulse:refresh", async () => {
   return state;
 });
 ipcMain.handle("pulse:check-update", () => checkForUpdates(true));
+ipcMain.on("pulse:network-online", () => triggerAutomaticUpdateCheck(true));
 ipcMain.handle("pulse:open-update", async () => {
   const url = safeReleaseURL(state.appUpdate?.downloadURL || state.appUpdate?.releasePageURL);
   if (!url) return false;
   await shell.openExternal(url);
   return true;
 });
+ipcMain.handle("pulse:skip-update", (_event, version) => skipAvailableUpdate(version));
 ipcMain.handle("pulse:search-locations", async (_event, query) => {
   try {
     return { results: await searchWeatherLocations(query), error: null };
@@ -2495,16 +2544,21 @@ app.whenReady().then(() => {
   armLocalUsageDayTimer();
   powerMonitor.on("resume", () => {
     void handleLocalUsageDayBoundary(new Date()).finally(() => armLocalUsageDayTimer());
+    triggerAutomaticUpdateCheck(true);
   });
+  powerMonitor.on("unlock-screen", () => triggerAutomaticUpdateCheck(true));
   initializeInformationBar();
   createWindow();
 });
+
+app.on("browser-window-focus", () => triggerAutomaticUpdateCheck(false));
 
 app.on("before-quit", () => {
   app.isQuitting = true;
   clearTimeout(refreshTimer);
   clearTimeout(localUsageDayTimer);
   clearTimeout(weatherRefreshTimer);
+  clearTimeout(updateRefreshTimer);
   ++weatherRequestGeneration;
   stopAuthMonitoring();
   stopSessionMonitoring();

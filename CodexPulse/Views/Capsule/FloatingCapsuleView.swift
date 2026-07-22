@@ -8,10 +8,12 @@ import WebKit
 /// 状态灯:绿=空闲 · 橙=思考/运行 · 红=等待授权 · 灰=未连接
 struct FloatingCapsuleView: View {
     @Environment(PulseStore.self) private var store
+    @Environment(AppUpdateService.self) private var appUpdates
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.pulseVisualTheme) private var visualTheme
     @Environment(\.colorScheme) private var colorScheme
     @State private var isExpanded = false
+    @State private var isShowingUpdateDetails = false
     @State private var isMini = false
     @State private var areResetCardsExpanded = false
     @State private var tokenChartRevealed = false
@@ -30,6 +32,19 @@ struct FloatingCapsuleView: View {
     /// 天气开启态保留完整画面；关闭态以内容宽度为主，仅保留最小操作空间。
     private let informationCapsuleWidth: CGFloat = 275
     private let compactCapsuleMinimumWidth: CGFloat = 235
+    private let updateIndicatorWidth: CGFloat = 28
+
+    private var hasAvailableUpdate: Bool {
+        appUpdates.availableRelease != nil
+    }
+
+    private var resolvedInformationCapsuleWidth: CGFloat {
+        informationCapsuleWidth + (hasAvailableUpdate ? updateIndicatorWidth : 0)
+    }
+
+    private var resolvedCompactCapsuleMinimumWidth: CGFloat {
+        compactCapsuleMinimumWidth + (hasAvailableUpdate ? updateIndicatorWidth : 0)
+    }
 
     // MARK: - 状态映射
 
@@ -224,11 +239,17 @@ struct FloatingCapsuleView: View {
                     capsuleBar
                     if showsWeatherMetadata {
                         weatherMetadata
-                            .frame(width: informationCapsuleWidth, alignment: .center)
+                            .frame(width: resolvedInformationCapsuleWidth, alignment: .center)
                             .transition(.opacity.combined(with: .move(edge: .top)))
                     }
                     if isExpanded {
-                        detailCard
+                        Group {
+                            if isShowingUpdateDetails, appUpdates.availableRelease != nil {
+                                updateDetailCard
+                            } else {
+                                detailCard
+                            }
+                        }
                             .frame(width: informationBarEnabled ? 422 : nil, alignment: .center)
                             .transition(
                                 .asymmetric(
@@ -259,6 +280,13 @@ struct FloatingCapsuleView: View {
         .onChange(of: store.settings.resolvedActivityBandEnabled) { _, enabled in
             if enabled { previewActivityBand() }
             else { activityPreviewStartedAt = nil }
+        }
+        .onChange(of: appUpdates.availableRelease) { _, release in
+            guard release == nil, isShowingUpdateDetails else { return }
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+                isShowingUpdateDetails = false
+                isExpanded = false
+            }
         }
         .task(id: weatherTaskID) {
             guard needsWeatherData, let location = weatherLocation else {
@@ -316,11 +344,16 @@ struct FloatingCapsuleView: View {
             if informationBarEnabled {
                 Spacer(minLength: 8)
             }
+            updateIndicator
+            if informationBarEnabled && hasAvailableUpdate {
+                Color.clear
+                    .frame(width: 8, height: 1)
+            }
             chevron
         }
         .padding(.horizontal, informationBarEnabled ? 14 : 10)
-        .frame(width: informationBarEnabled ? informationCapsuleWidth : nil)
-        .frame(minWidth: informationBarEnabled ? nil : compactCapsuleMinimumWidth)
+        .frame(width: informationBarEnabled ? resolvedInformationCapsuleWidth : nil)
+        .frame(minWidth: informationBarEnabled ? nil : resolvedCompactCapsuleMinimumWidth)
         .fixedSize(horizontal: !informationBarEnabled, vertical: false)
         .frame(height: 64)
         .background(capsuleBackground)
@@ -346,12 +379,14 @@ struct FloatingCapsuleView: View {
         .scaleEffect(isHovering && !isExpanded ? 1.025 : 1.0)
         .help("Codex \(mode.label) · 点击\(isExpanded ? "收起" : "展开")详情 · 右键更多操作")
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isHovering)
+        .animation(.spring(response: 0.3, dampingFraction: 0.88), value: hasAvailableUpdate)
     }
 
     private func toggleMiniMode() {
         let nextValue = !isMini
         withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
             isExpanded = false
+            isShowingUpdateDetails = false
             isMini = nextValue
         }
         areResetCardsExpanded = false
@@ -365,6 +400,7 @@ struct FloatingCapsuleView: View {
         withAnimation(.spring(response: 0.36, dampingFraction: 0.84)) {
             isMini = false
             isExpanded = true
+            isShowingUpdateDetails = false
         }
         resetMagneticOffset()
         PulseLog.write("capsule mini mode restored and details expanded")
@@ -373,7 +409,13 @@ struct FloatingCapsuleView: View {
     private func toggleDetails() {
         guard !isMini else { return }
         withAnimation(.spring(response: 0.36, dampingFraction: 0.84)) {
-            isExpanded.toggle()
+            if isExpanded {
+                isExpanded = false
+                isShowingUpdateDetails = false
+            } else {
+                isShowingUpdateDetails = false
+                isExpanded = true
+            }
         }
         PulseLog.write("capsule details \(isExpanded ? "expanded" : "collapsed")")
         if isExpanded {
@@ -607,6 +649,39 @@ struct FloatingCapsuleView: View {
             .font(.system(size: 9, weight: .semibold))
             .foregroundStyle(.tertiary)
             .rotationEffect(.degrees(isExpanded ? 180 : 0))
+    }
+
+    @ViewBuilder
+    private var updateIndicator: some View {
+        if let release = appUpdates.availableRelease {
+            Button {
+                FloatingCapsuleController.shared.suppressNextCapsuleClick()
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                    isShowingUpdateDetails = true
+                    isExpanded = true
+                }
+                resetMagneticOffset()
+            } label: {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 15, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(visualTheme.accent)
+                    Circle()
+                        .fill(PulseTheme.orange)
+                        .frame(width: 5, height: 5)
+                        .overlay(Circle().stroke(Color.white.opacity(0.72), lineWidth: 0.5))
+                        .offset(x: 1, y: -1)
+                }
+                .frame(width: 20, height: 24)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("发现新版本 v\(release.version) · 点击查看更新内容")
+            .accessibilityLabel("发现新版本 v\(release.version)")
+            .accessibilityHint("点击查看更新内容")
+            .transition(.scale(scale: 0.76).combined(with: .opacity))
+        }
     }
 
     private var divider: some View {
@@ -901,6 +976,84 @@ struct FloatingCapsuleView: View {
         .background {
             CapsuleGlass(shape: RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
+    }
+
+    private var updateDetailCard: some View {
+        let release = appUpdates.availableRelease
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                ZStack {
+                    Circle()
+                        .fill(visualTheme.accent.opacity(0.14))
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(visualTheme.accent)
+                }
+                .frame(width: 34, height: 34)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("发现新版本")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("v\(appUpdates.currentVersion)  →  v\(release?.version ?? "—")")
+                        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.bottom, 14)
+
+            cardDivider
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text(release?.title ?? "CodexPulse 更新")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .lineLimit(2)
+                ScrollView {
+                    Text(updateNotesText(release))
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(minHeight: 72, maxHeight: 160)
+            }
+            .padding(.vertical, 14)
+
+            cardDivider
+
+            HStack(spacing: 10) {
+                Button("跳过此版本") {
+                    appUpdates.skipAvailableVersion()
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.88)) {
+                        isShowingUpdateDetails = false
+                        isExpanded = false
+                    }
+                }
+                .buttonStyle(.bordered)
+
+                Spacer(minLength: 0)
+
+                Button("立即更新") {
+                    appUpdates.openAvailableUpdate()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(release == nil)
+            }
+            .padding(.top, 14)
+        }
+        .padding(18)
+        .frame(width: 340)
+        .background {
+            CapsuleGlass(shape: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private func updateNotesText(_ release: AppRelease?) -> AttributedString {
+        let source = release?.displayNotes ?? "新版本已发布，可前往 GitHub 下载并安装。"
+        return (try? AttributedString(markdown: source)) ?? AttributedString(source)
     }
 
     private var cardDivider: some View {

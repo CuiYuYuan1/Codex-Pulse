@@ -431,6 +431,91 @@ async function captureSettingsAndAssertMiniPicker() {
   fs.writeFileSync(path.join(outputDirectory, "clear-settings@2x.png"), image.toPNG());
 }
 
+async function assertUpdateReminderInteraction() {
+  const window = new BrowserWindow({
+    width: 390,
+    height: 810,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    resizable: false,
+    webPreferences: {
+      preload: path.join(__dirname, "visual-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      additionalArguments: ["--fixture=update"]
+    }
+  });
+  captureWindows.push(window);
+  await window.loadFile(path.resolve(__dirname, "../src/renderer/index.html"));
+  await wait(450);
+
+  const collapsed = await window.webContents.executeJavaScript(`(() => {
+    const capsule = document.getElementById("capsule").getBoundingClientRect();
+    const indicator = document.getElementById("updateIndicator");
+    return {
+      capsuleWidth: capsule.width,
+      indicatorHidden: indicator.hidden,
+      indicatorTitle: indicator.title,
+      expandedWidth: Number(document.getElementById("capsule").dataset.expandedWidth)
+    };
+  })()`, true);
+  if (collapsed.indicatorHidden
+      || !collapsed.indicatorTitle.includes("v0.1.27")
+      || collapsed.expandedWidth < 303
+      || collapsed.capsuleWidth < 303) {
+    throw new Error(`update reminder did not reserve adaptive capsule space: ${JSON.stringify(collapsed)}`);
+  }
+
+  await window.webContents.executeJavaScript(`document.getElementById("updateIndicator").click()`, true);
+  await wait(520);
+  const detail = await window.webContents.executeJavaScript(`(() => ({
+    expanded: document.getElementById("capsule").getAttribute("aria-expanded"),
+    updateMode: document.getElementById("detail").classList.contains("update-mode"),
+    updateHidden: document.getElementById("updateDetail").hidden,
+    standardHeaderDisplay: getComputedStyle(document.querySelector(".account-row")).display,
+    version: document.getElementById("updateVersionRoute").textContent,
+    title: document.getElementById("updateReleaseTitle").textContent,
+    notes: document.getElementById("updateReleaseNotes").textContent,
+    installText: document.getElementById("installUpdateButton").textContent,
+    skipText: document.getElementById("skipUpdateButton").textContent
+  }))()`, true);
+  if (detail.expanded !== "true"
+      || !detail.updateMode
+      || detail.updateHidden
+      || detail.standardHeaderDisplay !== "none"
+      || !detail.version.includes("0.1.26")
+      || !detail.version.includes("0.1.27")
+      || detail.title !== "CodexPulse v0.1.27"
+      || !detail.notes.includes("磁吸跟随")
+      || !detail.notes.includes("• 解决双击缩小")
+      || detail.installText !== "立即更新"
+      || detail.skipText !== "跳过此版本") {
+    throw new Error(`update detail interaction is incomplete: ${JSON.stringify(detail)}`);
+  }
+  const image = await window.webContents.capturePage({ x: 0, y: 0, width: 390, height: 410 });
+  fs.writeFileSync(path.join(outputDirectory, "update-detail@2x.png"), image.toPNG());
+
+  await window.webContents.executeJavaScript(`document.getElementById("skipUpdateButton").click()`, true);
+  await wait(520);
+  const skipped = await window.webContents.executeJavaScript(`(() => ({
+    expanded: document.getElementById("capsule").getAttribute("aria-expanded"),
+    indicatorHidden: document.getElementById("updateIndicator").hidden,
+    hasUpdateClass: document.getElementById("capsule").classList.contains("has-update"),
+    status: document.getElementById("updateStatus").textContent,
+    capsuleWidth: document.getElementById("capsule").getBoundingClientRect().width
+  }))()`, true);
+  if (skipped.expanded !== "false"
+      || !skipped.indicatorHidden
+      || skipped.hasUpdateClass
+      || skipped.status !== "已跳过版本 v0.1.27"
+      || skipped.capsuleWidth !== 275) {
+    throw new Error(`skipped update remained visible: ${JSON.stringify(skipped)}`);
+  }
+  window.destroy();
+}
+
 async function assertPointerDoubleClickMinimizes() {
   const window = new BrowserWindow({
     width: 390,
@@ -767,6 +852,7 @@ app.whenReady().then(async () => {
     await captureFixture("clear", true, theme, `theme-${theme}`);
   }
   await captureSettingsAndAssertMiniPicker();
+  await assertUpdateReminderInteraction();
   await assertPointerDoubleClickMinimizes();
   await assertMagnetAndDetailStayStable("clear");
   await assertMagnetAndDetailStayStable("off");

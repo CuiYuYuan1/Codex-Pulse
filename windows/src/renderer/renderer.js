@@ -10,11 +10,13 @@ const elements = Object.fromEntries([
   "miniStylePicker", "miniStyle", "miniStyleLabel", "miniStyleMenu",
   "moreSettingsToggle", "appearanceSettings",
   "informationBarToggle", "informationLocationButton", "informationLocationLabel", "locationChooser", "locationChooserClose", "locationSearch",
-  "locationSearchStatus", "locationResults", "updateVersion", "updateStatus", "checkUpdateButton"
+  "locationSearchStatus", "locationResults", "updateVersion", "updateStatus", "checkUpdateButton",
+  "updateIndicator", "updateDetail", "updateVersionRoute", "updateReleaseTitle", "updateReleaseNotes", "skipUpdateButton", "installUpdateButton"
 ].map((id) => [id, document.getElementById(id)]));
 
 let expanded = false;
 let miniMode = false;
+let detailMode = "standard";
 let cardsExpanded = false;
 let currentState;
 let hoveredChartIndex = null;
@@ -319,6 +321,26 @@ function setText(element, value) {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function releaseNotesForDisplay(markdown) {
+  const fallback = "此版本未提供详细更新说明，可前往 GitHub Release 查看完整变更。";
+  const source = String(markdown || "").trim();
+  if (!source) return fallback;
+
+  const rendered = source
+    .replace(/\r\n?/g, "\n")
+    .replace(/\*{0,2}Full Changelog\*{0,2}\s*:\s*https:\/\/github\.com\/[^\s]+\/compare\/([^\s]+?)\.\.\.([^\s)]+)/gi,
+      (_match, from, to) => `完整变更：${from} → ${to}`)
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\*\*([^*\n]+)\*\*/g, "$1")
+    .replace(/__([^_\n]+)__/g, "$1")
+    .replace(/\[([^\]]+)]\([^)]+\)/g, "$1")
+    .replace(/`([^`\n]+)`/g, "$1")
+    .replace(/^[*-]\s+/gm, "• ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return rendered || fallback;
+}
+
 function setClass(element, value) {
   if (element.className !== value) element.className = value;
 }
@@ -528,7 +550,8 @@ function scheduleCollapsedWindowWidthSync(syncAfterRingTransition = true) {
     // Only a long Token value is allowed to grow the capsule toward the right.
     elements.capsule.style.setProperty(widthProperty, "max-content");
     const naturalCapsuleWidth = elements.capsule.getBoundingClientRect().width;
-    const macBaseWidth = informationEnabled ? 275 : 235;
+    const macBaseWidth = (informationEnabled ? 275 : 235)
+      + (elements.capsule.classList.contains("has-update") ? 28 : 0);
     const expandedCapsuleWidth = Math.max(macBaseWidth, Math.ceil(naturalCapsuleWidth));
     elements.capsule.style.setProperty(
       widthProperty,
@@ -826,10 +849,23 @@ function render(state) {
   elements.todayDetail.title = usageSource;
 
   const update = state.appUpdate || {};
+  const hasAvailableUpdate = update.status === "available" && Boolean(update.availableVersion);
   setText(elements.updateVersion, `CodexPulse v${update.currentVersion || "—"}`);
-  setText(elements.updateStatus, update.message || "启动时自动检查 GitHub Releases");
+  setText(elements.updateStatus, update.message || "启动后及每 5 分钟自动检查 GitHub Releases");
   elements.checkUpdateButton.disabled = update.status === "checking";
   elements.checkUpdateButton.textContent = update.status === "available" ? "下载更新" : update.status === "checking" ? "检查中…" : "检查更新";
+  elements.updateIndicator.hidden = !hasAvailableUpdate;
+  elements.updateIndicator.title = hasAvailableUpdate
+    ? `发现新版本 v${update.availableVersion} · 点击查看更新内容`
+    : "";
+  elements.capsule.classList.toggle("has-update", hasAvailableUpdate);
+  setText(elements.updateVersionRoute, `v${update.currentVersion || "—"}  →  v${update.availableVersion || "—"}`);
+  setText(elements.updateReleaseTitle, update.releaseTitle || `CodexPulse v${update.availableVersion || "—"}`);
+  setText(elements.updateReleaseNotes, releaseNotesForDisplay(update.releaseNotes));
+  if (!hasAvailableUpdate && detailMode === "update") {
+    setDetailMode("standard");
+    if (expanded) setExpanded(false);
+  }
   elements.tokenChart.title = usageSource;
   updateTaskMetric(state, mode);
   setText(elements.cliInfo, state.cliPath ? `Codex：${state.cliPath}` : "Codex 路径：等待自动检测");
@@ -986,6 +1022,31 @@ function setMoreSettingsExpanded(nextExpanded) {
   elements.appearanceSettings.hidden = !settingsExpanded;
   elements.detail.classList.toggle("settings-open", settingsExpanded);
   requestAnimationFrame(scheduleWindowShapeSync);
+}
+
+function setDetailMode(mode) {
+  detailMode = mode === "update" ? "update" : "standard";
+  const showingUpdate = detailMode === "update";
+  elements.detail.classList.toggle("update-mode", showingUpdate);
+  elements.updateDetail.hidden = !showingUpdate;
+  elements.updateDetail.setAttribute("aria-hidden", String(!showingUpdate));
+  if (showingUpdate) {
+    closePreferenceMenu();
+    closeLocationChooser();
+    setMoreSettingsExpanded(false);
+  }
+  requestAnimationFrame(scheduleWindowShapeSync);
+}
+
+function showUpdateDetails() {
+  if (currentState?.appUpdate?.status !== "available") return;
+  clearTimeout(capsuleSingleClickTimer);
+  setDetailMode("update");
+  if (expanded) {
+    requestAnimationFrame(scheduleWindowShapeSync);
+  } else {
+    setExpanded(true);
+  }
 }
 
 function nextCompositeFrame() {
@@ -1172,6 +1233,7 @@ async function collapseDetailBeforeResize(generation) {
 
 function setExpanded(nextExpanded) {
   if (nextExpanded && miniMode) {
+    setDetailMode("standard");
     void setMiniMode(false, { expandAfterRestore: true });
     return;
   }
@@ -1209,7 +1271,12 @@ function setExpanded(nextExpanded) {
 }
 
 function toggleExpanded() {
-  setExpanded(!expanded);
+  if (expanded) {
+    setExpanded(false);
+  } else {
+    setDetailMode("standard");
+    setExpanded(true);
+  }
 }
 
 let capsulePointer;
@@ -1498,10 +1565,32 @@ elements.capsule.addEventListener("pointercancel", (event) => {
   }
 });
 elements.capsule.addEventListener("keydown", (event) => {
+  if (event.target !== elements.capsule) return;
   if (event.key === "Enter" || event.key === " ") {
     event.preventDefault();
     if (miniMode) void setMiniMode(false);
     else toggleExpanded();
+  }
+});
+
+["pointerdown", "pointerup", "pointercancel", "dblclick"].forEach((type) => {
+  elements.updateIndicator.addEventListener(type, (event) => event.stopPropagation());
+});
+elements.updateIndicator.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  showUpdateDetails();
+});
+elements.installUpdateButton.addEventListener("click", () => void window.pulse.openUpdate());
+elements.skipUpdateButton.addEventListener("click", async () => {
+  const version = currentState?.appUpdate?.availableVersion;
+  if (!version) return;
+  elements.skipUpdateButton.disabled = true;
+  try {
+    await window.pulse.skipUpdate(version);
+    setExpanded(false);
+  } finally {
+    elements.skipUpdateButton.disabled = false;
   }
 });
 
@@ -1722,4 +1811,5 @@ window.pulse.onExpand(() => {
   if (miniMode) void setMiniMode(false, { expandAfterRestore: true });
   else setExpanded(true);
 });
+window.addEventListener("online", () => window.pulse.notifyNetworkOnline());
 window.pulse.getState().then(render);

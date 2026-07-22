@@ -8,7 +8,7 @@ struct CodexPulseApp: App {
     @State private var store = PulseStore()
     @State private var modelRankings = ArtificialAnalysisLeaderboardStore()
     @State private var resetPrediction = CodexResetPredictionStore()
-    @State private var appUpdates = AppUpdateService()
+    @State private var appUpdates = AppUpdateService.shared
 
     init() {
         #if os(macOS)
@@ -32,10 +32,9 @@ struct CodexPulseApp: App {
                 .tint(store.settings.resolvedVisualTheme.accent)
                 .preferredColorScheme(store.settings.resolvedAppearanceMode.colorScheme)
                 .frame(minWidth: 860, minHeight: 620)
-                .appUpdateAlert()
                 .onAppear {
                     store.start()
-                    Task { await appUpdates.checkForUpdates(userInitiated: false) }
+                    appUpdates.startAutomaticChecks()
                     #if os(macOS)
                     NSApp.activate(ignoringOtherApps: true)
                     FloatingCapsuleController.shared.restoreIfNeeded(store: store)

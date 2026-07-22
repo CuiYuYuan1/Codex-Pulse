@@ -16,6 +16,16 @@ private final class InteractiveCapsulePanel: NSPanel {
     private var capsuleMouseDownScreenLocation: NSPoint?
     private var capsuleMouseDownAt: TimeInterval?
     private var pendingSingleClick: DispatchWorkItem?
+    private var suppressNextSingleClick = false
+
+    func suppressNextCapsuleClick() {
+        suppressNextSingleClick = true
+        pendingSingleClick?.cancel()
+        pendingSingleClick = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.suppressNextSingleClick = false
+        }
+    }
 
     override func sendEvent(_ event: NSEvent) {
         switch event.type {
@@ -39,6 +49,10 @@ private final class InteractiveCapsulePanel: NSPanel {
             clearCapsuleClickCandidate()
             super.sendEvent(event)
             if shouldToggle {
+                if suppressNextSingleClick {
+                    suppressNextSingleClick = false
+                    return
+                }
                 if event.clickCount >= 2 {
                     pendingSingleClick?.cancel()
                     pendingSingleClick = nil
@@ -225,6 +239,10 @@ final class FloatingCapsuleController {
         UserDefaults.standard.set(false, forKey: visibleKey)
     }
 
+    func suppressNextCapsuleClick() {
+        (panel as? InteractiveCapsulePanel)?.suppressNextCapsuleClick()
+    }
+
     // MARK: - 位置持久化
 
     private func persistFrame() {
@@ -300,6 +318,7 @@ private struct FloatingCapsuleRoot: View {
     var body: some View {
         FloatingCapsuleView()
             .environment(store)
+            .environment(AppUpdateService.shared)
             .environment(\.pulseVisualTheme, store.settings.resolvedVisualTheme)
             .tint(store.settings.resolvedVisualTheme.accent)
             .preferredColorScheme(store.settings.resolvedAppearanceMode.colorScheme)

@@ -103,7 +103,7 @@ open CodexPulse.xcodeproj       # Run → 菜单栏显示真实数据
 24. 额外额度重置预测：免费监控 OpenAI Status、帮助中心、OpenAI News、Codex 更新日志与官方 GitHub 发布，并可通过 Nitter/RSSHub 或自定义 RSS 代理关注 `@OpenAI`、`@OpenAIDevs`、`@sama`、`@thsottiaux`；显示 0～100 规则指数、预计窗口、可信度、依据与历史事件，不把指数冒充概率  
 25. 可选信息任务栏：MIT 授权的 Meteocons 动态天气 SVG 随应用离线分发并融入胶囊左侧，同时显示所选地区的温度、星期和本地时间；支持 macOS/Windows、IANA 时区、离线 last-good 缓存与 Open-Meteo/GeoNames 署名，不请求图片 CDN  
 26. API Key/DeepSeek 等自定义 provider 下，今日 Token 回退到本机全部 session 的 `token_count`/`usage` 汇总；提供方只返回 0 时采用本地估算并在详情中标明来源，不冒充服务商账单
-27. GitHub Releases 更新检查：macOS 与 Windows 启动后自动检查最新版，设置/托盘支持手动检查；发现新版本时提示并打开对应 DMG/EXE 下载
+27. GitHub Releases 更新检查：macOS 与 Windows 启动后及运行中每 5 分钟自动检查最新版，应用激活、休眠唤醒或网络恢复时会补查，设置/托盘支持手动检查；发现新版本时胶囊自适应显示更新图标，悬停提示、点击查看版本与说明，并支持立即更新或跳过当前版本
 
 ## 更新与发布
 
@@ -117,7 +117,7 @@ git tag v0.1.24
 git push origin main --tags
 ```
 
-推送 `v*` 标签后，[Release 工作流](.github/workflows/release.yml)会构建通用 macOS DMG 与 Windows NSIS 安装包、生成 SHA-256 校验文件并创建 GitHub Release。已安装的旧版本下次启动时会提示更新；也可以在 macOS“设置 → 系统”、Windows“更多设置”或托盘菜单中手动检查。
+推送 `v*` 标签后，[Release 工作流](.github/workflows/release.yml)会构建通用 macOS DMG 与 Windows NSIS 安装包、生成 SHA-256 校验文件并创建 GitHub Release。已安装且包含更新功能的旧版本会在启动、每 5 分钟轮询、应用激活、休眠唤醒或网络恢复时检查新版本并显示更新图标；跳过后同一版本不再提示，只有更高版本发布时重新提醒。也可以在 macOS“设置 → 系统”、Windows“更多设置”或托盘菜单中手动检查。
 
 本地打包 macOS：
 

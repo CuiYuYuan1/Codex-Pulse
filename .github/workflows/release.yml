@@ -58,12 +58,37 @@ jobs:
     needs: [macos, windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
       - name: Generate checksums
         run: cd release-assets && sha256sum * > SHA256SUMS.txt
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          NOTES_FILE="ReleaseNotes/${GITHUB_REF_NAME}.md"
+          OUTPUT_FILE="${RUNNER_TEMP}/release-notes.md"
+          if [[ -f "$NOTES_FILE" ]]; then
+            cp "$NOTES_FILE" "$OUTPUT_FILE"
+          else
+            PREVIOUS_TAG="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+            {
+              echo "更新内容"
+              echo
+              if [[ -n "$PREVIOUS_TAG" ]]; then
+                git log --format='- %s' "${PREVIOUS_TAG}..${GITHUB_REF_NAME}"
+                echo
+                echo "完整变更：https://github.com/${GITHUB_REPOSITORY}/compare/${PREVIOUS_TAG}...${GITHUB_REF_NAME}"
+              else
+                echo "- 稳定性与体验优化。"
+              fi
+            } > "$OUTPUT_FILE"
+          fi
+          echo "RELEASE_NOTES_FILE=$OUTPUT_FILE" >> "$GITHUB_ENV"
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -71,9 +96,12 @@ jobs:
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "CodexPulse ${GITHUB_REF_NAME}" \
+              --notes-file "$RELEASE_NOTES_FILE"
           else
             gh release create "$GITHUB_REF_NAME" release-assets/* \
               --verify-tag \
-              --generate-notes \
+              --notes-file "$RELEASE_NOTES_FILE" \
               --title "CodexPulse ${GITHUB_REF_NAME}"
           fi

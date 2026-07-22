@@ -1,6 +1,6 @@
 import Foundation
 import Observation
-import SwiftUI
+import Network
 #if os(macOS)
 import AppKit
 #endif
@@ -13,29 +13,111 @@ struct AppRelease: Identifiable, Equatable, Sendable {
     let downloadURL: URL
 
     var id: String { version }
+
+    var displayNotes: String {
+        let fallback = "此版本未提供详细更新说明，可前往 GitHub Release 查看完整变更。"
+        guard let source = notes?.trimmingCharacters(in: .whitespacesAndNewlines), !source.isEmpty else {
+            return fallback
+        }
+
+        let renderedLines = source.components(separatedBy: .newlines).map { line -> String in
+            guard line.localizedCaseInsensitiveContains("Full Changelog"),
+                  let compareRange = line.range(of: "/compare/") else {
+                return line
+            }
+
+            let comparison = line[compareRange.upperBound...]
+                .trimmingCharacters(in: CharacterSet(charactersIn: " )"))
+                .replacingOccurrences(of: "...", with: " → ")
+            return comparison.isEmpty ? "完整变更请查看 GitHub Release" : "完整变更：\(comparison)"
+        }
+        let rendered = renderedLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return rendered.isEmpty ? fallback : rendered
+    }
 }
 
 @MainActor
 @Observable
 final class AppUpdateService {
+    static let shared = AppUpdateService()
     static let repository = "CuiYuYuan1/Codex-Pulse"
     static let releasesPageURL = URL(string: "https://github.com/\(repository)/releases")!
 
     private(set) var isChecking = false
-    private(set) var statusMessage = "启动时自动检查 GitHub Releases"
+    private(set) var statusMessage = "启动后及每 5 分钟自动检查 GitHub Releases"
     private(set) var lastCheckedAt: Date?
     private(set) var availableRelease: AppRelease?
-    var isShowingUpdateAlert = false
+    private(set) var skippedVersion: String?
 
-    private var didPerformAutomaticCheck = false
+    @ObservationIgnored private var automaticCheckTask: Task<Void, Never>?
+    @ObservationIgnored private var wakeObserver: NSObjectProtocol?
+    @ObservationIgnored private var activeObserver: NSObjectProtocol?
+    @ObservationIgnored private let networkMonitor = NWPathMonitor()
+    @ObservationIgnored private let networkMonitorQueue = DispatchQueue(label: "com.codexpulse.update-network")
+    private var lastAutomaticCheckAt: Date?
+    private let skippedVersionKey = "pulse.update.skipped-version"
+    private let automaticCheckInterval: TimeInterval = 5 * 60
+
+    init() {
+        skippedVersion = UserDefaults.standard.string(forKey: skippedVersionKey)
+    }
 
     var currentVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
     }
 
-    func checkForUpdates(userInitiated: Bool) async {
-        if !userInitiated, didPerformAutomaticCheck { return }
-        if !userInitiated { didPerformAutomaticCheck = true }
+    func startAutomaticChecks() {
+        guard automaticCheckTask == nil else { return }
+
+        automaticCheckTask = Task { [weak self] in
+            guard let self else { return }
+            await self.checkForUpdates(userInitiated: false, force: true)
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(self.automaticCheckInterval * 1_000_000_000))
+                } catch {
+                    return
+                }
+                await self.checkForUpdates(userInitiated: false)
+            }
+        }
+
+        #if os(macOS)
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.checkForUpdates(userInitiated: false, force: true)
+            }
+        }
+        activeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.checkForUpdates(userInitiated: false)
+            }
+        }
+        #endif
+
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            guard path.status == .satisfied else { return }
+            Task { @MainActor [weak self] in
+                await self?.checkForUpdates(userInitiated: false, force: true)
+            }
+        }
+        networkMonitor.start(queue: networkMonitorQueue)
+    }
+
+    func checkForUpdates(userInitiated: Bool, force: Bool = false) async {
+        if !userInitiated, !force, let lastAutomaticCheckAt,
+           Date().timeIntervalSince(lastAutomaticCheckAt) < automaticCheckInterval {
+            return
+        }
+        if !userInitiated { lastAutomaticCheckAt = Date() }
         guard !isChecking else { return }
 
         isChecking = true
@@ -82,9 +164,13 @@ final class AppUpdateService {
                     pageURL: pageURL,
                     downloadURL: downloadURL
                 )
-                availableRelease = release
-                statusMessage = "发现新版本 v\(remoteVersion)"
-                isShowingUpdateAlert = true
+                if Self.normalizedVersion(skippedVersion ?? "") == remoteVersion {
+                    availableRelease = nil
+                    statusMessage = "已跳过版本 v\(remoteVersion)"
+                } else {
+                    availableRelease = release
+                    statusMessage = "发现新版本 v\(remoteVersion)"
+                }
             } else {
                 availableRelease = nil
                 statusMessage = "当前已是最新版 v\(currentVersion)"
@@ -99,6 +185,15 @@ final class AppUpdateService {
         #if os(macOS)
         NSWorkspace.shared.open(url)
         #endif
+    }
+
+    func skipAvailableVersion() {
+        guard let release = availableRelease else { return }
+        let version = Self.normalizedVersion(release.version)
+        skippedVersion = version
+        UserDefaults.standard.set(version, forKey: skippedVersionKey)
+        availableRelease = nil
+        statusMessage = "已跳过版本 v\(version)"
     }
 
     func openReleasesPage() {
@@ -184,28 +279,4 @@ private enum UpdateError: LocalizedError {
 
 private extension String {
     var nilIfEmpty: String? { isEmpty ? nil : self }
-}
-
-private struct AppUpdateAlertModifier: ViewModifier {
-    @Environment(AppUpdateService.self) private var updates
-
-    func body(content: Content) -> some View {
-        @Bindable var updates = updates
-        content.alert(
-            "发现 CodexPulse 新版本",
-            isPresented: $updates.isShowingUpdateAlert,
-            presenting: updates.availableRelease
-        ) { _ in
-            Button("下载更新") { updates.openAvailableUpdate() }
-            Button("稍后", role: .cancel) {}
-        } message: { release in
-            Text("v\(updates.currentVersion) → v\(release.version)\n\n\(release.notes ?? "新版本已发布，可前往 GitHub 下载并安装。")")
-        }
-    }
-}
-
-extension View {
-    func appUpdateAlert() -> some View {
-        modifier(AppUpdateAlertModifier())
-    }
 }

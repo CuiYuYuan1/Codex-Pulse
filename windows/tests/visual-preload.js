@@ -7,6 +7,7 @@ const isLargeToken = fixture === "large-token" || fixture === "off-large";
 const isFullQuota = fixture === "full";
 const isActual = fixture === "actual";
 const isInformationRegression = fixture === "api-126k";
+const isUpdateAvailable = fixture === "update";
 const isAlmostFullQuota = fixture === "almost-full" || isActual;
 const isZeroToken = fixture === "zero" || isActual;
 const weatherFixtureName = isActual ? "thunder" : isInformationRegression ? "rain" : isAPIKey ? fixture.slice(4) : fixture;
@@ -62,13 +63,30 @@ const state = {
     message: null,
     updatedAt: today
   },
+  appUpdate: {
+    currentVersion: "0.1.26",
+    status: isUpdateAvailable ? "available" : "current",
+    message: isUpdateAvailable ? "发现新版本 v0.1.27" : "当前已是最新版 v0.1.26",
+    availableVersion: isUpdateAvailable ? "0.1.27" : null,
+    releaseTitle: isUpdateAvailable ? "CodexPulse v0.1.27" : null,
+    releaseNotes: isUpdateAvailable
+      ? "更新内容\n\n- 优化 Windows 胶囊磁吸跟随，响应更及时，快速移动时更接近 macOS 的吸附手感。\n- 解决双击缩小与还原时的重复圆环、残影和闪烁。\n- 保持透明窗口原生表面尺寸稳定，减少展开、收起和缩放过程中的合成卡顿。\n- 补充磁吸快速扫动、缩小/还原和详情展开的视觉回归测试。\n\n安装说明\n\n- Windows：下载 CodexPulse-Windows-Setup-0.1.26-x64.exe。\n- macOS：下载 CodexPulse-macOS-0.1.26-universal.dmg。"
+      : null,
+    downloadURL: isUpdateAvailable ? "https://github.com/CuiYuYuan1/Codex-Pulse/releases/download/v0.1.27/CodexPulse-Windows-Setup-0.1.27-x64.exe" : null,
+    releasePageURL: "https://github.com/CuiYuYuan1/Codex-Pulse/releases",
+    checkedAt: today
+  },
   updatedAt: today
 };
 
 const noop = () => {};
+const stateListeners = new Set();
 contextBridge.exposeInMainWorld("pulse", {
   getState: async () => state,
-  onState: noop,
+  onState: (callback) => {
+    stateListeners.add(callback);
+    return () => stateListeners.delete(callback);
+  },
   onCollapse: (callback) => {
     const listener = () => callback();
     ipcRenderer.on("pulse:collapse", listener);
@@ -85,6 +103,22 @@ contextBridge.exposeInMainWorld("pulse", {
   dragTo: noop,
   endDrag: noop,
   refresh: noop,
+  checkForUpdates: async () => state.appUpdate,
+  openUpdate: async () => true,
+  skipUpdate: async (version) => {
+    if (state.appUpdate.availableVersion !== version) return state.appUpdate;
+    state.appUpdate = {
+      ...state.appUpdate,
+      status: "skipped",
+      message: `已跳过版本 v${version}`,
+      availableVersion: null,
+      releaseTitle: null,
+      releaseNotes: null,
+      downloadURL: null
+    };
+    stateListeners.forEach((listener) => listener(state));
+    return state.appUpdate;
+  },
   quit: noop,
   clearCodexPath: noop,
   openExternal: async () => true,

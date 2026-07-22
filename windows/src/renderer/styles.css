@@ -572,6 +572,13 @@ html[data-theme] .capsule::after {
 .capsule.information-enabled .token-readout { grid-column: 7; justify-self: end; gap: 5px; }
 .capsule.information-enabled .token-metric { width: auto; align-items: flex-start; text-align: left; }
 .capsule.information-enabled .chevron { grid-column: 9; margin-left: 0; justify-self: end; }
+.capsule.information-enabled.has-update {
+  grid-template-columns:
+    62px 14px auto minmax(8px, 1fr) 1px
+    minmax(8px, 1fr) max-content minmax(8px, 1fr) max-content 8px 9px;
+}
+.capsule.information-enabled.has-update .update-indicator { grid-column: 9; justify-self: center; }
+.capsule.information-enabled.has-update .chevron { grid-column: 11; }
 .mini-capsule { display: none; }
 html.mini-mode .stage { padding: 10px; align-items: flex-end; }
 html.mini-mode.mini-transition-layout .stage {
@@ -1264,6 +1271,148 @@ html[data-theme] .detail::before {
 .update-preference-copy small { max-width: 185px; overflow: hidden; color: var(--faint); font-size: 7.5px; text-overflow: ellipsis; white-space: nowrap; }
 .update-check-button { min-width: 68px; justify-content: center; cursor: pointer; }
 .update-check-button:disabled { opacity: .5; cursor: default; }
+
+/* 新版本只占用一个轻量状态位；出现时由测量逻辑给胶囊增加 28px，
+   不压缩额度、Token 或展开箭头。 */
+.update-indicator {
+  position: relative;
+  width: 20px;
+  height: 24px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  flex: 0 0 20px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--blue);
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+  transition: color .16s ease, background .16s ease, transform .18s cubic-bezier(.2,.8,.2,1);
+}
+.update-indicator[hidden] { display: none !important; }
+.update-indicator:hover,
+.update-indicator:focus-visible {
+  color: color-mix(in srgb, var(--blue) 80%, white);
+  background: color-mix(in srgb, var(--blue) 12%, transparent);
+  transform: translateY(-1px);
+}
+.update-indicator svg,
+.update-detail-icon svg {
+  width: 17px;
+  height: 17px;
+  fill: color-mix(in srgb, currentColor 18%, transparent);
+  stroke: currentColor;
+  stroke-width: 1.35;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.update-indicator-dot {
+  position: absolute;
+  right: 0;
+  top: 2px;
+  width: 5px;
+  height: 5px;
+  border: .5px solid rgba(255,255,255,.8);
+  border-radius: 50%;
+  background: var(--orange);
+  box-shadow: 0 0 5px color-mix(in srgb, var(--orange) 58%, transparent);
+}
+
+.update-detail { display: none; }
+.detail.update-mode {
+  height: 310px;
+}
+.detail.update-mode > :not(.update-detail) { display: none !important; }
+.detail.update-mode > .update-detail {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.update-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+.update-detail-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 14%, transparent);
+}
+.update-detail-icon svg { width: 19px; height: 19px; }
+.update-detail-heading {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.update-detail-heading strong { color: var(--text); font-size: 13px; font-weight: 650; }
+.update-detail-heading small { color: var(--muted); font-size: 10.5px; font-weight: 550; font-variant-numeric: tabular-nums; }
+.update-detail-copy {
+  min-height: 0;
+  padding: 14px 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.update-detail-copy > strong {
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+.update-release-notes {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  user-select: text;
+  -webkit-user-select: text;
+  scrollbar-width: thin;
+}
+.update-detail-actions {
+  padding-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.update-action {
+  min-width: 92px;
+  height: 29px;
+  padding: 0 13px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  font-size: 10px;
+  font-weight: 620;
+  cursor: pointer;
+  transition: filter .15s ease, transform .15s ease, background .15s ease;
+}
+.update-action:hover { filter: brightness(1.08); transform: translateY(-1px); }
+.update-action:active { transform: translateY(0); }
+.update-action:disabled { opacity: .52; cursor: default; transform: none; }
+.update-action.secondary {
+  border-color: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+.update-action.primary {
+  color: white;
+  background: var(--blue);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--blue) 28%, transparent);
+}
 .preference-picker {
   position: relative;
   z-index: 1;
