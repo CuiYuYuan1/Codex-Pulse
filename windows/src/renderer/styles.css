@@ -1890,6 +1890,55 @@ html[data-theme] .detail::before {
   -webkit-user-select: text;
   scrollbar-width: thin;
 }
+.update-progress {
+  padding-top: 4px;
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 9px;
+}
+.update-progress[hidden] { display: none; }
+.update-progress-heading {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.update-progress-heading span {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.update-progress-heading strong {
+  flex: 0 0 auto;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.update-progress-track {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+.update-progress-fill {
+  width: 0;
+  height: 100%;
+  display: block;
+  border-radius: inherit;
+  background: var(--blue);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--blue) 38%, transparent);
+  transition: width .18s cubic-bezier(.2,.82,.2,1), background .18s ease;
+}
+.update-progress.ready .update-progress-fill { background: var(--green); }
+.update-progress.failed .update-progress-heading,
+.update-progress.failed .update-progress-heading strong { color: var(--red); }
+.update-progress small {
+  color: var(--faint);
+  font-size: 8.5px;
+  font-variant-numeric: tabular-nums;
+}
 .update-detail-actions {
   padding-top: 14px;
   display: flex;

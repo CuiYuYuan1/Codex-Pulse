@@ -11,6 +11,7 @@ struct AppRelease: Identifiable, Equatable, Sendable {
     let notes: String?
     let pageURL: URL
     let downloadURL: URL
+    let expectedSHA256: String?
 
     var id: String { version }
 
@@ -48,12 +49,19 @@ final class AppUpdateService {
     private(set) var lastCheckedAt: Date?
     private(set) var availableRelease: AppRelease?
     private(set) var skippedVersion: String?
+    private(set) var installationStage: AppUpdateInstallationStage = .idle
+    private(set) var downloadProgress: Double = 0
+    private(set) var downloadedByteCount: Int64 = 0
+    private(set) var expectedDownloadByteCount: Int64 = 0
+    private(set) var installationMessage: String?
 
     @ObservationIgnored private var automaticCheckTask: Task<Void, Never>?
     @ObservationIgnored private var wakeObserver: NSObjectProtocol?
     @ObservationIgnored private var activeObserver: NSObjectProtocol?
     @ObservationIgnored private let networkMonitor = NWPathMonitor()
     @ObservationIgnored private let networkMonitorQueue = DispatchQueue(label: "com.codexpulse.update-network")
+    @ObservationIgnored private var downloadCoordinator: AppUpdateDownloadCoordinator?
+    @ObservationIgnored private var downloadedUpdateURL: URL?
     private var lastAutomaticCheckAt: Date?
     private let skippedVersionKey = "pulse.update.skipped-version"
     private let automaticCheckInterval: TimeInterval = 5 * 60
@@ -64,6 +72,20 @@ final class AppUpdateService {
 
     var currentVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+    }
+
+    var primaryUpdateActionTitle: String {
+        switch installationStage {
+        case .idle: "立即更新"
+        case .downloading: "下载中 \(Int((downloadProgress * 100).rounded()))%"
+        case .ready: "重启并更新"
+        case .installing: "正在重启…"
+        case .failed: downloadedUpdateURL == nil ? "重新下载" : "重试安装"
+        }
+    }
+
+    var isPrimaryUpdateActionDisabled: Bool {
+        availableRelease == nil || installationStage == .downloading || installationStage == .installing
     }
 
     func startAutomaticChecks() {
@@ -138,6 +160,7 @@ final class AppUpdateService {
                 throw UpdateError.invalidResponse
             }
             if http.statusCode == 404 {
+                resetDownloadedUpdate(removeFile: true)
                 availableRelease = nil
                 lastCheckedAt = Date()
                 statusMessage = "GitHub 暂无已发布版本"
@@ -156,22 +179,32 @@ final class AppUpdateService {
             lastCheckedAt = Date()
 
             if Self.isVersion(remoteVersion, newerThan: currentVersion) {
+                let asset = Self.preferredDownloadAsset(from: payload.assets)
                 let release = AppRelease(
                     version: remoteVersion,
                     title: payload.name?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
                         ?? "CodexPulse v\(remoteVersion)",
                     notes: payload.body?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
                     pageURL: pageURL,
-                    downloadURL: downloadURL
+                    downloadURL: downloadURL,
+                    expectedSHA256: Self.normalizedSHA256(asset?.digest)
                 )
                 if Self.normalizedVersion(skippedVersion ?? "") == remoteVersion {
+                    if availableRelease?.version != remoteVersion {
+                        resetDownloadedUpdate(removeFile: true)
+                    }
                     availableRelease = nil
                     statusMessage = "已跳过版本 v\(remoteVersion)"
                 } else {
+                    if let previousVersion = availableRelease?.version,
+                       Self.normalizedVersion(previousVersion) != remoteVersion {
+                        resetDownloadedUpdate(removeFile: true)
+                    }
                     availableRelease = release
                     statusMessage = "发现新版本 v\(remoteVersion)"
                 }
             } else {
+                resetDownloadedUpdate(removeFile: true)
                 availableRelease = nil
                 statusMessage = "当前已是最新版 v\(currentVersion)"
             }
@@ -181,14 +214,127 @@ final class AppUpdateService {
     }
 
     func openAvailableUpdate() {
-        let url = availableRelease?.downloadURL ?? Self.releasesPageURL
-        #if os(macOS)
-        NSWorkspace.shared.open(url)
-        #endif
+        performPrimaryUpdateAction()
+    }
+
+    func performPrimaryUpdateAction() {
+        switch installationStage {
+        case .idle:
+            downloadAvailableUpdate()
+        case .ready:
+            installDownloadedUpdateAndRestart()
+        case .failed:
+            if downloadedUpdateURL == nil {
+                downloadAvailableUpdate()
+            } else {
+                installDownloadedUpdateAndRestart()
+            }
+        case .downloading, .installing:
+            break
+        }
+    }
+
+    func downloadAvailableUpdate() {
+        guard let release = availableRelease else { return }
+        guard MacUpdateSupport.isTrustedReleaseAssetURL(release.downloadURL) else {
+            installationStage = .failed
+            installationMessage = "更新地址校验失败，请稍后重新检查更新"
+            return
+        }
+
+        resetDownloadedUpdate(removeFile: true)
+        do {
+            let destination = try MacUpdateSupport.downloadDestination(for: release.version)
+            installationStage = .downloading
+            downloadProgress = 0
+            installationMessage = "正在下载 v\(release.version)…"
+            statusMessage = installationMessage ?? statusMessage
+
+            let coordinator = AppUpdateDownloadCoordinator(
+                sourceURL: release.downloadURL,
+                destinationURL: destination,
+                progress: { [weak self] written, expected in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.installationStage == .downloading else { return }
+                        self.downloadedByteCount = written
+                        self.expectedDownloadByteCount = max(0, expected)
+                        if expected > 0 {
+                            self.downloadProgress = min(1, max(0, Double(written) / Double(expected)))
+                        }
+                        self.installationMessage = "正在下载 v\(release.version)…"
+                    }
+                },
+                completion: { [weak self] result in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.downloadCoordinator = nil
+                        guard self.availableRelease?.version == release.version else {
+                            if case .success(let fileURL) = result {
+                                try? FileManager.default.removeItem(at: fileURL)
+                            }
+                            return
+                        }
+                        switch result {
+                        case .success(let fileURL):
+                            do {
+                                try await MacUpdateSupport.validateDownload(
+                                    at: fileURL,
+                                    expectedSHA256: release.expectedSHA256
+                                )
+                                self.downloadedUpdateURL = fileURL
+                                self.downloadProgress = 1
+                                self.installationStage = .ready
+                                self.installationMessage = "下载完成，重启后自动安装 v\(release.version)"
+                                self.statusMessage = self.installationMessage ?? self.statusMessage
+                            } catch {
+                                try? FileManager.default.removeItem(at: fileURL)
+                                self.downloadedUpdateURL = nil
+                                self.installationStage = .failed
+                                self.installationMessage = "下载校验失败：\(error.localizedDescription)"
+                                self.statusMessage = self.installationMessage ?? self.statusMessage
+                            }
+                        case .failure(let error):
+                            self.downloadedUpdateURL = nil
+                            self.installationStage = .failed
+                            self.installationMessage = "下载失败：\(error.localizedDescription)"
+                            self.statusMessage = self.installationMessage ?? self.statusMessage
+                        }
+                    }
+                }
+            )
+            downloadCoordinator = coordinator
+            coordinator.start()
+        } catch {
+            installationStage = .failed
+            installationMessage = "无法准备更新：\(error.localizedDescription)"
+            statusMessage = installationMessage ?? statusMessage
+        }
+    }
+
+    func installDownloadedUpdateAndRestart() {
+        guard let release = availableRelease, let downloadedUpdateURL else { return }
+        installationStage = .installing
+        installationMessage = "正在退出并安装 v\(release.version)…"
+        statusMessage = installationMessage ?? statusMessage
+        do {
+            try MacUpdateSupport.launchInstaller(
+                dmgURL: downloadedUpdateURL,
+                currentAppURL: Bundle.main.bundleURL,
+                version: release.version
+            )
+            #if os(macOS)
+            NSApplication.shared.terminate(nil)
+            #endif
+        } catch {
+            installationStage = .failed
+            installationMessage = "无法自动安装：\(error.localizedDescription)"
+            statusMessage = installationMessage ?? statusMessage
+        }
     }
 
     func skipAvailableVersion() {
         guard let release = availableRelease else { return }
+        resetDownloadedUpdate(removeFile: true)
         let version = Self.normalizedVersion(release.version)
         skippedVersion = version
         UserDefaults.standard.set(version, forKey: skippedVersionKey)
@@ -220,13 +366,38 @@ final class AppUpdateService {
         return false
     }
 
-    private static func preferredDownloadURL(from assets: [GitHubReleaseAsset]) -> URL? {
+    private static func preferredDownloadAsset(from assets: [GitHubReleaseAsset]) -> GitHubReleaseAsset? {
         #if os(macOS)
-        let preferred = assets.first { $0.name.lowercased().hasSuffix(".dmg") }
+        return assets.first { $0.name.lowercased().hasSuffix(".dmg") }
         #else
-        let preferred: GitHubReleaseAsset? = nil
+        return nil
         #endif
-        return preferred.flatMap { URL(string: $0.browserDownloadURL) }
+    }
+
+    private static func preferredDownloadURL(from assets: [GitHubReleaseAsset]) -> URL? {
+        preferredDownloadAsset(from: assets).flatMap { URL(string: $0.browserDownloadURL) }
+    }
+
+    private static func normalizedSHA256(_ digest: String?) -> String? {
+        guard let value = digest?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return nil
+        }
+        let normalized = value.hasPrefix("sha256:") ? String(value.dropFirst(7)) : value
+        return normalized.count == 64 && normalized.allSatisfy(\.isHexDigit) ? normalized : nil
+    }
+
+    private func resetDownloadedUpdate(removeFile: Bool) {
+        downloadCoordinator?.cancel()
+        downloadCoordinator = nil
+        if removeFile, let downloadedUpdateURL {
+            try? FileManager.default.removeItem(at: downloadedUpdateURL)
+        }
+        downloadedUpdateURL = nil
+        installationStage = .idle
+        downloadProgress = 0
+        downloadedByteCount = 0
+        expectedDownloadByteCount = 0
+        installationMessage = nil
     }
 }
 
@@ -258,9 +429,10 @@ private struct GitHubReleasePayload: Decodable {
 private struct GitHubReleaseAsset: Decodable {
     let name: String
     let browserDownloadURL: String
+    let digest: String?
 
     enum CodingKeys: String, CodingKey {
-        case name
+        case name, digest
         case browserDownloadURL = "browser_download_url"
     }
 }

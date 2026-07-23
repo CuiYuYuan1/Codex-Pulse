@@ -13,7 +13,7 @@ const elements = Object.fromEntries([
   "moreSettingsToggle", "appearanceSettings",
   "informationBarToggle", "informationLocationButton", "informationLocationLabel", "locationChooser", "locationChooserClose", "locationSearch",
   "locationSearchStatus", "locationResults",
-  "updateIndicator", "updateDetail", "updateVersionRoute", "updateReleaseTitle", "updateReleaseNotes", "skipUpdateButton", "installUpdateButton"
+  "updateIndicator", "updateDetail", "updateVersionRoute", "updateReleaseTitle", "updateReleaseNotes", "updateProgress", "updateProgressStatus", "updateProgressLabel", "updateProgressFill", "updateProgressSize", "skipUpdateButton", "installUpdateButton"
 ].map((id) => [id, document.getElementById(id)]));
 
 let expanded = false;
@@ -413,6 +413,12 @@ function formatLiveUsageTokens(value) {
   if (Math.abs(number) >= 1_000_000) return `${(number / 1_000_000).toFixed(1)}M`;
   if (Math.abs(number) >= 1_000) return `${(number / 1_000).toFixed(1)}K`;
   return exactNumber.format(number);
+}
+
+function formatDownloadBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes >= 1024 ** 3) return `${(bytes / (1024 ** 3)).toFixed(2)} GB`;
+  return `${(bytes / (1024 ** 2)).toFixed(1)} MB`;
 }
 
 function isCustomProviderState(state) {
@@ -1314,7 +1320,8 @@ function render(state) {
   elements.todayDetail.title = usageSource;
 
   const update = state.appUpdate || {};
-  const hasAvailableUpdate = update.status === "available" && Boolean(update.availableVersion);
+  const updateActionStates = new Set(["available", "downloading", "ready", "installing", "download-error"]);
+  const hasAvailableUpdate = updateActionStates.has(update.status) && Boolean(update.availableVersion);
   elements.updateIndicator.hidden = !hasAvailableUpdate;
   elements.updateIndicator.title = hasAvailableUpdate
     ? `发现新版本 v${update.availableVersion} · 点击查看更新内容`
@@ -1323,6 +1330,30 @@ function render(state) {
   setText(elements.updateVersionRoute, `v${update.currentVersion || "—"}  →  v${update.availableVersion || "—"}`);
   setText(elements.updateReleaseTitle, update.releaseTitle || `CodexPulse v${update.availableVersion || "—"}`);
   setText(elements.updateReleaseNotes, releaseNotesForDisplay(update.releaseNotes));
+  const showsUpdateProgress = ["downloading", "ready", "installing", "download-error"].includes(update.status);
+  const progress = Number.isFinite(Number(update.downloadProgress))
+    ? Math.max(0, Math.min(1, Number(update.downloadProgress)))
+    : null;
+  elements.updateProgress.hidden = !showsUpdateProgress;
+  setText(elements.updateProgressStatus, update.message || "正在准备更新…");
+  setText(elements.updateProgressLabel,
+    update.status === "ready" ? "完成"
+      : update.status === "installing" ? "重启"
+        : progress === null ? "—" : `${Math.round(progress * 100)}%`);
+  elements.updateProgressFill.style.width = `${Math.round((progress || 0) * 100)}%`;
+  elements.updateProgress.classList.toggle("ready", update.status === "ready");
+  elements.updateProgress.classList.toggle("failed", update.status === "download-error");
+  const downloadedSize = formatDownloadBytes(update.downloadedBytes);
+  const totalSize = formatDownloadBytes(update.totalBytes);
+  setText(elements.updateProgressSize,
+    Number(update.totalBytes) > 0 ? `${downloadedSize} / ${totalSize}` : downloadedSize);
+  setText(elements.installUpdateButton,
+    update.status === "downloading" ? `下载中 ${Math.round((progress || 0) * 100)}%`
+      : update.status === "ready" ? "重启并更新"
+        : update.status === "installing" ? "正在重启…"
+          : update.status === "download-error" ? "重新下载" : "立即更新");
+  elements.installUpdateButton.disabled = update.status === "downloading" || update.status === "installing";
+  elements.skipUpdateButton.disabled = update.status === "downloading" || update.status === "installing";
   if (!hasAvailableUpdate && detailMode === "update") {
     setDetailMode("standard");
     if (expanded) setExpanded(false);
@@ -1500,7 +1531,7 @@ function setDetailMode(mode) {
 }
 
 function showUpdateDetails() {
-  if (currentState?.appUpdate?.status !== "available") return;
+  if (!currentState?.appUpdate?.availableVersion) return;
   clearTimeout(capsuleSingleClickTimer);
   setDetailMode("update");
   if (expanded) {
@@ -2060,7 +2091,7 @@ elements.updateIndicator.addEventListener("click", (event) => {
   event.stopPropagation();
   showUpdateDetails();
 });
-elements.installUpdateButton.addEventListener("click", () => void window.pulse.openUpdate());
+elements.installUpdateButton.addEventListener("click", () => void window.pulse.performUpdate());
 elements.skipUpdateButton.addEventListener("click", async () => {
   const version = currentState?.appUpdate?.availableVersion;
   if (!version) return;

@@ -25,7 +25,10 @@ function loadUsageFunctions() {
       shouldPromoteLocalTodayUsage,
       normalizedVersion,
       isVersionNewer,
+      preferredWindowsReleaseAsset,
       preferredWindowsReleaseURL,
+      normalizedSHA256Digest,
+      isPathInsideDirectory,
       safeReleaseURL,
       setAccount(auth, email = null) { state.account = { auth, email }; },
       setProvider(modelProvider) { state.modelProvider = modelProvider; }
@@ -99,6 +102,10 @@ assert.strictEqual(
 );
 assert.strictEqual(usage.safeReleaseURL("https://evil.example/update.exe"), null);
 assert(usage.safeReleaseURL("https://github.com/CuiYuYuan1/Codex-Pulse/releases/download/v0.1.24/setup.exe"));
+assert.strictEqual(usage.normalizedSHA256Digest(`sha256:${"A".repeat(64)}`), "a".repeat(64));
+assert.strictEqual(usage.normalizedSHA256Digest("not-a-digest"), null);
+assert.strictEqual(usage.isPathInsideDirectory("/tmp/codexpulse/update.exe", "/tmp/codexpulse"), true);
+assert.strictEqual(usage.isPathInsideDirectory("/tmp/escaped.exe", "/tmp/codexpulse"), false);
 const start = localTime(2026, 7, 12);
 const end = localTime(2026, 7, 15);
 const fixture = [

@@ -26,6 +26,7 @@ const appServerClient = fs.readFileSync(path.join(root, "Shared/Services/StdioCo
 const localUsageReader = fs.readFileSync(path.join(root, "Shared/Services/LocalCodexUsageReader.swift"), "utf8");
 const artificialAnalysis = fs.readFileSync(path.join(root, "CodexPulse/Services/ArtificialAnalysisService.swift"), "utf8");
 const updateService = fs.readFileSync(path.join(root, "CodexPulse/Services/AppUpdateService.swift"), "utf8");
+const macUpdateSupport = fs.readFileSync(path.join(root, "CodexPulse/Services/MacUpdateSupport.swift"), "utf8");
 const releaseWorkflow = fs
   .readFileSync(path.join(root, ".github/workflows/release.yml"), "utf8")
   .replace(/\r\n/g, "\n");
@@ -181,8 +182,16 @@ includes(artificialAnalysis, "static func containsCredential() -> Bool", "macOS 
 includes(artificialAnalysis, "guard let apiKey = loadAPIKeyIfNeeded()", "macOS lazy Keychain data access");
 includes(updateService, "releases/latest", "macOS GitHub latest release check");
 includes(updateService, 'hasSuffix(".dmg")', "macOS DMG release selection");
+includes(updateService, "downloadAvailableUpdate", "macOS in-app update download");
+includes(updateService, 'case .ready: "重启并更新"', "macOS restart-to-install action");
+includes(macUpdateSupport, "URLSessionDownloadDelegate", "macOS native download progress");
+includes(macUpdateSupport, "SHA256.hash", "macOS downloaded asset verification");
+includes(macUpdateSupport, "/usr/bin/hdiutil attach", "macOS DMG replacement helper");
 includes(main, "GITHUB_LATEST_RELEASE_API", "Windows GitHub latest release check");
 includes(main, "preferredWindowsReleaseURL", "Windows installer release selection");
+includes(main, "downloadAvailableUpdate", "Windows in-app update download");
+includes(main, "normalizedSHA256Digest", "Windows downloaded asset verification");
+includes(main, '["--updated", "/S", "--force-run"]', "Windows silent restart installer");
 includes(main, "const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000", "Windows live update polling cadence");
 includes(main, 'powerMonitor.on("resume"', "Windows wake update check");
 includes(renderer, 'window.addEventListener("online"', "Windows network recovery update check");
@@ -196,6 +205,8 @@ includes(renderer, "showUpdateDetails", "Windows capsule update details");
 includes(renderer, "function releaseNotesForDisplay(markdown)", "Windows release note formatter");
 includes(renderer, "完整变更：${from} → ${to}", "Windows compact changelog label");
 includes(html, 'id="updateIndicator"', "Windows capsule update indicator");
+includes(html, 'id="updateProgress"', "Windows capsule update progress");
+includes(renderer, "formatDownloadBytes", "Windows update byte progress formatting");
 includes(css, ".detail.update-mode", "Windows update detail layout");
 includes(releaseWorkflow, "permissions:\n  contents: write", "GitHub release write permission");
 includes(releaseWorkflow, '--notes-file "$RELEASE_NOTES_FILE"', "GitHub curated release notes");

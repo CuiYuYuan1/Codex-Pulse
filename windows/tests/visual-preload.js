@@ -73,6 +73,10 @@ const state = {
       ? "更新内容\n\n- 优化 Windows 胶囊磁吸跟随，响应更及时，快速移动时更接近 macOS 的吸附手感。\n- 解决双击缩小与还原时的重复圆环、残影和闪烁。\n- 保持透明窗口原生表面尺寸稳定，减少展开、收起和缩放过程中的合成卡顿。\n- 补充磁吸快速扫动、缩小/还原和详情展开的视觉回归测试。\n\n安装说明\n\n- Windows：下载 CodexPulse-Windows-Setup-0.1.26-x64.exe。\n- macOS：下载 CodexPulse-macOS-0.1.26-universal.dmg。"
       : null,
     downloadURL: isUpdateAvailable ? "https://github.com/CuiYuYuan1/Codex-Pulse/releases/download/v0.1.27/CodexPulse-Windows-Setup-0.1.27-x64.exe" : null,
+    expectedSHA256: isUpdateAvailable ? "a".repeat(64) : null,
+    downloadProgress: null,
+    downloadedBytes: 0,
+    totalBytes: 0,
     releasePageURL: "https://github.com/CuiYuYuan1/Codex-Pulse/releases",
     checkedAt: today
   },
@@ -104,7 +108,39 @@ contextBridge.exposeInMainWorld("pulse", {
   endDrag: noop,
   refresh: noop,
   checkForUpdates: async () => state.appUpdate,
-  openUpdate: async () => true,
+  performUpdate: async () => {
+    if (state.appUpdate.status === "ready") {
+      state.appUpdate = {
+        ...state.appUpdate,
+        status: "installing",
+        message: `正在重启并安装 v${state.appUpdate.availableVersion}…`
+      };
+      stateListeners.forEach((listener) => listener(state));
+      return true;
+    }
+    if (state.appUpdate.status === "downloading" || state.appUpdate.status === "installing") return false;
+    state.appUpdate = {
+      ...state.appUpdate,
+      status: "downloading",
+      message: `正在下载 v${state.appUpdate.availableVersion}…`,
+      downloadProgress: 0.42,
+      downloadedBytes: 42 * 1024 * 1024,
+      totalBytes: 100 * 1024 * 1024
+    };
+    stateListeners.forEach((listener) => listener(state));
+    setTimeout(() => {
+      state.appUpdate = {
+        ...state.appUpdate,
+        status: "ready",
+        message: `v${state.appUpdate.availableVersion} 下载完成，重启后自动安装`,
+        downloadProgress: 1,
+        downloadedBytes: 100 * 1024 * 1024,
+        totalBytes: 100 * 1024 * 1024
+      };
+      stateListeners.forEach((listener) => listener(state));
+    }, 180);
+    return true;
+  },
   skipUpdate: async (version) => {
     if (state.appUpdate.availableVersion !== version) return state.appUpdate;
     state.appUpdate = {

@@ -275,6 +275,16 @@
         <div class="update-detail-copy">
           <strong id="updateReleaseTitle">CodexPulse 更新</strong>
           <div id="updateReleaseNotes" class="update-release-notes">新版本已发布，可前往 GitHub 下载并安装。</div>
+          <div id="updateProgress" class="update-progress" hidden>
+            <div class="update-progress-heading">
+              <span id="updateProgressStatus">正在准备下载…</span>
+              <strong id="updateProgressLabel">0%</strong>
+            </div>
+            <span class="update-progress-track" aria-hidden="true">
+              <span id="updateProgressFill" class="update-progress-fill"></span>
+            </span>
+            <small id="updateProgressSize">0 MB</small>
+          </div>
         </div>
         <footer class="update-detail-actions">
           <button id="skipUpdateButton" class="update-action secondary" type="button">跳过此版本</button>

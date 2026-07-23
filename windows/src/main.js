@@ -74,6 +74,9 @@ const localHistoryCache = new Map();
 let weatherRefreshTimer;
 let updateRefreshTimer;
 let updateCheckInFlight = false;
+let updateDownloadPromise;
+let updateDownloadAbortController;
+let stagedUpdate;
 let lastAutomaticUpdateCheckAt = 0;
 let weatherRequestGeneration = 0;
 const weatherCache = new Map();
@@ -109,6 +112,10 @@ let state = {
     releaseTitle: null,
     releaseNotes: null,
     downloadURL: null,
+    expectedSHA256: null,
+    downloadProgress: null,
+    downloadedBytes: 0,
+    totalBytes: 0,
     releasePageURL: GITHUB_RELEASES_URL,
     checkedAt: null
   },
@@ -246,13 +253,50 @@ function isVersionNewer(candidate, current) {
   return false;
 }
 
-function preferredWindowsReleaseURL(assets, fallbackURL) {
+function preferredWindowsReleaseAsset(assets) {
   const candidates = (Array.isArray(assets) ? assets : []).filter((asset) => {
     const name = String(asset?.name || "").toLowerCase();
     return name.endsWith(".exe") && /^https:\/\/github\.com\//i.test(String(asset?.browser_download_url || ""));
   });
   const setup = candidates.find((asset) => /setup|installer/.test(String(asset.name).toLowerCase()));
-  return String((setup || candidates[0])?.browser_download_url || fallbackURL || GITHUB_RELEASES_URL);
+  return setup || candidates[0] || null;
+}
+
+function preferredWindowsReleaseURL(assets, fallbackURL) {
+  return String(preferredWindowsReleaseAsset(assets)?.browser_download_url || fallbackURL || GITHUB_RELEASES_URL);
+}
+
+function normalizedSHA256Digest(value) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/^sha256:/, "");
+  return /^[a-f0-9]{64}$/.test(normalized) ? normalized : null;
+}
+
+function isPathInsideDirectory(candidate, directory) {
+  const relative = path.relative(path.resolve(directory), path.resolve(String(candidate || "")));
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+function updateDownloadDirectory() {
+  return path.join(app.getPath("userData"), "updates");
+}
+
+function restoreStagedUpdate(version, expectedSHA256) {
+  const saved = readSettings().stagedUpdate;
+  const directory = updateDownloadDirectory();
+  const installerPath = String(saved?.path || "");
+  const savedVersion = normalizedVersion(saved?.version);
+  const savedDigest = normalizedSHA256Digest(saved?.sha256);
+  if (savedVersion !== normalizedVersion(version)
+      || (expectedSHA256 && savedDigest !== expectedSHA256)
+      || !isPathInsideDirectory(installerPath, directory)
+      || path.extname(installerPath).toLowerCase() !== ".exe") return null;
+  try {
+    const stats = fs.statSync(installerPath);
+    if (!stats.isFile() || stats.size <= 1_000_000) return null;
+    return { version: savedVersion, path: installerPath, sha256: savedDigest, size: stats.size };
+  } catch {
+    return null;
+  }
 }
 
 function safeReleaseURL(rawURL) {
@@ -273,7 +317,7 @@ function updateAppUpdateState(patch) {
 
 async function checkForUpdates(userInitiated = false, force = false) {
   const now = Date.now();
-  if (updateCheckInFlight) return state.appUpdate;
+  if (updateCheckInFlight || updateDownloadPromise) return state.appUpdate;
   if (!userInitiated && !force && now - lastAutomaticUpdateCheckAt < UPDATE_CHECK_INTERVAL_MS) {
     return state.appUpdate;
   }
@@ -293,6 +337,7 @@ async function checkForUpdates(userInitiated = false, force = false) {
       signal: AbortSignal.timeout(12_000)
     });
     if (response.status === 404) {
+      stagedUpdate = null;
       updateAppUpdateState({
         status: "current",
         message: "GitHub 暂无已发布版本",
@@ -300,6 +345,10 @@ async function checkForUpdates(userInitiated = false, force = false) {
         releaseTitle: null,
         releaseNotes: null,
         downloadURL: null,
+        expectedSHA256: null,
+        downloadProgress: null,
+        downloadedBytes: 0,
+        totalBytes: 0,
         checkedAt: Date.now()
       });
       if (userInitiated) await dialog.showMessageBox({
@@ -311,13 +360,16 @@ async function checkForUpdates(userInitiated = false, force = false) {
     const release = await response.json();
     const remoteVersion = normalizedVersion(release?.tag_name);
     const releasePageURL = safeReleaseURL(release?.html_url) || GITHUB_RELEASES_URL;
+    const preferredAsset = preferredWindowsReleaseAsset(release?.assets);
     const downloadURL = safeReleaseURL(preferredWindowsReleaseURL(release?.assets, releasePageURL));
+    const expectedSHA256 = normalizedSHA256Digest(preferredAsset?.digest);
     const releaseTitle = String(release?.name || `CodexPulse v${remoteVersion}`).trim().slice(0, 180);
     const releaseNotes = String(release?.body || "新版本已发布，可前往 GitHub 下载并安装。")
       .trim().slice(0, 6_000);
     if (remoteVersion && isVersionNewer(remoteVersion, APP_VERSION)) {
       const skippedVersion = normalizedVersion(readSettings().skippedUpdateVersion);
       if (skippedVersion === remoteVersion) {
+        stagedUpdate = null;
         updateAppUpdateState({
           status: "skipped",
           message: `已跳过版本 v${remoteVersion}`,
@@ -325,22 +377,35 @@ async function checkForUpdates(userInitiated = false, force = false) {
           releaseTitle: null,
           releaseNotes: null,
           downloadURL: null,
+          expectedSHA256: null,
+          downloadProgress: null,
+          downloadedBytes: 0,
+          totalBytes: 0,
           releasePageURL,
           checkedAt: Date.now()
         });
       } else {
+        const restoredUpdate = restoreStagedUpdate(remoteVersion, expectedSHA256);
+        stagedUpdate = restoredUpdate;
         updateAppUpdateState({
-          status: "available",
-          message: `发现新版本 v${remoteVersion}`,
+          status: restoredUpdate ? "ready" : "available",
+          message: restoredUpdate
+            ? `v${remoteVersion} 已下载，重启后自动安装`
+            : `发现新版本 v${remoteVersion}`,
           availableVersion: remoteVersion,
           releaseTitle,
           releaseNotes,
           downloadURL,
+          expectedSHA256,
+          downloadProgress: restoredUpdate ? 1 : null,
+          downloadedBytes: restoredUpdate?.size || 0,
+          totalBytes: restoredUpdate?.size || 0,
           releasePageURL,
           checkedAt: Date.now()
         });
       }
     } else {
+      stagedUpdate = null;
       updateAppUpdateState({
         status: "current",
         message: `当前已是最新版 v${APP_VERSION}`,
@@ -348,6 +413,10 @@ async function checkForUpdates(userInitiated = false, force = false) {
         releaseTitle: null,
         releaseNotes: null,
         downloadURL: null,
+        expectedSHA256: null,
+        downloadProgress: null,
+        downloadedBytes: 0,
+        totalBytes: 0,
         releasePageURL,
         checkedAt: Date.now()
       });
@@ -356,7 +425,7 @@ async function checkForUpdates(userInitiated = false, force = false) {
       });
     }
   } catch (error) {
-    if (!userInitiated && state.appUpdate.status === "available") {
+    if (!userInitiated && ["available", "ready", "download-error"].includes(state.appUpdate.status)) {
       updateAppUpdateState({ checkedAt: Date.now() });
     } else {
       updateAppUpdateState({ status: "error", message: `检查更新失败：${error.message}`, checkedAt: Date.now() });
@@ -385,7 +454,11 @@ function skipAvailableUpdate(version) {
   const availableVersion = normalizedVersion(state.appUpdate?.availableVersion);
   const requestedVersion = normalizedVersion(version);
   if (!availableVersion || requestedVersion !== availableVersion) return state.appUpdate;
-  writeSettings({ skippedUpdateVersion: availableVersion });
+  if (stagedUpdate?.path && isPathInsideDirectory(stagedUpdate.path, updateDownloadDirectory())) {
+    try { fs.rmSync(stagedUpdate.path, { force: true }); } catch {}
+  }
+  stagedUpdate = null;
+  writeSettings({ skippedUpdateVersion: availableVersion, stagedUpdate: null });
   updateAppUpdateState({
     status: "skipped",
     message: `已跳过版本 v${availableVersion}`,
@@ -393,9 +466,147 @@ function skipAvailableUpdate(version) {
     releaseTitle: null,
     releaseNotes: null,
     downloadURL: null,
+    expectedSHA256: null,
+    downloadProgress: null,
+    downloadedBytes: 0,
+    totalBytes: 0,
     checkedAt: Date.now()
   });
   return state.appUpdate;
+}
+
+async function downloadAvailableUpdate() {
+  if (updateDownloadPromise) return updateDownloadPromise;
+  const version = normalizedVersion(state.appUpdate?.availableVersion);
+  const downloadURL = safeReleaseURL(state.appUpdate?.downloadURL);
+  const expectedSHA256 = normalizedSHA256Digest(state.appUpdate?.expectedSHA256);
+  if (!version || !downloadURL) return false;
+
+  const directory = updateDownloadDirectory();
+  const destination = path.join(directory, `CodexPulse-Windows-Setup-${version}-x64.exe`);
+  const partial = `${destination}.partial`;
+  updateDownloadAbortController = new AbortController();
+  updateAppUpdateState({
+    status: "downloading",
+    message: `正在下载 v${version}…`,
+    downloadProgress: 0,
+    downloadedBytes: 0,
+    totalBytes: 0
+  });
+
+  updateDownloadPromise = (async () => {
+    fs.mkdirSync(directory, { recursive: true });
+    await fs.promises.rm(partial, { force: true });
+    const response = await fetch(downloadURL, {
+      method: "GET",
+      headers: { "User-Agent": `CodexPulse/${APP_VERSION}` },
+      signal: updateDownloadAbortController.signal
+    });
+    if (!response.ok || !response.body) {
+      throw new Error(`安装包下载失败（HTTP ${response.status}）`);
+    }
+
+    const totalBytes = Math.max(0, Number(response.headers.get("content-length")) || 0);
+    const handle = await fs.promises.open(partial, "w");
+    const digest = crypto.createHash("sha256");
+    const reader = response.body.getReader();
+    let downloadedBytes = 0;
+    let lastPublishedAt = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = Buffer.from(value);
+        await handle.write(chunk);
+        digest.update(chunk);
+        downloadedBytes += chunk.length;
+        const now = Date.now();
+        if (now - lastPublishedAt >= 100 || (totalBytes > 0 && downloadedBytes >= totalBytes)) {
+          lastPublishedAt = now;
+          updateAppUpdateState({
+            status: "downloading",
+            message: `正在下载 v${version}…`,
+            downloadProgress: totalBytes > 0 ? Math.min(1, downloadedBytes / totalBytes) : null,
+            downloadedBytes,
+            totalBytes
+          });
+        }
+      }
+    } finally {
+      await handle.close();
+    }
+
+    if (downloadedBytes <= 1_000_000) throw new Error("下载的安装包不完整");
+    const actualSHA256 = digest.digest("hex");
+    if (expectedSHA256 && actualSHA256 !== expectedSHA256) {
+      throw new Error("安装包 SHA-256 校验不一致");
+    }
+    await fs.promises.rm(destination, { force: true });
+    await fs.promises.rename(partial, destination);
+    stagedUpdate = { version, path: destination, sha256: actualSHA256, size: downloadedBytes };
+    writeSettings({ stagedUpdate });
+    updateAppUpdateState({
+      status: "ready",
+      message: `v${version} 下载完成，重启后自动安装`,
+      downloadProgress: 1,
+      downloadedBytes,
+      totalBytes: totalBytes || downloadedBytes
+    });
+    return true;
+  })().catch(async (error) => {
+    await fs.promises.rm(partial, { force: true }).catch(() => {});
+    updateAppUpdateState({
+      status: "download-error",
+      message: `下载失败：${String(error?.message || error)}`,
+      downloadProgress: null,
+      downloadedBytes: 0,
+      totalBytes: 0
+    });
+    return false;
+  }).finally(() => {
+    updateDownloadPromise = null;
+    updateDownloadAbortController = null;
+  });
+  return updateDownloadPromise;
+}
+
+function installDownloadedUpdateAndRestart() {
+  const version = normalizedVersion(state.appUpdate?.availableVersion);
+  const restored = stagedUpdate || restoreStagedUpdate(version, normalizedSHA256Digest(state.appUpdate?.expectedSHA256));
+  if (!restored) {
+    updateAppUpdateState({ status: "download-error", message: "已下载的安装包不存在，请重新下载" });
+    return false;
+  }
+  stagedUpdate = restored;
+  try {
+    updateAppUpdateState({ status: "installing", message: `正在重启并安装 v${version}…` });
+    const installer = spawn(restored.path, ["--updated", "/S", "--force-run"], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true
+    });
+    installer.once("error", (error) => {
+      writeSettings({ stagedUpdate: restored });
+      updateAppUpdateState({ status: "download-error", message: `无法启动安装程序：${error.message}` });
+    });
+    installer.once("spawn", () => {
+      writeSettings({ stagedUpdate: null });
+      installer.unref();
+      app.isQuitting = true;
+      setTimeout(() => app.quit(), 250);
+    });
+    return true;
+  } catch (error) {
+    writeSettings({ stagedUpdate: restored });
+    updateAppUpdateState({ status: "download-error", message: `无法启动安装程序：${error.message}` });
+    return false;
+  }
+}
+
+async function performPrimaryUpdateAction() {
+  if (state.appUpdate?.status === "ready") return installDownloadedUpdateAndRestart();
+  if (state.appUpdate?.status === "installing" || state.appUpdate?.status === "downloading") return false;
+  return downloadAvailableUpdate();
 }
 
 async function searchWeatherLocations(query) {
@@ -2597,12 +2808,7 @@ ipcMain.handle("pulse:refresh", async () => {
 });
 ipcMain.handle("pulse:check-update", () => checkForUpdates(true));
 ipcMain.on("pulse:network-online", () => triggerAutomaticUpdateCheck(true));
-ipcMain.handle("pulse:open-update", async () => {
-  const url = safeReleaseURL(state.appUpdate?.downloadURL || state.appUpdate?.releasePageURL);
-  if (!url) return false;
-  await shell.openExternal(url);
-  return true;
-});
+ipcMain.handle("pulse:perform-update", () => performPrimaryUpdateAction());
 ipcMain.handle("pulse:skip-update", (_event, version) => skipAvailableUpdate(version));
 ipcMain.handle("pulse:search-locations", async (_event, query) => {
   try {
@@ -2726,6 +2932,7 @@ app.on("before-quit", () => {
   clearTimeout(localUsageDayTimer);
   clearTimeout(weatherRefreshTimer);
   clearTimeout(updateRefreshTimer);
+  updateDownloadAbortController?.abort();
   ++weatherRequestGeneration;
   stopAuthMonitoring();
   stopSessionMonitoring();

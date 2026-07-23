@@ -908,6 +908,49 @@ async function assertUpdateReminderInteraction() {
   const image = await window.webContents.capturePage({ x: 0, y: 0, width: 390, height: 410 });
   fs.writeFileSync(path.join(outputDirectory, "update-detail@2x.png"), image.toPNG());
 
+  await window.webContents.executeJavaScript(`document.getElementById("installUpdateButton").click()`, true);
+  await wait(70);
+  const downloading = await window.webContents.executeJavaScript(`(() => ({
+    progressHidden: document.getElementById("updateProgress").hidden,
+    status: document.getElementById("updateProgressStatus").textContent,
+    label: document.getElementById("updateProgressLabel").textContent,
+    size: document.getElementById("updateProgressSize").textContent,
+    fill: parseFloat(document.getElementById("updateProgressFill").style.width),
+    installText: document.getElementById("installUpdateButton").textContent,
+    installDisabled: document.getElementById("installUpdateButton").disabled,
+    skipDisabled: document.getElementById("skipUpdateButton").disabled
+  }))()`, true);
+  if (downloading.progressHidden
+      || !downloading.status.includes("正在下载")
+      || downloading.label !== "42%"
+      || downloading.size !== "42.0 MB / 100.0 MB"
+      || Math.abs(downloading.fill - 42) > .1
+      || downloading.installText !== "下载中 42%"
+      || !downloading.installDisabled
+      || !downloading.skipDisabled) {
+    throw new Error(`update download progress is incomplete: ${JSON.stringify(downloading)}`);
+  }
+  fs.writeFileSync(
+    path.join(outputDirectory, "update-download-progress@2x.png"),
+    (await window.webContents.capturePage({ x: 0, y: 0, width: 390, height: 470 })).toPNG()
+  );
+
+  await wait(180);
+  const ready = await window.webContents.executeJavaScript(`(() => ({
+    label: document.getElementById("updateProgressLabel").textContent,
+    status: document.getElementById("updateProgressStatus").textContent,
+    installText: document.getElementById("installUpdateButton").textContent,
+    installDisabled: document.getElementById("installUpdateButton").disabled,
+    skipDisabled: document.getElementById("skipUpdateButton").disabled
+  }))()`, true);
+  if (ready.label !== "完成"
+      || !ready.status.includes("下载完成")
+      || ready.installText !== "重启并更新"
+      || ready.installDisabled
+      || ready.skipDisabled) {
+    throw new Error(`downloaded update did not enter restart-ready state: ${JSON.stringify(ready)}`);
+  }
+
   await window.webContents.executeJavaScript(`document.getElementById("skipUpdateButton").click()`, true);
   await wait(520);
   const skipped = await window.webContents.executeJavaScript(`(() => ({

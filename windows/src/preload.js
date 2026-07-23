@@ -5,7 +5,7 @@ contextBridge.exposeInMainWorld("pulse", {
   refresh: () => ipcRenderer.invoke("pulse:refresh"),
   checkForUpdates: () => ipcRenderer.invoke("pulse:check-update"),
   notifyNetworkOnline: () => ipcRenderer.send("pulse:network-online"),
-  openUpdate: () => ipcRenderer.invoke("pulse:open-update"),
+  performUpdate: () => ipcRenderer.invoke("pulse:perform-update"),
   skipUpdate: (version) => ipcRenderer.invoke("pulse:skip-update", String(version || "")),
   chooseCodex: () => ipcRenderer.invoke("pulse:choose-codex"),
   clearCodexPath: () => ipcRenderer.invoke("pulse:clear-codex-path"),

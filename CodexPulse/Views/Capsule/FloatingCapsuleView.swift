@@ -1290,6 +1290,44 @@ struct FloatingCapsuleView: View {
                         .textSelection(.enabled)
                 }
                 .frame(minHeight: 72, maxHeight: 160)
+
+                if appUpdates.installationStage != .idle {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text(appUpdates.installationMessage ?? "正在准备更新…")
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 4)
+                            if appUpdates.installationStage == .downloading {
+                                Text("\(Int((appUpdates.downloadProgress * 100).rounded()))%")
+                                    .monospacedDigit()
+                            }
+                        }
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundStyle(
+                            appUpdates.installationStage == .failed
+                                ? PulseTheme.red
+                                : Color.secondary
+                        )
+
+                        if appUpdates.installationStage == .downloading
+                            || appUpdates.installationStage == .ready {
+                            ProgressView(value: appUpdates.downloadProgress, total: 1)
+                                .progressViewStyle(.linear)
+                                .tint(
+                                    appUpdates.installationStage == .ready
+                                        ? PulseTheme.green
+                                        : visualTheme.accent
+                                )
+                            Text(updateDownloadSizeText)
+                                .font(.system(size: 8.5, weight: .medium, design: .rounded))
+                                .foregroundStyle(.tertiary)
+                                .monospacedDigit()
+                        }
+                    }
+                    .padding(.top, 4)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
             }
             .padding(.vertical, 14)
 
@@ -1304,14 +1342,18 @@ struct FloatingCapsuleView: View {
                     }
                 }
                 .buttonStyle(.bordered)
+                .disabled(
+                    appUpdates.installationStage == .downloading
+                        || appUpdates.installationStage == .installing
+                )
 
                 Spacer(minLength: 0)
 
-                Button("立即更新") {
-                    appUpdates.openAvailableUpdate()
+                Button(appUpdates.primaryUpdateActionTitle) {
+                    appUpdates.performPrimaryUpdateAction()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(release == nil)
+                .disabled(appUpdates.isPrimaryUpdateActionDisabled)
             }
             .padding(.top, 14)
         }
@@ -1321,6 +1363,19 @@ struct FloatingCapsuleView: View {
             CapsuleGlass(shape: RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
         .accessibilityElement(children: .contain)
+    }
+
+    private var updateDownloadSizeText: String {
+        let written = ByteCountFormatter.string(
+            fromByteCount: appUpdates.downloadedByteCount,
+            countStyle: .file
+        )
+        guard appUpdates.expectedDownloadByteCount > 0 else { return written }
+        let total = ByteCountFormatter.string(
+            fromByteCount: appUpdates.expectedDownloadByteCount,
+            countStyle: .file
+        )
+        return "\(written) / \(total)"
     }
 
     private func updateNotesText(_ release: AppRelease?) -> AttributedString {
