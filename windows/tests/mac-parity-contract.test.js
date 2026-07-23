@@ -15,6 +15,7 @@ const capsuleController = fs.readFileSync(
   path.join(root, "CodexPulse/Views/Capsule/FloatingCapsuleController.swift"),
   "utf8"
 );
+const macApp = fs.readFileSync(path.join(root, "CodexPulse/App/CodexPulseApp.swift"), "utf8");
 const settingsStore = fs.readFileSync(path.join(root, "Shared/Storage/SettingsStore.swift"), "utf8");
 const css = fs.readFileSync(path.join(root, "windows/src/renderer/styles.css"), "utf8");
 const renderer = fs.readFileSync(path.join(root, "windows/src/renderer/renderer.js"), "utf8");
@@ -72,6 +73,11 @@ includes(swift, "(9...11).contains(phase) ? .scratch : .thinking", "macOS typing
 includes(renderer, 'petState === "scratch" ? "想一下" : "思考中"', "Windows monitor-aware thinking choreography");
 includes(capsuleController, "case .leftMouseDragged:", "macOS compact pet has native drag tracking");
 includes(capsuleController, "clampedCompactOrigin", "macOS compact pet drag stays inside the visible desktop");
+includes(capsuleController, "let screens = NSScreen.screens", "macOS compact pet drag evaluates every display");
+includes(capsuleController, "$0.frame.contains(pointer)", "macOS compact pet follows the pointer onto a secondary display");
+includes(capsuleController, 'Button("退出 CodexPulse", role: .destructive)', "macOS capsule context quit action");
+includes(macApp, "CommandGroup(replacing: .appTermination)", "macOS standard quit command");
+includes(macApp, "CodexPulseLifecycle.quit(store: store)", "macOS centralized graceful termination");
 includes(css, '--pet-display-left: 126px;', "Windows dino terminal x");
 includes(css, '.capsule[data-pet="cat"]', "Windows cat speech bubble");
 includes(css, '.capsule[data-pet="bunny"]', "Windows bunny tag");

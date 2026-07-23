@@ -62,7 +62,7 @@ private final class InteractiveCapsulePanel: NSPanel {
                     setFrameOrigin(clampedCompactOrigin(NSPoint(
                         x: startOrigin.x + delta.x,
                         y: startOrigin.y + delta.y
-                    )))
+                    ), pointer: currentLocation))
                 }
                 return
             }
@@ -161,8 +161,32 @@ private final class InteractiveCapsulePanel: NSPanel {
             && frame.height >= 385 && frame.height <= 435
     }
 
-    private func clampedCompactOrigin(_ proposed: NSPoint) -> NSPoint {
-        guard let visible = (screen ?? NSScreen.main)?.visibleFrame else { return proposed }
+    /// 使用 macOS 全局屏幕坐标判断拖动目标。窗口只要仍有足够区域落在任意
+    /// 显示器上就保持连续跟手；只有即将完全丢出所有屏幕时才夹回鼠标所在屏幕。
+    /// 不能使用 `panel.screen` 单屏夹取，否则窗口永远无法越过当前屏幕边缘。
+    private func clampedCompactOrigin(_ proposed: NSPoint, pointer: NSPoint) -> NSPoint {
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return proposed }
+        let proposedFrame = NSRect(origin: proposed, size: frame.size)
+        let minimumVisibleWidth = min(CGFloat(44), frame.width)
+        let minimumVisibleHeight = min(CGFloat(44), frame.height)
+        let remainsReachable = screens.contains { screen in
+            let intersection = proposedFrame.intersection(screen.visibleFrame)
+            return intersection.width >= minimumVisibleWidth
+                && intersection.height >= minimumVisibleHeight
+        }
+        if remainsReachable { return proposed }
+
+        let targetScreen = screens.first(where: { $0.frame.contains(pointer) })
+            ?? screens.max(by: {
+                proposedFrame.intersection($0.visibleFrame).width
+                    * proposedFrame.intersection($0.visibleFrame).height
+                    < proposedFrame.intersection($1.visibleFrame).width
+                    * proposedFrame.intersection($1.visibleFrame).height
+            })
+            ?? screen
+            ?? NSScreen.main
+        guard let visible = targetScreen?.visibleFrame else { return proposed }
         return NSPoint(
             x: min(max(proposed.x, visible.minX), visible.maxX - frame.width),
             y: min(max(proposed.y, visible.minY), visible.maxY - frame.height)
@@ -214,9 +238,14 @@ final class FloatingCapsuleController {
             return
         }
 
-        let content = CapsuleHostView(onSizeChange: { [weak self] size in
-            self?.resizePanel(to: size)
-        }) {
+        let content = CapsuleHostView(
+            onSizeChange: { [weak self] size in
+                self?.resizePanel(to: size)
+            },
+            onQuit: {
+                CodexPulseLifecycle.quit(store: store)
+            }
+        ) {
             FloatingCapsuleRoot(store: store)
         }
         let hosting = NSHostingView(rootView: content)
@@ -342,6 +371,10 @@ final class FloatingCapsuleController {
         (panel as? InteractiveCapsulePanel)?.suppressNextCapsuleClick()
     }
 
+    func prepareForTermination() {
+        persistFrame()
+    }
+
     // MARK: - 位置持久化
 
     private func persistFrame() {
@@ -371,6 +404,7 @@ final class FloatingCapsuleController {
 /// 承载胶囊内容，监听 SwiftUI 实际尺寸并保留右键操作。
 private struct CapsuleHostView<Content: View>: View {
     let onSizeChange: (CGSize) -> Void
+    let onQuit: () -> Void
     @ViewBuilder let content: () -> Content
 
     var body: some View {
@@ -388,6 +422,10 @@ private struct CapsuleHostView<Content: View>: View {
                 Divider()
                 Button("隐藏胶囊") {
                     FloatingCapsuleController.shared.hide()
+                }
+                Divider()
+                Button("退出 CodexPulse", role: .destructive) {
+                    onQuit()
                 }
             }
     }

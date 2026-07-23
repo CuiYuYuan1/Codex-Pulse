@@ -591,9 +591,8 @@ struct MenuBarPanelView: View {
                 #endif
                 Divider()
                 Button("退出") {
-                    store.stop()
                     #if os(macOS)
-                    NSApplication.shared.terminate(nil)
+                    CodexPulseLifecycle.quit(store: store)
                     #endif
                 }
             } label: {
@@ -601,6 +600,18 @@ struct MenuBarPanelView: View {
                     .font(.system(size: 14))
             }
             .menuStyle(.borderlessButton)
+
+            #if os(macOS)
+            Button {
+                CodexPulseLifecycle.quit(store: store)
+            } label: {
+                Image(systemName: "power")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .buttonStyle(GlassButtonStyle())
+            .help("退出 CodexPulse")
+            .accessibilityLabel("退出 CodexPulse")
+            #endif
         }
     }
 

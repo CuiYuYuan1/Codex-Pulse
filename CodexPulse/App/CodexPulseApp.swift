@@ -43,6 +43,14 @@ struct CodexPulseApp: App {
         }
         .defaultSize(width: 1_080, height: 760)
         .handlesExternalEvents(matching: ["dashboard"])
+        .commands {
+            CommandGroup(replacing: .appTermination) {
+                Button("退出 CodexPulse") {
+                    CodexPulseLifecycle.quit(store: store)
+                }
+                .keyboardShortcut("q", modifiers: .command)
+            }
+        }
 
         // 菜单栏：圆点 + 百分比 /「Pulse」
         MenuBarExtra {
@@ -73,3 +81,14 @@ struct CodexPulseApp: App {
         }
     }
 }
+
+#if os(macOS)
+@MainActor
+enum CodexPulseLifecycle {
+    static func quit(store: PulseStore) {
+        store.stop()
+        FloatingCapsuleController.shared.prepareForTermination()
+        NSApplication.shared.terminate(nil)
+    }
+}
+#endif
