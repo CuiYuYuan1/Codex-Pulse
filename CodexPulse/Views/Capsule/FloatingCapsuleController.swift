@@ -13,7 +13,9 @@ extension Notification.Name {
 private final class InteractiveCapsulePanel: NSPanel {
     var onCapsuleClick: (() -> Void)?
     var onCapsuleDoubleClick: (() -> Void)?
+    var usesCompactHitRegion = false
     private var capsuleMouseDownScreenLocation: NSPoint?
+    private var capsuleMouseDownFrameOrigin: NSPoint?
     private var capsuleMouseDownAt: TimeInterval?
     private var pendingSingleClick: DispatchWorkItem?
     private var suppressNextSingleClick = false
@@ -28,26 +30,53 @@ private final class InteractiveCapsulePanel: NSPanel {
     }
 
     override func sendEvent(_ event: NSEvent) {
+        let compactInteractionActive = isCompactInteractionActive
+        let ownsPetPointerTracking = compactInteractionActive || isPetConversationLayout
         switch event.type {
         case .leftMouseDown:
             if event.clickCount >= 2 {
                 pendingSingleClick?.cancel()
                 pendingSingleClick = nil
             }
-            if isInsideCapsule(event) {
+            let isInside = isInsideCapsule(event)
+            if isInside {
                 capsuleMouseDownScreenLocation = NSEvent.mouseLocation
+                capsuleMouseDownFrameOrigin = frame.origin
                 capsuleMouseDownAt = event.timestamp
             } else {
                 clearCapsuleClickCandidate()
             }
+            // Compact mode owns pointer tracking so the tiny NSHostingView cannot
+            // consume the drag before the borderless panel gets a chance to move.
+            if ownsPetPointerTracking && isInside { return }
+        case .leftMouseDragged:
+            if ownsPetPointerTracking,
+               let startLocation = capsuleMouseDownScreenLocation,
+               let startOrigin = capsuleMouseDownFrameOrigin {
+                let currentLocation = NSEvent.mouseLocation
+                let delta = NSPoint(
+                    x: currentLocation.x - startLocation.x,
+                    y: currentLocation.y - startLocation.y
+                )
+                if hypot(delta.x, delta.y) > 2 {
+                    setFrameOrigin(clampedCompactOrigin(NSPoint(
+                        x: startOrigin.x + delta.x,
+                        y: startOrigin.y + delta.y
+                    )))
+                }
+                return
+            }
         case .leftMouseUp:
             let start = capsuleMouseDownScreenLocation
+            let startedInsideCapsule = start != nil
             let startedAt = capsuleMouseDownAt
             let shouldToggle = start.map { pointDistance($0, NSEvent.mouseLocation) <= 4 } == true
                 && startedAt.map { event.timestamp - $0 <= 0.8 } == true
                 && isInsideCapsule(event)
             clearCapsuleClickCandidate()
-            super.sendEvent(event)
+            if !ownsPetPointerTracking || !startedInsideCapsule {
+                super.sendEvent(event)
+            }
             if shouldToggle {
                 if suppressNextSingleClick {
                     suppressNextSingleClick = false
@@ -79,8 +108,22 @@ private final class InteractiveCapsulePanel: NSPanel {
         guard let contentView else { return false }
         let point = contentView.convert(event.locationInWindow, from: nil)
         let bounds = contentView.bounds
+        if isCompactInteractionActive {
+            return bounds.insetBy(dx: 1, dy: 1).contains(point)
+        }
+        if isPetConversationLayout {
+            let petWidth: CGFloat = min(240, bounds.width)
+            let petHeight: CGFloat = min(154, bounds.height)
+            let originY = contentView.isFlipped ? 0 : bounds.height - petHeight
+            return NSRect(
+                x: bounds.width - petWidth,
+                y: originY,
+                width: petWidth,
+                height: petHeight
+            ).contains(point)
+        }
         if bounds.width <= 100, bounds.height <= 100 {
-            return bounds.insetBy(dx: 8, dy: 8).contains(point)
+            return bounds.insetBy(dx: 1, dy: 1).contains(point)
         }
         let horizontalInset: CGFloat = 24
         let topInset: CGFloat = 16
@@ -101,8 +144,34 @@ private final class InteractiveCapsulePanel: NSPanel {
         hypot(lhs.x - rhs.x, lhs.y - rhs.y)
     }
 
+    /// During a SwiftUI size transition the explicit flag can arrive one layout pass
+    /// after the native panel frame. The frame fallback keeps the whole transparent
+    /// pet canvas draggable, including character pixels handled by `NSImageView`.
+    private var isCompactInteractionActive: Bool {
+        usesCompactHitRegion || (
+            frame.width >= 220 && frame.width <= 260
+                && frame.height >= 135 && frame.height <= 175
+        )
+    }
+
+    /// 迷你宠物展开实时对话后，窗口会变高，但宠物仍固定在右上角。
+    /// 只把该区域识别成胶囊，避免拦截下方对话的滚动和关闭按钮。
+    private var isPetConversationLayout: Bool {
+        frame.width >= 315 && frame.width <= 355
+            && frame.height >= 385 && frame.height <= 435
+    }
+
+    private func clampedCompactOrigin(_ proposed: NSPoint) -> NSPoint {
+        guard let visible = (screen ?? NSScreen.main)?.visibleFrame else { return proposed }
+        return NSPoint(
+            x: min(max(proposed.x, visible.minX), visible.maxX - frame.width),
+            y: min(max(proposed.y, visible.minY), visible.maxY - frame.height)
+        )
+    }
+
     private func clearCapsuleClickCandidate() {
         capsuleMouseDownScreenLocation = nil
+        capsuleMouseDownFrameOrigin = nil
         capsuleMouseDownAt = nil
     }
 }
@@ -198,6 +267,8 @@ final class FloatingCapsuleController {
               contentSize.height > 1 else { return }
 
         let oldFrame = panel.frame
+        let targetUsesCompactHitRegion = isCompactPetSize(contentSize)
+        (panel as? InteractiveCapsulePanel)?.usesCompactHitRegion = targetUsesCompactHitRegion
         guard abs(oldFrame.width - contentSize.width) > 0.5
                 || abs(oldFrame.height - contentSize.height) > 0.5 else { return }
 
@@ -214,9 +285,22 @@ final class FloatingCapsuleController {
             if target.minY < visible.minY { target.origin.y = visible.minY }
             if target.maxY > visible.maxY { target.origin.y = visible.maxY - target.height }
         }
-        let isMiniMorph = oldFrame.width <= 100 || target.width <= 100
+        let isMiniMorph = isCompactPetFrame(oldFrame)
+            || isCompactPetFrame(target)
+            || oldFrame.width <= 100
+            || target.width <= 100
+        let isPetConversationMorph = (
+            isCompactPetFrame(oldFrame) && isPetConversationFrame(target)
+        ) || (
+            isPetConversationFrame(oldFrame) && isCompactPetFrame(target)
+        )
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        if isMiniMorph && !reduceMotion {
+        // Conversation expansion is a SwiftUI-owned island morph. Animating the
+        // NSPanel envelope at the same time adds a second vertical interpolator,
+        // which makes the surface look like a window dropping down and moves the
+        // compact pet with it. Resize that transparent envelope immediately and
+        // leave the visible transition to FloatingCapsuleView.
+        if isMiniMorph && !isPetConversationMorph && !reduceMotion {
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.3
                 context.timingFunction = CAMediaTimingFunction(
@@ -230,6 +314,21 @@ final class FloatingCapsuleController {
         } else {
             panel.setFrame(target, display: true)
         }
+    }
+
+    private func isCompactPetFrame(_ frame: NSRect) -> Bool {
+        frame.width >= 225 && frame.width <= 255
+            && frame.height >= 140 && frame.height <= 170
+    }
+
+    private func isPetConversationFrame(_ frame: NSRect) -> Bool {
+        frame.width >= 315 && frame.width <= 355
+            && frame.height >= 385 && frame.height <= 435
+    }
+
+    private func isCompactPetSize(_ size: CGSize) -> Bool {
+        size.width >= 225 && size.width <= 255
+            && size.height >= 140 && size.height <= 170
     }
 
     func hide() {

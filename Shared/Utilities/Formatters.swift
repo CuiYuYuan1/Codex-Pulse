@@ -12,6 +12,22 @@ enum PulseFormatters {
         return "\(value)"
     }
 
+    /// 活动任务中的紧凑 Token 文案。胶囊只保留一位小数，完整数值仍在
+    /// 详情数据中保留，避免百万级用量把主胶囊撑得过宽。
+    static func liveTokens(_ value: Int64?) -> String {
+        guard let value else { return "—" }
+        if value >= 1_000_000_000 {
+            return String(format: "%.1fB", Double(value) / 1_000_000_000)
+        }
+        if value >= 1_000_000 {
+            return String(format: "%.1fM", Double(value) / 1_000_000)
+        }
+        if value >= 1_000 {
+            return String(format: "%.1fK", Double(value) / 1_000)
+        }
+        return "\(value)"
+    }
+
     static func percent(_ value: Double) -> String {
         String(format: "%.0f%%", value)
     }

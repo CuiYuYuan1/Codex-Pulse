@@ -38,6 +38,14 @@ enum MiniCapsuleStyle: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var id: String { rawValue }
 
+    static var apiKeyCases: [MiniCapsuleStyle] {
+        allCases.filter(\.isAvailableInAPIKeyMode)
+    }
+
+    var isAvailableInAPIKeyMode: Bool {
+        self != .quota
+    }
+
     var displayName: String {
         switch self {
         case .quota: return "剩余额度"
@@ -45,6 +53,26 @@ enum MiniCapsuleStyle: String, Codable, CaseIterable, Identifiable, Sendable {
         case .status: return "任务状态"
         case .weather: return "天气温度"
         case .time: return "当地时间"
+        }
+    }
+}
+
+enum PetCharacter: String, Codable, CaseIterable, Identifiable, Sendable {
+    case dino
+    case cat
+    case bunny
+    case ghost
+    case robot
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .dino: return "小恐龙"
+        case .cat: return "猫咪"
+        case .bunny: return "兔子"
+        case .ghost: return "幽灵"
+        case .robot: return "机器人"
         }
     }
 }
@@ -136,8 +164,12 @@ struct PulseSettings: Codable, Equatable, Sendable {
     var activityBandStyle: ActivityBandStyle?
     /// 界面材质主题；与浅色/深色模式相互独立。
     var visualTheme: PulseVisualTheme?
-    /// 双击缩小后的单圆展示内容；nil 兼容旧配置并迁移为剩余额度。
+    /// 双击缩小后显示在宠物屏幕内的简洁内容；nil 兼容旧配置并迁移为剩余额度。
     var miniCapsuleStyle: MiniCapsuleStyle?
+    /// API Key 模式没有 ChatGPT 额度，使用独立的缩小展示选择，旧配置默认为时间。
+    var apiMiniCapsuleStyle: MiniCapsuleStyle?
+    /// 缩小态桌面宠物；旧配置默认迁移为小恐龙。
+    var petCharacter: PetCharacter?
     /// 信息任务栏（天气 · 地区 · 星期 · 当前时间）；默认关闭，兼容旧配置。
     var informationBarEnabled: Bool?
     /// 信息任务栏使用的地区及天气请求坐标；默认不选择地区。
@@ -164,6 +196,8 @@ struct PulseSettings: Codable, Equatable, Sendable {
         activityBandStyle: .classic,
         visualTheme: .classic,
         miniCapsuleStyle: .quota,
+        apiMiniCapsuleStyle: .time,
+        petCharacter: .dino,
         informationBarEnabled: false,
         weatherLocation: nil
     )
@@ -221,6 +255,21 @@ struct PulseSettings: Codable, Equatable, Sendable {
     var resolvedMiniCapsuleStyle: MiniCapsuleStyle {
         get { miniCapsuleStyle ?? .quota }
         set { miniCapsuleStyle = newValue }
+    }
+
+    var resolvedAPIMiniCapsuleStyle: MiniCapsuleStyle {
+        get {
+            let style = apiMiniCapsuleStyle ?? .time
+            return style.isAvailableInAPIKeyMode ? style : .time
+        }
+        set {
+            apiMiniCapsuleStyle = newValue.isAvailableInAPIKeyMode ? newValue : .time
+        }
+    }
+
+    var resolvedPetCharacter: PetCharacter {
+        get { petCharacter ?? .dino }
+        set { petCharacter = newValue }
     }
 
     var resolvedInformationBarEnabled: Bool {

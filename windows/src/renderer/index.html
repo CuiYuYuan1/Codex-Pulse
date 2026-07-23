@@ -11,6 +11,8 @@
   <main class="stage">
     <div id="capsule" class="capsule" role="button" tabindex="0" aria-expanded="false" aria-label="Codex-Pulse 悬浮胶囊">
       <span id="miniCapsule" class="mini-capsule" aria-hidden="true">
+        <img id="petAnimation" class="pet-animation" alt="" draggable="false">
+        <span class="pet-monitor-frame" aria-hidden="true"></span>
         <svg class="mini-ring-svg" viewBox="0 0 68 68" focusable="false">
           <defs>
             <linearGradient id="miniActivityGradient" x1="0" y1="0" x2="1" y2="1">
@@ -27,6 +29,7 @@
           <circle id="miniRingProgress" class="mini-ring-progress" cx="34" cy="34" r="23" pathLength="100"></circle>
         </svg>
         <span id="miniValue" class="mini-value">—</span>
+        <span id="miniValuePrevious" class="mini-value mini-value-previous" hidden aria-hidden="true">—</span>
       </span>
       <span id="weatherScene" class="weather-scene" aria-hidden="true">
         <img id="weatherAnimation" class="weather-animation" alt="">
@@ -41,7 +44,10 @@
       <span class="token-readout">
         <span class="coffee-bean" aria-hidden="true"></span>
         <span class="metric token-metric">
-          <strong id="todayTokens">—</strong>
+          <strong class="token-roll-viewport">
+            <span id="todayTokens">—</span>
+            <span id="todayTokensPrevious" class="token-roll-previous" hidden aria-hidden="true">—</span>
+          </strong>
         </span>
       </span>
       <button id="updateIndicator" class="update-indicator" type="button" hidden aria-label="发现新版本，查看更新内容">
@@ -59,15 +65,35 @@
       </span>
     </div>
 
-    <div id="informationStrip" class="information-strip" hidden aria-live="polite">
-      <span id="weatherMiniIcon" class="weather-mini-icon" aria-hidden="true"></span>
-      <span id="weatherSummary" class="information-weather">天气同步中</span>
-      <span class="information-separator" aria-hidden="true">·</span>
-      <span id="informationLocation" class="information-location">选择地区</span>
-      <span class="information-separator" aria-hidden="true">·</span>
-      <span id="informationWeekday">—</span>
-      <span id="informationTime" class="information-time">--:--</span>
-    </div>
+    <button id="informationStrip" class="information-strip" type="button" hidden aria-live="polite" aria-expanded="false">
+      <span id="informationWeatherContent" class="information-weather-content">
+        <span id="weatherMiniIcon" class="weather-mini-icon" aria-hidden="true"></span>
+        <span id="weatherSummary" class="information-weather">天气同步中</span>
+        <span class="information-separator" aria-hidden="true">·</span>
+        <span id="informationLocation" class="information-location">选择地区</span>
+        <span class="information-separator" aria-hidden="true">·</span>
+        <span id="informationWeekday">—</span>
+        <span id="informationTime" class="information-time">--:--</span>
+      </span>
+      <span id="informationTaskContent" class="information-task-content" aria-hidden="true">
+        <span class="information-task-pulse" aria-hidden="true"></span>
+        <span class="information-task-copy">
+          <span id="informationTaskStatus" class="information-task-status">思考中</span>
+          <span id="informationTaskSummary" class="information-task-summary">Codex 正在组织回复…</span>
+          <span class="information-stream-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        </span>
+        <span class="information-task-chevron" aria-hidden="true"></span>
+      </span>
+    </button>
+
+    <section id="conversationDetail" class="conversation-detail" hidden aria-hidden="true" aria-label="当前 Codex 对话">
+      <header class="conversation-header">
+        <span class="conversation-title"><span class="conversation-title-icon" aria-hidden="true"></span>当前对话</span>
+        <span id="conversationLiveLabel" class="conversation-live-label">实时输出</span>
+        <button id="conversationClose" class="conversation-close" type="button" aria-label="收起实时对话">×</button>
+      </header>
+      <div id="conversationMessages" class="conversation-messages" aria-live="polite"></div>
+    </section>
 
     <section id="detail" class="detail" aria-hidden="true">
       <header class="account-row">
@@ -125,6 +151,22 @@
             </div>
           </div>
         </div>
+        <div class="preference-row pet-preference-row">
+          <span class="preference-label">宠物</span>
+          <div id="petPicker" class="preference-picker">
+            <button id="petCharacter" class="preference-trigger" type="button" aria-label="宠物" aria-haspopup="listbox" aria-expanded="false">
+              <span id="petCharacterLabel">小恐龙</span>
+              <span class="preference-chevron" aria-hidden="true"></span>
+            </button>
+            <div id="petCharacterMenu" class="preference-menu" role="listbox" aria-label="宠物" hidden>
+              <button class="preference-option" type="button" role="option" data-value="dino"><span class="pet-swatch">🦕</span><span>小恐龙</span><span class="option-check"></span></button>
+              <button class="preference-option" type="button" role="option" data-value="cat"><span class="pet-swatch">🐱</span><span>猫咪</span><span class="option-check"></span></button>
+              <button class="preference-option" type="button" role="option" data-value="bunny"><span class="pet-swatch">🐰</span><span>兔子</span><span class="option-check"></span></button>
+              <button class="preference-option" type="button" role="option" data-value="ghost"><span class="pet-swatch">👻</span><span>幽灵</span><span class="option-check"></span></button>
+              <button class="preference-option" type="button" role="option" data-value="robot"><span class="pet-swatch">🤖</span><span>机器人</span><span class="option-check"></span></button>
+            </div>
+          </div>
+        </div>
         <div class="preference-row">
           <button id="activityBandToggle" class="activity-toggle" type="button" aria-pressed="true">
             <span class="activity-toggle-dot"></span>
@@ -155,13 +197,6 @@
           <a href="https://open-meteo.com/" data-external-link>Weather: Open-Meteo</a>
           <span aria-hidden="true">·</span>
           <a href="https://www.geonames.org/" data-external-link>Location: GeoNames</a>
-        </div>
-        <div class="preference-row update-preference-row">
-          <span class="update-preference-copy">
-            <strong id="updateVersion">CodexPulse</strong>
-            <small id="updateStatus">启动后及每 5 分钟自动检查更新</small>
-          </span>
-          <button id="checkUpdateButton" class="preference-trigger update-check-button" type="button">检查更新</button>
         </div>
       </div>
 

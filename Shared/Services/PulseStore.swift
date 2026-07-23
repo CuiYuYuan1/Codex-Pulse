@@ -1048,8 +1048,31 @@ final class PulseStore {
             filesChanged: max(record.filesChanged, isSameTask ? existing.filesChanged : 0),
             linesAdded: isSameTask ? existing.linesAdded : 0,
             linesRemoved: isSameTask ? existing.linesRemoved : 0,
-            lastStatusMessage: record.summary ?? (isSameTask ? existing.lastStatusMessage : nil)
+            lastStatusMessage: record.summary ?? (isSameTask ? existing.lastStatusMessage : nil),
+            conversation: mergedConversation(
+                recorded: record.conversation,
+                existing: isSameTask ? existing.conversation : nil
+            )
         )
+    }
+
+    private func mergedConversation(
+        recorded: [TaskConversationMessage]?,
+        existing: [TaskConversationMessage]?
+    ) -> [TaskConversationMessage]? {
+        var messages = recorded ?? existing ?? []
+        guard let live = existing?.last, live.isStreaming else {
+            return messages.isEmpty ? nil : messages
+        }
+        if let index = messages.lastIndex(where: { $0.id == live.id }) {
+            messages[index] = live
+        } else if !messages.contains(where: {
+            $0.role == live.role && ($0.text == live.text || $0.text.hasPrefix(live.text))
+        }) {
+            messages.append(live)
+        }
+        if messages.count > 32 { messages.removeFirst(messages.count - 32) }
+        return messages.isEmpty ? nil : messages
     }
 
     private func isTaskInFlight(_ state: CodexRunState) -> Bool {
@@ -1348,8 +1371,16 @@ final class PulseStore {
 
         case .localTaskStateChanged(let record):
             recordSyncSuccess(.threads)
+            rolloverDayIfNeeded()
             let previous = snapshot
             var next = previous
+            if let totalTokens = record.tokenUsage {
+                _ = mergeRealtimeThreadTokenTotal(
+                    threadID: record.id,
+                    totalTokens: totalTokens,
+                    into: &next.usage
+                )
+            }
             mergeLiveTaskStates([record], into: &next.recentTasks)
             let state = record.runState ?? .idle
             let wasCurrentInFlight = previous.currentTask.id == record.id
@@ -1465,6 +1496,34 @@ final class PulseStore {
             // 让额度百分比和今日 Token 在任务结束后数秒内到位。
             schedulePostTurnRefresh()
 
+        case .agentMessageDelta(let threadID, let itemID, let delta):
+            guard !delta.isEmpty else { break }
+            var next = snapshot
+            var messages = next.currentTask.conversation ?? []
+            if let index = messages.lastIndex(where: { $0.id == itemID }) {
+                messages[index].text += delta
+                messages[index].isStreaming = true
+            } else {
+                messages.append(TaskConversationMessage(
+                    id: itemID,
+                    role: .assistant,
+                    text: delta,
+                    timestamp: Date(),
+                    isStreaming: true
+                ))
+            }
+            if messages.count > 32 { messages.removeFirst(messages.count - 32) }
+            next.currentTask.conversation = messages
+            next.currentTask.state = .generatingCode
+            next.currentTask.lastStatusMessage = "正在输出回复"
+            if next.currentTask.id == CurrentTaskInfo.empty.id {
+                next.currentTask.id = threadID
+            }
+            if next.currentTask.startedAt == nil { next.currentTask.startedAt = Date() }
+            next.updatedAt = Date()
+            apply(next)
+            startPolling()
+
         case .itemStarted(let step):
             recordSyncSuccess(.threads)
             lastActiveTaskEvidenceAt = Date()
@@ -1488,25 +1547,26 @@ final class PulseStore {
             startPolling()
 
         case .itemCompleted:
-            break
+            if var messages = snapshot.currentTask.conversation,
+               let index = messages.indices.last,
+               messages[index].role == .assistant,
+               messages[index].isStreaming {
+                messages[index].isStreaming = false
+                var next = snapshot
+                next.currentTask.conversation = messages
+                next.updatedAt = Date()
+                apply(next)
+            }
 
         case .tokenUsageUpdated(let threadID, _, let totalTokens):
             // 事件值是该线程截至当前的累计量；转成增量后并入“今日 Token”。
             rolloverDayIfNeeded()
-            let previousTotal = threadTokenTotals[threadID]
-            threadTokenTotals[threadID] = totalTokens
-            // 首次见到该线程时无法区分历史量与新增量，只记录基线不累加，
-            // 避免把启动前已产生的会话用量重复计入今日。
-            guard let previousTotal, totalTokens > previousTotal else { break }
-            let delta = totalTokens - previousTotal
             var next = snapshot
-            var usage = next.usage
-            let baseline = usage.todayTokens ?? 0
-            usage.mergeEventTodayTokens(baseline + delta)
-            if let total = usage.totalTokens {
-                usage.totalTokens = total + delta
-            }
-            next.usage = usage
+            guard mergeRealtimeThreadTokenTotal(
+                threadID: threadID,
+                totalTokens: totalTokens,
+                into: &next.usage
+            ) else { break }
             next.updatedAt = Date()
             apply(next)
 
@@ -1535,6 +1595,37 @@ final class PulseStore {
             }
             await refreshAll(forceRemote: true)
         }
+    }
+
+    /// App Server 通知与本地 JSONL 文件监听共享同一线程基线，避免同一批
+    /// token_count 被两个实时通道重复累加。首次只建立基线，之后只接受递增值；
+    /// 压缩导致计数器重置时由紧随其后的本地完整汇总校正。
+    @discardableResult
+    private func mergeRealtimeThreadTokenTotal(
+        threadID: String,
+        totalTokens: Int64,
+        into usage: inout UsageStats
+    ) -> Bool {
+        guard totalTokens >= 0 else { return false }
+        guard let previousTotal = threadTokenTotals[threadID] else {
+            threadTokenTotals[threadID] = totalTokens
+            return false
+        }
+        if totalTokens < previousTotal {
+            // 上下文压缩会重置线程累计器；先切换到新基线，下一次写入即可继续实时累加。
+            threadTokenTotals[threadID] = totalTokens
+            return false
+        }
+        guard totalTokens > previousTotal else { return false }
+
+        threadTokenTotals[threadID] = totalTokens
+        let delta = totalTokens - previousTotal
+        let baseline = usage.todayTokens ?? 0
+        usage.mergeEventTodayTokens(baseline + delta)
+        if let total = usage.totalTokens {
+            usage.totalTokens = total + delta
+        }
+        return true
     }
 
     private func prepareForAccountTransition() {

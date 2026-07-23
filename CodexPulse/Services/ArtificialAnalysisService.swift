@@ -96,6 +96,20 @@ enum ArtificialAnalysisCredentialStore {
     private static let service = "com.codexpulse.app.artificial-analysis"
     private static let account = "data-api-key"
 
+    /// 只查询条目元数据，不取出密钥内容。这样启动时可以恢复设置状态，
+    /// 又不会为了一个暂时用不到的排行榜刷新触发 Keychain 密码确认。
+    static func containsCredential() -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        return SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess
+    }
+
     static func read() -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -260,10 +274,13 @@ final class ArtificialAnalysisLeaderboardStore {
 
     private let cacheLifetime: TimeInterval = 12 * 60 * 60
     private var didStart = false
+    /// 密钥内容按需加载并在单次应用生命周期内缓存。未使用稳定 Developer ID
+    /// 签名的构建可能在读取内容时弹出密码确认，不能在 init/refresh 各读一次。
+    private var cachedAPIKey: String?
 
     init() {
         snapshot = ArtificialAnalysisCacheStore.load()
-        hasAPIKey = ArtificialAnalysisCredentialStore.read() != nil
+        hasAPIKey = ArtificialAnalysisCredentialStore.containsCredential()
     }
 
     var isCacheStale: Bool {
@@ -281,7 +298,7 @@ final class ArtificialAnalysisLeaderboardStore {
     func refresh(force: Bool = false) async {
         guard !isLoading else { return }
         guard force || isCacheStale else { return }
-        guard let apiKey = ArtificialAnalysisCredentialStore.read() else {
+        guard let apiKey = loadAPIKeyIfNeeded() else {
             hasAPIKey = false
             return
         }
@@ -303,6 +320,7 @@ final class ArtificialAnalysisLeaderboardStore {
     func saveAPIKey(_ value: String) async -> Bool {
         do {
             try ArtificialAnalysisCredentialStore.save(value)
+            cachedAPIKey = value.trimmingCharacters(in: .whitespacesAndNewlines)
             hasAPIKey = true
             statusMessage = "API Key 已保存到 macOS Keychain"
             errorMessage = nil
@@ -318,6 +336,7 @@ final class ArtificialAnalysisLeaderboardStore {
     func removeAPIKey() {
         do {
             try ArtificialAnalysisCredentialStore.delete()
+            cachedAPIKey = nil
             hasAPIKey = false
             errorMessage = nil
             statusMessage = "API Key 已从 Keychain 删除；排行榜缓存仍保留"
@@ -325,6 +344,15 @@ final class ArtificialAnalysisLeaderboardStore {
             errorMessage = error.localizedDescription
             statusMessage = nil
         }
+    }
+
+    private func loadAPIKeyIfNeeded() -> String? {
+        if let cachedAPIKey { return cachedAPIKey }
+        guard hasAPIKey else { return nil }
+        let value = ArtificialAnalysisCredentialStore.read()
+        cachedAPIKey = value
+        hasAPIKey = value != nil
+        return value
     }
 }
 

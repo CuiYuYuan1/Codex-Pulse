@@ -61,14 +61,30 @@ struct SettingsView: View {
                     store.saveSettings()
                 }
 
-                Picker("缩小展示", selection: $store.settings.resolvedMiniCapsuleStyle) {
-                    ForEach(MiniCapsuleStyle.allCases) { style in
+                Picker("缩小展示", selection: miniCapsuleStyleSelection) {
+                    ForEach(availableMiniCapsuleStyles) { style in
                         Text(style.displayName).tag(style)
                     }
                 }
-                .onChange(of: store.settings.resolvedMiniCapsuleStyle) { _, _ in
+
+                if isAPIKeyMode {
+                    Text("API Key 模式不使用 ChatGPT 剩余额度，默认显示当地时间。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Picker("宠物", selection: $store.settings.resolvedPetCharacter) {
+                    ForEach(PetCharacter.allCases) { pet in
+                        Text(pet.displayName).tag(pet)
+                    }
+                }
+                .onChange(of: store.settings.resolvedPetCharacter) { _, _ in
                     store.saveSettings()
                 }
+
+                Text("双击缩小后显示宠物；空闲时把上面的缩小展示内容放进宠物屏幕，思考和等待授权会自动切换动画。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("信息任务栏") {
@@ -450,6 +466,32 @@ struct SettingsView: View {
         } message: {
             Text("排行榜缓存会保留，但在重新填写 Key 前无法刷新。")
         }
+    }
+
+    private var isAPIKeyMode: Bool {
+        store.snapshot.account.authMode == .apiKey
+    }
+
+    private var availableMiniCapsuleStyles: [MiniCapsuleStyle] {
+        isAPIKeyMode ? MiniCapsuleStyle.apiKeyCases : MiniCapsuleStyle.allCases
+    }
+
+    private var miniCapsuleStyleSelection: Binding<MiniCapsuleStyle> {
+        Binding(
+            get: {
+                isAPIKeyMode
+                    ? store.settings.resolvedAPIMiniCapsuleStyle
+                    : store.settings.resolvedMiniCapsuleStyle
+            },
+            set: { style in
+                if isAPIKeyMode {
+                    store.settings.resolvedAPIMiniCapsuleStyle = style
+                } else {
+                    store.settings.resolvedMiniCapsuleStyle = style
+                }
+                store.saveSettings()
+            }
+        )
     }
 
     private var resetPredictionSettingsSection: some View {

@@ -296,6 +296,8 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
     private let resetCreditDetailsCacheTTL: TimeInterval = 60
     private let rateLimitsFailureBackoff: TimeInterval = 30
     private let rateLimitsMaxBackoff: TimeInterval = 300
+    private static let cliDiscoveryQueue = DispatchQueue(label: "com.codexpulse.cli-discovery")
+    private static var cachedCLIPath: String?
 
     private static let resetCreditDetailsSession: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
@@ -317,6 +319,10 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cli)
         proc.arguments = ["app-server"]
+        // Finder/Xcode 启动时继承的 cwd 可能位于桌面、文稿或下载目录，子进程
+        // 第一次访问会触发 macOS 文件授权。app-server 不需要项目 cwd，固定到
+        // Codex 自己的隐藏数据目录，避免每次启动重复请求受保护文件夹权限。
+        proc.currentDirectoryURL = Self.safeCodexWorkingDirectory()
         // Prefer explicit stdio listen if supported; bare `app-server` defaults to stdio.
 
         let inPipe = Pipe()
@@ -511,7 +517,7 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
                 }
                 let fallback = ProtocolMapper.emptyUsage(note: "Token 数据解析失败")
                 // 解析/网络瞬时失败不能占用 60 秒成功缓存，否则后续轮询一直命中空数据。
-                return await mergingLocalToday(into: fallback)
+                return await mergingLocalToday(into: fallback, promoteToDisplayedUsage: true)
             }
             let mapped = ProtocolMapper.usage(from: wire)
             storeUsageCache(mapped)
@@ -524,7 +530,7 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
             if var cached = cachedUsage(maxAge: .greatestFiniteMagnitude) {
                 cached.sourceNote = "Token 远端统计刷新失败，已保留最近数据：\(error.localizedDescription)"
                 PulseLog.write("usage remote fail; using cached summary: \(error.localizedDescription)")
-                return await mergingLocalToday(into: cached)
+                return await mergingLocalToday(into: cached, promoteToDisplayedUsage: true)
             }
             // API-key / 无权限：软失败并带说明，避免整页 Token 全是 —
             if case CodexServerError.rpcError(_, let msg) = error {
@@ -536,24 +542,24 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
                     )
                     // 明确不支持/无权限属于稳定结果，可以短期缓存避免重复打接口。
                     storeUsageCache(fallback)
-                    return await mergingLocalToday(into: fallback)
+                    return await mergingLocalToday(into: fallback, promoteToDisplayedUsage: true)
                 }
                 let fallback = ProtocolMapper.emptyUsage(note: "Token 统计 RPC 失败：\(msg)")
-                return await mergingLocalToday(into: fallback)
+                return await mergingLocalToday(into: fallback, promoteToDisplayedUsage: true)
             }
             if case CodexServerError.timeout = error {
                 let fallback = ProtocolMapper.emptyUsage(note: "Token 统计请求超时")
-                return await mergingLocalToday(into: fallback)
+                return await mergingLocalToday(into: fallback, promoteToDisplayedUsage: true)
             }
             let fallback = ProtocolMapper.emptyUsage(
                 note: "Token 统计暂不可用：\(error.localizedDescription)"
             )
-            return await mergingLocalToday(into: fallback)
+            return await mergingLocalToday(into: fallback, promoteToDisplayedUsage: true)
         }
     }
 
     func readLocalUsage(merging cached: UsageStats) async -> UsageStats {
-        await mergingLocalToday(into: cached)
+        await mergingLocalToday(into: cached, promoteToDisplayedUsage: true)
     }
 
     func invalidateAccountScopedState() {
@@ -592,12 +598,18 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
         }
     }
 
-    private func mergingLocalToday(into usage: UsageStats) async -> UsageStats {
+    private func mergingLocalToday(
+        into usage: UsageStats,
+        promoteToDisplayedUsage: Bool = false
+    ) async -> UsageStats {
         var merged = usage
         async let localTodayTask = LocalCodexUsageReader.shared.todayTokens(codexHome: serverCodexHome)
         async let localDailyTask = LocalCodexUsageReader.shared.last7DaysBuckets(codexHome: serverCodexHome)
         if let localToday = await localTodayTask {
-            merged.mergeLocalTodayTokens(localToday)
+            merged.mergeLocalTodayTokens(
+                localToday,
+                promoteToAccountTotals: promoteToDisplayedUsage
+            )
         }
         if let localDaily = await localDailyTask {
             merged.mergeLocalDailyBuckets(localDaily)
@@ -831,6 +843,7 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
                 task.projectPath = task.projectPath ?? local.cwd
                 task.finishedAt = max(task.finishedAt, local.modifiedAt)
                 task.startedAt = local.startedAt ?? task.startedAt
+                task.conversation = local.conversation
                 localTasks.append(task)
             } else {
                 localTasks.append(localTaskRecord(local))
@@ -848,7 +861,7 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
             projectPath: path,
             gitBranch: nil,
             model: nil,
-            tokenUsage: nil,
+            tokenUsage: local.totalTokens,
             durationSeconds: 0,
             succeeded: true,
             filesChanged: 0,
@@ -856,7 +869,8 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
             finishedAt: local.modifiedAt,
             runState: local.state,
             activeFlags: nil,
-            startedAt: local.startedAt
+            startedAt: local.startedAt,
+            conversation: local.conversation
         )
     }
 
@@ -1211,6 +1225,18 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
                 eventContinuation?.yield(.turnCompleted(task))
             }
 
+        case "item/agentMessage/delta":
+            if let threadID = params["threadId"] as? String,
+               let itemID = params["itemId"] as? String,
+               let delta = params["delta"] as? String,
+               !delta.isEmpty {
+                eventContinuation?.yield(.agentMessageDelta(
+                    threadID: threadID,
+                    itemID: itemID,
+                    delta: delta
+                ))
+            }
+
         case "item/started":
             let step = itemSummary(params)
             eventContinuation?.yield(.itemStarted(step))
@@ -1304,38 +1330,65 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
     // MARK: - CLI discovery
 
     static func findCodexCLI() throws -> String {
-        let home = NSHomeDirectory()
-        let candidates = [
-            "/opt/homebrew/bin/codex",
-            "/usr/local/bin/codex",
-            home + "/.local/bin/codex",
-            home + "/.npm-global/bin/codex",
-            home + "/.nvm/current/bin/codex"
-        ]
-        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
-            return path
-        }
+        try cliDiscoveryQueue.sync {
+            if let cachedCLIPath,
+               FileManager.default.isExecutableFile(atPath: cachedCLIPath) {
+                return cachedCLIPath
+            }
 
-        // `which codex` via /bin/zsh -lc for PATH with nvm/asdf
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        task.arguments = ["-lc", "command -v codex"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do {
-            try task.run()
-            task.waitUntilExit()
-        } catch {
-            throw CodexServerError.cliNotFound
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let path = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !path.isEmpty, FileManager.default.isExecutableFile(atPath: path) {
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            var candidates = [
+                "/opt/homebrew/bin/codex",
+                "/usr/local/bin/codex",
+                home + "/.local/bin/codex",
+                home + "/.npm-global/bin/codex",
+                home + "/.nvm/current/bin/codex",
+                home + "/.volta/bin/codex",
+                home + "/.asdf/shims/codex",
+                home + "/.local/share/pnpm/codex",
+                home + "/Library/pnpm/codex",
+                home + "/.bun/bin/codex"
+            ]
+            let nvmVersions = URL(fileURLWithPath: home, isDirectory: true)
+                .appendingPathComponent(".nvm/versions/node", isDirectory: true)
+            let versionDirectories = (try? FileManager.default.contentsOfDirectory(
+                at: nvmVersions,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            candidates.append(contentsOf: versionDirectories
+                .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedDescending }
+                .map { $0.appendingPathComponent("bin/codex").path })
+
+            if let resolved = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+                cachedCLIPath = resolved
+                return resolved
+            }
+
+            // 不启动 login shell，避免加载用户 shell profile、密码管理器、direnv
+            // 等与 Codex-Pulse 无关的授权流程。仅使用现有 PATH 做最后兜底。
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+            task.arguments = ["codex"]
+            task.currentDirectoryURL = safeCodexWorkingDirectory()
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = Pipe()
+            do {
+                try task.run()
+                task.waitUntilExit()
+            } catch {
+                throw CodexServerError.cliNotFound
+            }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let path = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !path.isEmpty, FileManager.default.isExecutableFile(atPath: path) else {
+                throw CodexServerError.cliNotFound
+            }
+            cachedCLIPath = path
             return path
         }
-        throw CodexServerError.cliNotFound
     }
 
     static func isCLIInstalled() -> Bool {
@@ -1346,6 +1399,7 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
         let task = Process()
         task.executableURL = URL(fileURLWithPath: path)
         task.arguments = ["--version"]
+        task.currentDirectoryURL = safeCodexWorkingDirectory()
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = Pipe()
@@ -1358,5 +1412,21 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func safeCodexWorkingDirectory() -> URL {
+        let fileManager = FileManager.default
+        let configured = ProcessInfo.processInfo.environment["CODEX_HOME"]
+            .map { NSString(string: $0).expandingTildeInPath }
+        let codexHome = configured.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
+        if fileManager.fileExists(atPath: codexHome.path) {
+            return codexHome
+        }
+        let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fileManager.homeDirectoryForCurrentUser
+        let fallback = support.appendingPathComponent("CodexPulse/Runtime", isDirectory: true)
+        try? fileManager.createDirectory(at: fallback, withIntermediateDirectories: true)
+        return fallback
     }
 }

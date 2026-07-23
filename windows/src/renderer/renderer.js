@@ -1,6 +1,7 @@
 const elements = Object.fromEntries([
-  "capsule", "detail", "miniCapsule", "miniRingProgress", "miniValue", "weatherScene", "weatherAnimation", "weatherSpacer", "statusDot", "quotaRing", "quotaArc", "remaining", "todayTokens", "chevron",
-  "informationStrip", "weatherMiniIcon", "weatherSummary", "informationLocation", "informationWeekday", "informationTime",
+  "capsule", "detail", "miniCapsule", "miniRingProgress", "miniValue", "miniValuePrevious", "petAnimation", "weatherScene", "weatherAnimation", "weatherSpacer", "statusDot", "quotaRing", "quotaArc", "remaining", "todayTokens", "todayTokensPrevious", "chevron",
+  "informationStrip", "informationWeatherContent", "informationTaskContent", "informationTaskStatus", "informationTaskSummary", "weatherMiniIcon", "weatherSummary", "informationLocation", "informationWeekday", "informationTime",
+  "conversationDetail", "conversationMessages", "conversationLiveLabel", "conversationClose",
   "email", "plan", "taskBadge", "connectionMessage", "chooseCodex", "resetTime",
   "limitTitle", "progressTrack", "progressFill", "secondaryLimit", "cardsToggle", "cardsSummary", "cardsNearest", "cardsChevron",
   "cardsList", "tokenChart", "chartValue", "todayDetail", "totalTokens", "totalMetricLabel", "taskElapsed", "taskMetricLabel",
@@ -8,14 +9,22 @@ const elements = Object.fromEntries([
   "activityBandToggle", "activityBandPicker", "activityBandStyle", "activityBandStyleLabel", "activityBandStyleMenu",
   "themePicker", "themeStyle", "themeStyleLabel", "themeStyleMenu",
   "miniStylePicker", "miniStyle", "miniStyleLabel", "miniStyleMenu",
+  "petPicker", "petCharacter", "petCharacterLabel", "petCharacterMenu",
   "moreSettingsToggle", "appearanceSettings",
   "informationBarToggle", "informationLocationButton", "informationLocationLabel", "locationChooser", "locationChooserClose", "locationSearch",
-  "locationSearchStatus", "locationResults", "updateVersion", "updateStatus", "checkUpdateButton",
+  "locationSearchStatus", "locationResults",
   "updateIndicator", "updateDetail", "updateVersionRoute", "updateReleaseTitle", "updateReleaseNotes", "skipUpdateButton", "installUpdateButton"
 ].map((id) => [id, document.getElementById(id)]));
 
 let expanded = false;
 let miniMode = false;
+let conversationExpanded = false;
+let miniConversationExpanded = false;
+let conversationCollapseTimer;
+let miniConversationCollapseTimer;
+let conversationStructureSignature = "";
+let taskSummaryAnimation;
+let lastTaskSummaryMotionAt = 0;
 let detailMode = "standard";
 let cardsExpanded = false;
 let currentState;
@@ -68,7 +77,10 @@ const themeLabels = Object.freeze({
 });
 let themePreference = loadThemePreference();
 const miniStylePreferenceKey = "codexPulse.miniStyle";
+const apiMiniStylePreferenceKey = "codexPulse.apiMiniStyle";
+const lastUsageModePreferenceKey = "codexPulse.lastUsageMode";
 const miniStyles = new Set(["quota", "tokens", "status", "weather", "time"]);
+const apiMiniStyles = new Set(["tokens", "status", "weather", "time"]);
 const miniStyleLabels = Object.freeze({
   quota: "剩余额度",
   tokens: "今日 Token",
@@ -77,6 +89,17 @@ const miniStyleLabels = Object.freeze({
   time: "当地时间"
 });
 let miniStylePreference = loadMiniStylePreference();
+let apiMiniStylePreference = loadAPIMiniStylePreference();
+const petPreferenceKey = "codexPulse.petCharacter";
+const petCharacters = new Set(["dino", "cat", "bunny", "ghost", "robot"]);
+const petCharacterLabels = Object.freeze({
+  dino: "小恐龙",
+  cat: "猫咪",
+  bunny: "兔子",
+  ghost: "幽灵",
+  robot: "机器人"
+});
+let petCharacterPreference = loadPetPreference();
 let activePreferenceMenu = null;
 
 const weatherKinds = Object.freeze({
@@ -166,7 +189,8 @@ function openPreferenceMenu(picker, trigger, menu) {
   trigger.setAttribute("aria-expanded", "true");
   menu.hidden = false;
   activePreferenceMenu = { picker, trigger, menu };
-  const selected = menu.querySelector('[aria-selected="true"]') || menu.querySelector(".preference-option");
+  const selected = menu.querySelector('[aria-selected="true"]:not([hidden])')
+    || menu.querySelector(".preference-option:not([hidden])");
   requestAnimationFrame(() => selected?.focus({ preventScroll: true }));
 }
 
@@ -184,7 +208,7 @@ function bindPreferencePicker({ picker, trigger, menu, onSelect }) {
     closePreferenceMenu(true);
   });
   menu.addEventListener("keydown", (event) => {
-    const options = [...menu.querySelectorAll(".preference-option")];
+    const options = [...menu.querySelectorAll(".preference-option:not([hidden])")];
     const index = options.indexOf(document.activeElement);
     if (event.key === "Escape") {
       event.preventDefault();
@@ -262,17 +286,92 @@ function loadMiniStylePreference() {
   }
 }
 
-function applyMiniStylePreference() {
-  elements.capsule.dataset.miniStyle = miniStylePreference;
+function loadAPIMiniStylePreference() {
+  try {
+    const saved = localStorage.getItem(apiMiniStylePreferenceKey);
+    return apiMiniStyles.has(saved) ? saved : "time";
+  } catch {
+    return "time";
+  }
+}
+
+function usesAPIMiniStyle(state = currentState) {
+  const auth = String(state?.account?.auth || "");
+  const recognizedAPI = auth === "API Key" || isCustomProviderState(state);
+  const recognizedAccount = auth === "ChatGPT";
+  try {
+    if (recognizedAPI) localStorage.setItem(lastUsageModePreferenceKey, "api");
+    else if (recognizedAccount) localStorage.setItem(lastUsageModePreferenceKey, "account");
+    if (!recognizedAPI && !recognizedAccount) {
+      return localStorage.getItem(lastUsageModePreferenceKey) === "api";
+    }
+  } catch { /* 本次状态仍然足以决定模式。 */ }
+  return recognizedAPI;
+}
+
+function effectiveMiniStyle(state = currentState) {
+  return usesAPIMiniStyle(state) ? apiMiniStylePreference : miniStylePreference;
+}
+
+function miniTaskConversationAvailable(state = currentState) {
+  if (!miniMode || !state) return false;
+  const mode = modeFor(state);
+  return mode === "working" || mode === "attention";
+}
+
+function cycleMiniDisplay() {
+  const apiMode = usesAPIMiniStyle();
+  const styles = apiMode
+    ? ["tokens", "weather", "time"]
+    : ["quota", "tokens", "weather", "time"];
+  const current = effectiveMiniStyle();
+  const currentIndex = styles.indexOf(current);
+  const next = styles[(currentIndex >= 0 ? currentIndex + 1 : 0) % styles.length];
+  if (apiMode) apiMiniStylePreference = next;
+  else miniStylePreference = next;
+  applyMiniStylePreference();
+}
+
+function applyMiniStylePreference({ rerender = true } = {}) {
+  const apiMode = usesAPIMiniStyle();
+  const activeStyle = effectiveMiniStyle();
+  elements.capsule.dataset.miniStyle = activeStyle;
+  const quotaOption = elements.miniStyleMenu.querySelector('[data-value="quota"]');
+  if (quotaOption) quotaOption.hidden = apiMode;
   syncPreferencePicker(
     elements.miniStyle,
     elements.miniStyleLabel,
     elements.miniStyleMenu,
-    miniStylePreference,
+    activeStyle,
     miniStyleLabels
   );
   try {
     localStorage.setItem(miniStylePreferenceKey, miniStylePreference);
+    localStorage.setItem(apiMiniStylePreferenceKey, apiMiniStylePreference);
+  } catch { /* 设置仍在本次运行内生效。 */ }
+  if (rerender && currentState) renderMini(currentState);
+}
+
+function loadPetPreference() {
+  try {
+    const saved = localStorage.getItem(petPreferenceKey);
+    return petCharacters.has(saved) ? saved : "dino";
+  } catch {
+    return "dino";
+  }
+}
+
+function applyPetPreference() {
+  elements.capsule.dataset.pet = petCharacterPreference;
+  syncPreferencePicker(
+    elements.petCharacter,
+    elements.petCharacterLabel,
+    elements.petCharacterMenu,
+    petCharacterPreference,
+    petCharacterLabels
+  );
+  try {
+    localStorage.setItem(petPreferenceKey, petCharacterPreference);
   } catch { /* 设置仍在本次运行内生效。 */ }
   if (currentState) renderMini(currentState);
 }
@@ -292,6 +391,7 @@ function previewActivityBand() {
 applyThemePreference();
 applyActivityBandPreference();
 applyMiniStylePreference();
+applyPetPreference();
 
 function formatTokens(value) {
   const number = Number(value);
@@ -304,6 +404,15 @@ function formatTokens(value) {
 
 function formatUsageTokens(value) {
   return formatTokens(value);
+}
+
+function formatLiveUsageTokens(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  if (Math.abs(number) >= 1_000_000_000) return `${(number / 1_000_000_000).toFixed(1)}B`;
+  if (Math.abs(number) >= 1_000_000) return `${(number / 1_000_000).toFixed(1)}M`;
+  if (Math.abs(number) >= 1_000) return `${(number / 1_000).toFixed(1)}K`;
+  return exactNumber.format(number);
 }
 
 function isCustomProviderState(state) {
@@ -319,6 +428,101 @@ function usesLocalUsageState(state) {
 function setText(element, value) {
   const text = String(value);
   if (element.textContent !== text) element.textContent = text;
+}
+
+let tokenRollGeneration = 0;
+let tokenRollAnimations = [];
+let miniMonitorRollGeneration = 0;
+let miniMonitorRollAnimations = [];
+
+function setLiveTokenText(value, animated) {
+  const current = elements.todayTokens;
+  const previous = elements.todayTokensPrevious;
+  const nextText = String(value);
+  const oldText = current.textContent || "—";
+  if (oldText === nextText) return;
+
+  tokenRollGeneration += 1;
+  const generation = tokenRollGeneration;
+  tokenRollAnimations.forEach((animation) => animation.cancel());
+  tokenRollAnimations = [];
+
+  if (!animated || reduceMotion || oldText === "—" || nextText === "—") {
+    previous.hidden = true;
+    current.textContent = nextText;
+    current.style.removeProperty("transform");
+    current.style.removeProperty("opacity");
+    previous.style.removeProperty("transform");
+    previous.style.removeProperty("opacity");
+    return;
+  }
+
+  previous.textContent = oldText;
+  previous.hidden = false;
+  current.textContent = nextText;
+  const timing = { duration: 220, easing: "cubic-bezier(.2,.78,.3,1)", fill: "both" };
+  const outgoing = previous.animate([
+    { transform: "translateY(0)", opacity: 1 },
+    { transform: "translateY(-110%)", opacity: 0 }
+  ], timing);
+  const incoming = current.animate([
+    { transform: "translateY(110%)", opacity: 0 },
+    { transform: "translateY(0)", opacity: 1 }
+  ], timing);
+  const completedAnimations = [outgoing, incoming];
+  tokenRollAnimations = completedAnimations;
+  Promise.allSettled(completedAnimations.map((animation) => animation.finished)).then(() => {
+    if (generation !== tokenRollGeneration) return;
+    previous.hidden = true;
+    completedAnimations.forEach((animation) => animation.cancel());
+    current.style.removeProperty("transform");
+    current.style.removeProperty("opacity");
+    previous.style.removeProperty("transform");
+    previous.style.removeProperty("opacity");
+    tokenRollAnimations = [];
+  });
+}
+
+function setMiniMonitorText(value, animated) {
+  const current = elements.miniValue;
+  const previous = elements.miniValuePrevious;
+  const nextText = String(value);
+  const oldText = current.textContent || "—";
+  if (oldText === nextText) return;
+
+  miniMonitorRollGeneration += 1;
+  const generation = miniMonitorRollGeneration;
+  miniMonitorRollAnimations.forEach((animation) => animation.cancel());
+  miniMonitorRollAnimations = [];
+
+  if (!animated || reduceMotion || oldText === "—" || nextText === "—") {
+    previous.hidden = true;
+    current.textContent = nextText;
+    current.style.removeProperty("transform");
+    current.style.removeProperty("opacity");
+    return;
+  }
+
+  previous.textContent = oldText;
+  previous.hidden = false;
+  current.textContent = nextText;
+  const timing = { duration: 240, easing: "cubic-bezier(.2,.78,.3,1)", fill: "both" };
+  const outgoing = previous.animate([
+    { transform: "translateY(0)", opacity: 1 },
+    { transform: "translateY(-105%)", opacity: 0 }
+  ], timing);
+  const incoming = current.animate([
+    { transform: "translateY(105%)", opacity: 0 },
+    { transform: "translateY(0)", opacity: 1 }
+  ], timing);
+  miniMonitorRollAnimations = [outgoing, incoming];
+  Promise.allSettled(miniMonitorRollAnimations.map((animation) => animation.finished)).then(() => {
+    if (generation !== miniMonitorRollGeneration) return;
+    previous.hidden = true;
+    current.style.removeProperty("transform");
+    current.style.removeProperty("opacity");
+    miniMonitorRollAnimations = [];
+  });
 }
 
 function releaseNotesForDisplay(markdown) {
@@ -404,6 +608,7 @@ function updateInformationClock() {
 
 function renderMini(state, now = new Date()) {
   if (!state) return;
+  const miniStyle = effectiveMiniStyle(state);
   const primary = state.limits?.[0];
   const remaining = Number(primary?.remainingPercent);
   const mode = modeFor(state);
@@ -412,9 +617,9 @@ function renderMini(state, now = new Date()) {
   let value = "—";
   let progress = 0;
   let color = "var(--blue)";
-  let title = miniStyleLabels[miniStylePreference];
+  let title = miniStyleLabels[miniStyle];
 
-  switch (miniStylePreference) {
+  switch (miniStyle) {
     case "tokens":
       value = state.connection === "connected"
         ? formatUsageTokens(state.usage?.today, state.usage?.todayEstimated === true)
@@ -460,16 +665,56 @@ function renderMini(state, now = new Date()) {
     }
   }
 
-  // 68px 缩小态下，98% 的 2% 缺口不足一个稳定视觉单位，容易被误认为圆环断裂。
-  // 中心数字继续展示真实值；仅将接近满额的微型环视觉闭合。
-  const visualProgress = miniStylePreference === "quota" && progress >= 98 ? 100 : progress;
-  setText(elements.miniValue, value);
+  // 保留进度值供无障碍描述和旧结构兼容；宠物缩小态不再绘制圆环。
+  const visualProgress = miniStyle === "quota" && progress >= 98 ? 100 : progress;
+  const interactionPhase = Math.floor(now.getTime() / 1000) % 13;
+  const petState = mode === "attention"
+    ? "auth"
+    : mode === "working"
+    ? ((interactionPhase >= 9 && interactionPhase <= 11) ? "scratch" : "typing")
+    : "idle";
+  const petPath = `assets/pets-v2/codex_${petCharacterPreference}_v2_${petState}.gif`;
+  if (elements.petAnimation.getAttribute("src") !== petPath) {
+    elements.petAnimation.setAttribute("src", petPath);
+  }
+  elements.petAnimation.alt = `${petCharacterLabels[petCharacterPreference]} · ${mode === "attention" ? "等待授权" : mode === "working" ? "思考中" : mode === "idle" ? "空闲" : "未连接"}`;
+  elements.capsule.classList.toggle("pet-idle", mode === "idle" || mode === "offline");
+  const rawStartedAt = Number(state.task?.startedAt);
+  const taskStartedAt = Number.isFinite(rawStartedAt) && rawStartedAt > 0
+    ? (rawStartedAt < 1_000_000_000_000 ? rawStartedAt * 1000 : rawStartedAt)
+    : now.getTime() - (now.getTime() % 8000);
+  const activeElapsed = Math.max(0, (now.getTime() - taskStartedAt) / 1000);
+  const accountQuotaAvailable = state.account?.auth !== "API Key" && Number.isFinite(remaining);
+  const showsActiveQuota = (mode === "working" || mode === "attention")
+    && accountQuotaAvailable
+    && activeElapsed % 8 >= 5;
+  const monitorValue = showsActiveQuota
+    ? `额度${Math.round(Math.max(0, Math.min(100, remaining)))}%`
+    : mode === "working"
+    ? (petState === "scratch" ? "想一下" : "思考中")
+    : mode === "attention"
+    ? "等待授权"
+    : value;
+  const monitorColor = showsActiveQuota
+    ? usageColor(remaining)
+    : mode === "attention" ? "var(--red)" : mode === "working" ? "var(--orange)" : color;
+  elements.capsule.classList.toggle("pet-quota-page", showsActiveQuota);
+  setMiniMonitorText(monitorValue, miniMode);
   elements.miniCapsule.style.setProperty("--mini-progress", `${visualProgress}`);
-  elements.miniCapsule.style.setProperty("--mini-color", color);
+  elements.miniCapsule.style.setProperty("--mini-color", monitorColor);
   elements.miniRingProgress.style.setProperty("--mini-progress", `${visualProgress}`);
   elements.miniRingProgress.style.setProperty("--mini-color", color);
   elements.miniRingProgress.classList.toggle("is-complete", visualProgress >= 100);
-  elements.miniCapsule.title = `${title} · 双击恢复完整胶囊`;
+  const interactionHelp = mode === "working" || mode === "attention"
+    ? "单击展开或收起当前对话"
+    : "单击切换显示内容";
+  elements.miniCapsule.title = `${petCharacterLabels[petCharacterPreference]} · ${title} · ${interactionHelp} · 双击恢复完整胶囊`;
+  if (miniMode) {
+    elements.capsule.setAttribute(
+      "aria-label",
+      `${petCharacterLabels[petCharacterPreference]}，${title}，${interactionHelp}，双击恢复完整胶囊`
+    );
+  }
 }
 
 function renderInformationBar(info = {}) {
@@ -525,6 +770,215 @@ function renderInformationBar(info = {}) {
     : "Location data by GeoNames";
   updateInformationClock();
   if (wasEnabled !== enabled && !expanded) scheduleCollapsedWindowWidthSync(false);
+}
+
+function visibleTaskConversation(task = {}) {
+  return Array.isArray(task.conversation)
+    ? task.conversation.filter((message) => message
+      && (message.role === "user" || message.role === "assistant")
+      && typeof message.text === "string"
+      && message.text.trim())
+    : [];
+}
+
+function compactConversationText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function renderConversationMessages(messages, mode) {
+  const signature = messages.map((message) => `${message.id}:${message.role}`).join("|");
+  if (signature !== conversationStructureSignature) {
+    elements.conversationMessages.replaceChildren();
+    if (!messages.length) {
+      const empty = document.createElement("div");
+      empty.className = "conversation-empty";
+      const pulse = document.createElement("span");
+      pulse.className = "conversation-empty-pulse";
+      const text = document.createElement("span");
+      text.textContent = mode === "attention" ? "等待你确认后继续" : "Codex 正在组织回复…";
+      empty.append(pulse, text);
+      elements.conversationMessages.append(empty);
+    } else {
+      for (const message of messages) {
+        const row = document.createElement("div");
+        row.className = `conversation-message ${message.role}`;
+        row.dataset.messageId = String(message.id || "");
+        const label = document.createElement("span");
+        label.className = "conversation-message-role";
+        label.textContent = message.role === "user" ? "你" : "Codex";
+        const text = document.createElement("p");
+        text.className = "conversation-message-text";
+        text.textContent = message.text;
+        row.append(label, text);
+        elements.conversationMessages.append(row);
+      }
+    }
+    conversationStructureSignature = signature;
+  } else if (messages.length) {
+    const rows = elements.conversationMessages.querySelectorAll(".conversation-message");
+    messages.forEach((message, index) => {
+      const text = rows[index]?.querySelector(".conversation-message-text");
+      if (text && text.textContent !== message.text) text.textContent = message.text;
+    });
+  } else {
+    const emptyText = elements.conversationMessages.querySelector(".conversation-empty span:last-child");
+    const value = mode === "attention" ? "等待你确认后继续" : "Codex 正在组织回复…";
+    if (emptyText && emptyText.textContent !== value) emptyText.textContent = value;
+  }
+  const live = mode === "working" || messages.some((message) => message.isStreaming);
+  elements.conversationLiveLabel.hidden = !live;
+  if (conversationExpanded || miniConversationExpanded) {
+    requestAnimationFrame(() => {
+      elements.conversationMessages.scrollTop = elements.conversationMessages.scrollHeight;
+    });
+  }
+}
+
+function setConversationExpanded(nextExpanded) {
+  const taskActive = currentState
+    && (modeFor(currentState) === "working" || modeFor(currentState) === "attention")
+    && elements.capsule.classList.contains("information-enabled")
+    && !expanded
+    && !miniMode;
+  const next = Boolean(nextExpanded && taskActive);
+  if (conversationExpanded === next) return;
+  if (next && miniConversationExpanded) setMiniConversationExpanded(false, { immediate: true });
+  conversationExpanded = next;
+  clearTimeout(conversationCollapseTimer);
+  elements.informationStrip.setAttribute("aria-expanded", String(next));
+  const root = document.documentElement;
+  if (next) {
+    const collapsedRect = elements.informationStrip.getBoundingClientRect();
+    elements.conversationDetail.style.setProperty(
+      "--conversation-origin-scale-x",
+      String(Math.max(0.05, collapsedRect.width / 342))
+    );
+    elements.conversationDetail.style.setProperty(
+      "--conversation-origin-scale-y",
+      String(Math.max(0.03, collapsedRect.height / 270))
+    );
+    root.classList.remove("conversation-closing");
+    root.classList.add("conversation-expanded");
+    elements.conversationDetail.hidden = false;
+    elements.conversationDetail.setAttribute("aria-hidden", "false");
+    // Commit the pill-sized start frame before adding `.open`. Without this
+    // read Chromium can coalesce both mutations and skip the outward morph.
+    elements.conversationDetail.getBoundingClientRect();
+    requestAnimationFrame(() => {
+      elements.conversationDetail.classList.add("open");
+      scheduleWindowShapeSync();
+    });
+  } else {
+    root.classList.remove("conversation-expanded");
+    root.classList.add("conversation-closing");
+    elements.conversationDetail.classList.remove("open");
+    elements.conversationDetail.setAttribute("aria-hidden", "true");
+    conversationCollapseTimer = setTimeout(() => {
+      if (conversationExpanded) return;
+      elements.conversationDetail.hidden = true;
+      root.classList.remove("conversation-closing");
+      scheduleWindowShapeSync();
+    }, reduceMotion ? 0 : 300);
+  }
+}
+
+function setMiniConversationExpanded(nextExpanded, { immediate = false } = {}) {
+  const next = Boolean(nextExpanded && miniTaskConversationAvailable());
+  if (miniConversationExpanded === next
+      && !(immediate && !next && !elements.conversationDetail.hidden)) return;
+  miniConversationExpanded = next;
+  clearTimeout(miniConversationCollapseTimer);
+  const root = document.documentElement;
+  const mode = currentState ? modeFor(currentState) : "idle";
+  if (next) {
+    const monitor = elements.miniCapsule.querySelector(".pet-monitor-frame").getBoundingClientRect();
+    elements.conversationDetail.style.setProperty(
+      "--conversation-origin-scale-x",
+      String(Math.max(0.05, monitor.width / 342))
+    );
+    elements.conversationDetail.style.setProperty(
+      "--conversation-origin-scale-y",
+      String(Math.max(0.03, monitor.height / 246))
+    );
+    root.classList.add("mini-conversation-expanded");
+    root.classList.toggle("mini-conversation-attention", mode === "attention");
+    if (conversationExpanded) setConversationExpanded(false);
+    renderConversationMessages(visibleTaskConversation(currentState?.task), mode);
+    elements.conversationDetail.hidden = false;
+    elements.conversationDetail.setAttribute("aria-hidden", "false");
+    // Keep the pet fixed while the conversation surface grows from its monitor.
+    elements.conversationDetail.getBoundingClientRect();
+    requestAnimationFrame(() => {
+      elements.conversationDetail.classList.add("open");
+      scheduleWindowShapeSync();
+    });
+  } else {
+    elements.conversationDetail.classList.remove("open");
+    elements.conversationDetail.setAttribute("aria-hidden", "true");
+    const finish = () => {
+      if (miniConversationExpanded || conversationExpanded) return;
+      elements.conversationDetail.hidden = true;
+      root.classList.remove("mini-conversation-expanded");
+      root.classList.remove("mini-conversation-attention");
+      scheduleWindowShapeSync();
+    };
+    if (immediate || reduceMotion) finish();
+    else miniConversationCollapseTimer = setTimeout(finish, 320);
+  }
+  if (currentState) renderMini(currentState);
+  scheduleWindowShapeSync();
+}
+
+function handleMiniSingleClick() {
+  if (miniTaskConversationAvailable()) {
+    setMiniConversationExpanded(!miniConversationExpanded);
+  } else {
+    cycleMiniDisplay();
+  }
+}
+
+function renderTaskInformation(state, mode) {
+  const enabled = elements.capsule.classList.contains("information-enabled");
+  const taskActive = enabled && (mode === "working" || mode === "attention") && !expanded && !miniMode;
+  const messages = visibleTaskConversation(state.task);
+  const assistant = [...messages].reverse().find((message) => message.role === "assistant");
+  const summary = compactConversationText(
+    assistant?.text || state.task?.title || (mode === "attention" ? "等待你确认后继续" : "Codex 正在组织回复…")
+  );
+  elements.informationStrip.classList.toggle("task-streaming", taskActive);
+  elements.informationStrip.classList.toggle("task-attention", taskActive && mode === "attention");
+  elements.informationStrip.disabled = !taskActive;
+  elements.informationWeatherContent.setAttribute("aria-hidden", String(taskActive));
+  elements.informationTaskContent.setAttribute("aria-hidden", String(!taskActive));
+  setText(elements.informationTaskStatus, mode === "attention" ? "等待授权" : "思考中");
+  const nextSummary = summary || "Codex 正在组织回复…";
+  const summaryChanged = elements.informationTaskSummary.textContent !== nextSummary;
+  setText(elements.informationTaskSummary, nextSummary);
+  elements.informationTaskSummary.title = summary;
+  const motionNow = performance.now();
+  if (taskActive && summaryChanged && !reduceMotion && motionNow - lastTaskSummaryMotionAt >= 120) {
+    lastTaskSummaryMotionAt = motionNow;
+    taskSummaryAnimation?.cancel();
+    taskSummaryAnimation = elements.informationTaskSummary.animate([
+      { transform: "translateY(4px)", opacity: .38 },
+      { transform: "translateY(0)", opacity: 1 }
+    ], {
+      duration: 180,
+      easing: "cubic-bezier(.16,1,.3,1)"
+    });
+  }
+  requestAnimationFrame(() => {
+    const summaryElement = elements.informationTaskSummary;
+    summaryElement.scrollLeft = summaryElement.scrollWidth;
+  });
+  renderConversationMessages(messages, mode);
+  if (!taskActive && conversationExpanded) setConversationExpanded(false);
+  const miniTaskActive = miniMode && (mode === "working" || mode === "attention");
+  if (!miniTaskActive && miniConversationExpanded) setMiniConversationExpanded(false);
+  document.documentElement.classList.toggle(
+    "mini-conversation-attention",
+    miniConversationExpanded && mode === "attention"
+  );
 }
 
 function scheduleCollapsedWindowWidthSync(syncAfterRingTransition = true) {
@@ -590,7 +1044,13 @@ function paddedShapeRect(element, horizontalPadding, verticalPadding = horizonta
 }
 
 function currentWindowShape(expandedState = expanded) {
-  if (miniMode) return [paddedShapeRect(elements.capsule, 10, 10)];
+  if (miniMode) {
+    const rects = [paddedShapeRect(elements.capsule, 12, 12)];
+    if (!elements.conversationDetail.hidden) {
+      rects.push(paddedShapeRect(elements.conversationDetail, 14, 18));
+    }
+    return rects;
+  }
   // Keep the independently rendered hover/activity halo inside the native
   // Windows shape. Without this extra transparent perimeter setShape clips
   // the blur back to a thin colored line at the capsule edge.
@@ -608,6 +1068,7 @@ function currentWindowShape(expandedState = expanded) {
   }
   const rects = [capsuleRect];
   if (!elements.informationStrip.hidden) rects.push(paddedShapeRect(elements.informationStrip, 18, 16));
+  if (!elements.conversationDetail.hidden) rects.push(paddedShapeRect(elements.conversationDetail, 18, 20));
   return rects;
 }
 
@@ -762,8 +1223,10 @@ function updateTaskTunnel(mode) {
 
 function render(state) {
   currentState = state;
-  renderInformationBar(state.informationBar || {});
+  applyMiniStylePreference({ rerender: false });
   const mode = modeFor(state);
+  renderInformationBar(state.informationBar || {});
+  renderTaskInformation(state, mode);
   const primary = state.limits?.[0];
   const secondary = state.limits?.[1];
   const remaining = primary?.remainingPercent;
@@ -785,9 +1248,11 @@ function render(state) {
   setText(elements.remaining, quotaValue);
   const quotaProgress = Math.max(0, Math.min(100, remaining || 0));
   elements.quotaArc.style.setProperty("--quota", `${quotaProgress >= 98 ? 100 : quotaProgress}%`);
-  setText(elements.todayTokens, connected
-    ? formatUsageTokens(state.usage?.today, state.usage?.todayEstimated === true)
-    : "—");
+  setLiveTokenText(connected
+    ? taskActive
+      ? formatLiveUsageTokens(state.usage?.today)
+      : formatUsageTokens(state.usage?.today, state.usage?.todayEstimated === true)
+    : "—", taskActive);
   setText(elements.email, state.account?.maskedEmail || "—");
   const providerLabel = isCustomProviderState(state) ? state.modelProvider : state.account?.plan;
   setText(elements.plan, `${providerLabel || "—"} · ${state.account?.auth || "—"}`);
@@ -850,10 +1315,6 @@ function render(state) {
 
   const update = state.appUpdate || {};
   const hasAvailableUpdate = update.status === "available" && Boolean(update.availableVersion);
-  setText(elements.updateVersion, `CodexPulse v${update.currentVersion || "—"}`);
-  setText(elements.updateStatus, update.message || "启动后及每 5 分钟自动检查 GitHub Releases");
-  elements.checkUpdateButton.disabled = update.status === "checking";
-  elements.checkUpdateButton.textContent = update.status === "available" ? "下载更新" : update.status === "checking" ? "检查中…" : "检查更新";
   elements.updateIndicator.hidden = !hasAvailableUpdate;
   elements.updateIndicator.title = hasAvailableUpdate
     ? `发现新版本 v${update.availableVersion} · 点击查看更新内容`
@@ -1109,6 +1570,8 @@ async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
     if (expandAfterRestore && !miniMode && !miniTransitioning) setExpanded(true);
     return;
   }
+  if (shouldMinimize) setConversationExpanded(false);
+  else if (miniConversationExpanded) setMiniConversationExpanded(false, { immediate: true });
   miniTransitioning = true;
   clearTimeout(capsuleSingleClickTimer);
   clearTimeout(collapseTimer);
@@ -1141,7 +1604,10 @@ async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
         miniMode = true;
         root.classList.add("mini-mode");
         elements.miniCapsule.setAttribute("aria-hidden", "false");
-        elements.capsule.setAttribute("aria-label", `${miniStyleLabels[miniStylePreference]}，双击恢复完整胶囊`);
+        elements.capsule.setAttribute(
+          "aria-label",
+          `${petCharacterLabels[petCharacterPreference]}，${miniStyleLabels[effectiveMiniStyle()]}，单击切换显示内容，双击恢复完整胶囊`
+        );
         if (currentState) renderMini(currentState);
       });
       await window.pulse.resize("mini");
@@ -1239,6 +1705,7 @@ function setExpanded(nextExpanded) {
   }
   if (miniTransitioning) return;
   if (expanded === nextExpanded) return;
+  if (nextExpanded) setConversationExpanded(false);
   expanded = nextExpanded;
   document.documentElement.classList.toggle("detail-expanded", expanded);
   const transitionGeneration = ++detailTransitionGeneration;
@@ -1539,7 +2006,7 @@ function finishCapsulePointer(event) {
   if (shouldToggle) {
     clearTimeout(capsuleSingleClickTimer);
     capsuleSingleClickTimer = setTimeout(() => {
-      if (miniMode) setExpanded(true);
+      if (miniMode) handleMiniSingleClick();
       else toggleExpanded();
     }, 300);
   }
@@ -1568,9 +2035,21 @@ elements.capsule.addEventListener("keydown", (event) => {
   if (event.target !== elements.capsule) return;
   if (event.key === "Enter" || event.key === " ") {
     event.preventDefault();
-    if (miniMode) void setMiniMode(false);
+    if (miniMode) handleMiniSingleClick();
     else toggleExpanded();
   }
+});
+
+elements.informationStrip.addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (elements.informationStrip.disabled) return;
+  setConversationExpanded(!conversationExpanded);
+});
+
+elements.conversationClose.addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (miniMode) setMiniConversationExpanded(false);
+  else setConversationExpanded(false);
 });
 
 ["pointerdown", "pointerup", "pointercancel", "dblclick"].forEach((type) => {
@@ -1621,11 +2100,24 @@ bindPreferencePicker({
   }
 });
 bindPreferencePicker({
+  picker: elements.petPicker,
+  trigger: elements.petCharacter,
+  menu: elements.petCharacterMenu,
+  onSelect: (value) => {
+    petCharacterPreference = petCharacters.has(value) ? value : "dino";
+    applyPetPreference();
+  }
+});
+bindPreferencePicker({
   picker: elements.miniStylePicker,
   trigger: elements.miniStyle,
   menu: elements.miniStyleMenu,
   onSelect: (value) => {
-    miniStylePreference = miniStyles.has(value) ? value : "quota";
+    if (usesAPIMiniStyle()) {
+      apiMiniStylePreference = apiMiniStyles.has(value) ? value : "time";
+    } else {
+      miniStylePreference = miniStyles.has(value) ? value : "quota";
+    }
     applyMiniStylePreference();
   }
 });
@@ -1761,10 +2253,6 @@ elements.tokenChart.addEventListener("mousemove", (event) => {
 elements.tokenChart.addEventListener("mouseleave", () => { hoveredChartIndex = null; scheduleChartDraw(); });
 elements.chooseCodex.addEventListener("click", () => window.pulse.clearCodexPath());
 elements.refresh.addEventListener("click", () => window.pulse.refresh());
-elements.checkUpdateButton.addEventListener("click", () => {
-  if (currentState?.appUpdate?.status === "available") void window.pulse.openUpdate();
-  else void window.pulse.checkForUpdates();
-});
 elements.quit.addEventListener("click", () => window.pulse.quit());
 
 // 展开后点击窗口内的透明留白区域也收起；详情卡和胶囊自身保持正常交互。

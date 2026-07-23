@@ -28,6 +28,7 @@ windows/build/
 # Build and verification artifacts
 dist/
 output/
+tmp/
 *.dmg
 *.exe
 

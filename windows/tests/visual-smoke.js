@@ -314,7 +314,7 @@ async function captureFixture(fixture, expanded = false, theme = "classic", outp
   window.destroy();
 }
 
-async function captureMini(style, taskMode = null, activityStyle = null, theme = null) {
+async function captureMini(style, taskMode = null, activityStyle = null, theme = null, pet = "dino") {
   const window = new BrowserWindow({
     width: 390,
     height: 810,
@@ -338,43 +338,372 @@ async function captureMini(style, taskMode = null, activityStyle = null, theme =
   await wait(250);
   await window.webContents.executeJavaScript(`
     document.querySelector('#miniStyleMenu [data-value="${style}"]').click();
+    document.querySelector('#petCharacterMenu [data-value="${pet}"]').click();
     ${activityStyle ? `document.querySelector('#activityBandStyleMenu [data-value="${activityStyle}"]').click();` : ""}
     ${theme ? `document.querySelector('#themeStyleMenu [data-value="${theme}"]').click();` : ""}
     document.getElementById("capsule").dispatchEvent(
       new MouseEvent("dblclick", { button: 0, bubbles: true })
     );
-    ${taskMode ? `document.getElementById("capsule").classList.add("task-active"${taskMode === "attention" ? `, "task-attention"` : ""});` : ""}
+    ${taskMode ? `render({ ...currentState, task: { state: "${taskMode}", label: "${taskMode === "attention" ? "等待授权" : "思考中"}", startedAt: Date.now() } });` : ""}
   `, true);
   await wait(650);
-  const centers = await window.webContents.executeJavaScript(`(() => {
+  const expectedDisplayFrames = {
+    dino: [126, 23, 76, 34],
+    cat: [123, 17, 81, 36],
+    bunny: [122, 21, 82, 34],
+    ghost: [125, 17, 79, 36],
+    robot: [122, 21, 82, 34]
+  };
+  const [displayX, displayY, displayWidth, displayHeight] = expectedDisplayFrames[pet];
+  const petLayout = await window.webContents.executeJavaScript(`(() => {
     const capsule = document.getElementById('miniCapsule').getBoundingClientRect();
-    const ring = document.querySelector('.mini-ring-svg').getBoundingClientRect();
+    const animation = document.getElementById('petAnimation');
+    const image = animation.getBoundingClientRect();
+    const value = document.getElementById('miniValue').getBoundingClientRect();
     return {
-      dx: ring.left + ring.width / 2 - (capsule.left + capsule.width / 2),
-      dy: ring.top + ring.height / 2 - (capsule.top + capsule.height / 2),
-      oneCenter: [...document.querySelectorAll('.mini-ring-svg circle')]
-        .every((circle) => circle.getAttribute('cx') === '34' && circle.getAttribute('cy') === '34')
+      width: capsule.width,
+      height: capsule.height,
+      imageDX: image.left - capsule.left,
+      imageDY: image.top - capsule.top,
+      imageWidth: image.width,
+      imageHeight: image.height,
+      naturalWidth: animation.naturalWidth,
+      naturalHeight: animation.naturalHeight,
+      valueDisplay: getComputedStyle(document.getElementById('miniValue')).display,
+      valueX: value.left - capsule.left,
+      valueY: value.top - capsule.top,
+      valueWidth: value.width,
+      valueHeight: value.height,
+      source: animation.getAttribute('src')
     };
   })()`, true);
-  if (Math.abs(centers.dx) > 0.25 || Math.abs(centers.dy) > 0.25 || !centers.oneCenter) {
-    throw new Error(`mini ring is not centered: ${JSON.stringify({ style, ...centers })}`);
+  const expectedPetStates = taskMode === "attention" ? ["auth"] : taskMode === "working" ? ["typing", "scratch"] : ["idle"];
+  const idleMonitorInvalid = !taskMode && (
+    petLayout.valueDisplay === "none"
+      || Math.abs(petLayout.valueX - displayX) > 0.25
+      || Math.abs(petLayout.valueY - displayY) > 0.25
+      || Math.abs(petLayout.valueWidth - displayWidth) > 0.25
+      || Math.abs(petLayout.valueHeight - displayHeight) > 0.25
+  );
+  if (Math.abs(petLayout.width - 216) > 0.25
+      || Math.abs(petLayout.height - 129.6) > 0.25
+      || Math.abs(petLayout.imageDX) > 0.25
+      || Math.abs(petLayout.imageDY) > 0.25
+      || Math.abs(petLayout.imageWidth - 216) > 0.25
+      || Math.abs(petLayout.imageHeight - 129.6) > 0.25
+      || petLayout.naturalWidth !== 480
+      || petLayout.naturalHeight !== 288
+      || !expectedPetStates.some((state) => petLayout.source.endsWith(`codex_${pet}_v2_${state}.gif`))
+      || (taskMode && petLayout.valueDisplay === "none")
+      || idleMonitorInvalid) {
+    throw new Error(`pet mini layout/state mismatch: ${JSON.stringify({ style, taskMode, ...petLayout })}`);
+  }
+  if (taskMode && pet === "dino" && !activityStyle && !theme) {
+    const activeQuota = await window.webContents.executeJavaScript(`(() => {
+      const startedAt = Date.now() - 5500;
+      render({
+        ...currentState,
+        task: { ...currentState.task, state: "${taskMode}", startedAt }
+      });
+      return {
+        value: document.getElementById("miniValue").textContent,
+        quotaPage: document.getElementById("capsule").classList.contains("pet-quota-page")
+      };
+    })()`, true);
+    if (!activeQuota.quotaPage || activeQuota.value !== "额度98%") {
+      throw new Error(`account mini monitor did not rotate current quota: ${JSON.stringify({ taskMode, activeQuota })}`);
+    }
+    await wait(280);
   }
   const image = await window.webContents.capturePage();
-  const suffix = [theme, activityStyle, taskMode].filter(Boolean).map((value) => `-${value}`).join("");
+  const suffix = [pet === "dino" ? null : pet, theme, activityStyle, taskMode].filter(Boolean).map((value) => `-${value}`).join("");
   fs.writeFileSync(path.join(outputDirectory, `mini-${style}${suffix}@2x.png`), image.toPNG());
 
   if (style === "quota" && !taskMode) {
-    window.webContents.sendInputEvent({ type: "mouseDown", x: 346, y: 44, button: "left", clickCount: 1 });
-    window.webContents.sendInputEvent({ type: "mouseUp", x: 346, y: 44, button: "left", clickCount: 1 });
+    window.webContents.sendInputEvent({ type: "mouseDown", x: 350, y: 26, button: "left", clickCount: 1 });
+    window.webContents.sendInputEvent({ type: "mouseUp", x: 350, y: 26, button: "left", clickCount: 1 });
     await wait(850);
     const interaction = await window.webContents.executeJavaScript(`({
       isMini: document.documentElement.classList.contains("mini-mode"),
-      isExpanded: document.getElementById("capsule").getAttribute("aria-expanded")
+      isExpanded: document.getElementById("capsule").getAttribute("aria-expanded"),
+      miniStyle: document.getElementById("capsule").dataset.miniStyle
     })`, true);
-    if (interaction.isMini || interaction.isExpanded !== "true") {
-      throw new Error(`mini single click did not expand details: ${JSON.stringify(interaction)}`);
+    if (!interaction.isMini || interaction.isExpanded !== "false" || interaction.miniStyle !== "tokens") {
+      throw new Error(`idle mini single click did not cycle its display: ${JSON.stringify(interaction)}`);
     }
   }
+}
+
+async function assertLiveTokenRoll() {
+  const window = new BrowserWindow({
+    width: 390,
+    height: 810,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    resizable: false,
+    webPreferences: {
+      preload: path.join(__dirname, "visual-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      additionalArguments: ["--fixture=large-token"]
+    }
+  });
+  captureWindows.push(window);
+  await window.loadFile(path.resolve(__dirname, "../src/renderer/index.html"));
+  await wait(300);
+  await window.webContents.executeJavaScript(`render({
+    ...currentState,
+    task: { state: "working", label: "思考中", startedAt: Date.now() },
+    usage: { ...currentState.usage, today: 153200000 }
+  })`, true);
+  await wait(260);
+  await window.webContents.executeJavaScript(`render({
+    ...currentState,
+    usage: { ...currentState.usage, today: 153300000 }
+  })`, true);
+  await wait(45);
+  const midFrame = await window.webContents.executeJavaScript(`(() => ({
+    value: document.getElementById("todayTokens").textContent,
+    previous: document.getElementById("todayTokensPrevious").textContent,
+    previousVisible: !document.getElementById("todayTokensPrevious").hidden,
+    activeAnimations: document.querySelector(".token-roll-viewport").getAnimations({ subtree: true }).length
+  }))()`, true);
+  if (midFrame.value !== "153.3M"
+      || midFrame.previous !== "153.2M"
+      || !midFrame.previousVisible
+      || midFrame.activeAnimations < 2) {
+    throw new Error(`live Token roll did not animate upward: ${JSON.stringify(midFrame)}`);
+  }
+  await wait(240);
+  const settled = await window.webContents.executeJavaScript(`(() => {
+    const current = document.getElementById("todayTokens");
+    const previous = document.getElementById("todayTokensPrevious");
+    return {
+      previousHidden: previous.hidden,
+      previousDisplay: getComputedStyle(previous).display,
+      value: current.textContent,
+      currentTransform: getComputedStyle(current).transform,
+      activeAnimations: document.querySelector(".token-roll-viewport").getAnimations({ subtree: true }).length
+    };
+  })()`, true);
+  if (!settled.previousHidden
+      || settled.previousDisplay !== "none"
+      || settled.value !== "153.3M"
+      || settled.currentTransform !== "none"
+      || settled.activeAnimations !== 0) {
+    throw new Error(`live Token roll did not settle cleanly: ${JSON.stringify(settled)}`);
+  }
+  window.destroy();
+}
+
+async function assertOfflineAPIMiniTime() {
+  const window = new BrowserWindow({
+    width: 390,
+    height: 810,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    resizable: false,
+    webPreferences: {
+      preload: path.join(__dirname, "visual-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      partition: `offline-api-mini-${Date.now()}`,
+      additionalArguments: ["--fixture=api-rain"]
+    }
+  });
+  captureWindows.push(window);
+  await window.loadFile(path.resolve(__dirname, "../src/renderer/index.html"));
+  await wait(300);
+  const result = await window.webContents.executeJavaScript(`new Promise((resolve) => {
+    apiMiniStylePreference = "time";
+    localStorage.setItem("codexPulse.apiMiniStyle", "time");
+    render(currentState);
+    const before = {
+      auth: currentState?.account?.auth,
+      style: effectiveMiniStyle(currentState),
+      storedMode: localStorage.getItem("codexPulse.lastUsageMode")
+    };
+    render({
+      ...currentState,
+      connection: "offline",
+      account: { ...currentState.account, auth: "—" },
+      message: "正在重新连接"
+    });
+    document.getElementById("capsule").dispatchEvent(
+      new MouseEvent("dblclick", { button: 0, bubbles: true })
+    );
+    setTimeout(() => resolve({
+      style: document.getElementById("capsule").dataset.miniStyle,
+      value: document.getElementById("miniValue").textContent,
+      color: document.getElementById("miniCapsule").style.getPropertyValue("--mini-color").trim(),
+      idle: document.getElementById("capsule").classList.contains("pet-idle"),
+      before,
+      storedMode: localStorage.getItem("codexPulse.lastUsageMode")
+    }), 350);
+  })`, true);
+  if (result.style !== "time" || !/^\d{2}:\d{2}$/.test(result.value)
+      || result.color !== "var(--blue)" || !result.idle) {
+    throw new Error(`offline API mini did not preserve time: ${JSON.stringify(result)}`);
+  }
+  window.destroy();
+}
+
+async function assertTaskConversationIsland() {
+  const window = new BrowserWindow({
+    width: 390,
+    height: 810,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    resizable: false,
+    webPreferences: {
+      preload: path.join(__dirname, "visual-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      additionalArguments: ["--fixture=clear"]
+    }
+  });
+  captureWindows.push(window);
+  await window.loadFile(path.resolve(__dirname, "../src/renderer/index.html"));
+  await wait(320);
+  const weatherStripSize = await window.webContents.executeJavaScript(`(() => {
+    const rect = document.getElementById("informationStrip").getBoundingClientRect();
+    return { width: rect.width, height: rect.height };
+  })()`, true);
+  await window.webContents.executeJavaScript(`render({
+    ...currentState,
+    task: {
+      state: "working",
+      label: "思考中",
+      title: "正在输出回复",
+      startedAt: Date.now(),
+      threadID: "thread-visual",
+      conversation: [
+        { id: "user-1", role: "user", text: "请优化这个交互", isStreaming: false },
+        { id: "assistant-1", role: "assistant", text: "我正在检查当前的窗口状态，并持续把最新的流式输出滚动到任务信息栏末尾", isStreaming: true }
+      ]
+    }
+  })`, true);
+  await wait(260);
+  const collapsed = await window.webContents.executeJavaScript(`(() => {
+    const strip = document.getElementById("informationStrip").getBoundingClientRect();
+    const content = document.getElementById("informationTaskContent").getBoundingClientRect();
+    const copy = document.querySelector(".information-task-copy").getBoundingClientRect();
+    return {
+      taskMode: document.getElementById("informationStrip").classList.contains("task-streaming"),
+      disabled: document.getElementById("informationStrip").disabled,
+      summary: document.getElementById("informationTaskSummary").textContent,
+      summaryScrollLeft: document.getElementById("informationTaskSummary").scrollLeft,
+      stripWidth: strip.width,
+      stripHeight: strip.height,
+      leftInset: content.left - strip.left,
+      rightInset: strip.right - content.right,
+      copyCenterDelta: Math.abs((copy.left + copy.width / 2) - (strip.left + strip.width / 2)),
+      capsuleWidth: document.getElementById("capsule").getBoundingClientRect().width
+    };
+  })()`, true);
+  if (!collapsed.taskMode || collapsed.disabled
+      || !collapsed.summary.includes("检查当前的窗口状态")
+      || collapsed.summaryScrollLeft <= 0
+      || Math.abs(collapsed.stripWidth - weatherStripSize.width) > .5
+      || Math.abs(collapsed.stripHeight - weatherStripSize.height) > .5
+      || collapsed.leftInset < 8.5 || collapsed.rightInset < 8.5
+      || collapsed.copyCenterDelta > .75
+      || Math.abs(collapsed.capsuleWidth - 275) > .5) {
+    throw new Error(`task stream strip did not preserve weather size: ${JSON.stringify({ weatherStripSize, collapsed })}`);
+  }
+  fs.writeFileSync(
+    path.join(outputDirectory, "task-information-stream-collapsed@2x.png"),
+    (await window.webContents.capturePage()).toPNG()
+  );
+
+  await window.webContents.executeJavaScript(`document.getElementById("informationStrip").click()`, true);
+  await wait(90);
+  const morphing = await window.webContents.executeJavaScript(`(() => {
+    const detail = document.getElementById("conversationDetail");
+    const matrix = new DOMMatrixReadOnly(getComputedStyle(detail).transform);
+    return {
+      scaleX: matrix.a,
+      scaleY: matrix.d,
+      originScaleX: parseFloat(detail.style.getPropertyValue("--conversation-origin-scale-x")),
+      originScaleY: parseFloat(detail.style.getPropertyValue("--conversation-origin-scale-y"))
+    };
+  })()`, true);
+  if (!(morphing.scaleX > morphing.originScaleX && morphing.scaleX < .999)
+      || !(morphing.scaleY > morphing.originScaleY && morphing.scaleY < .999)) {
+    throw new Error(`task conversation skipped the outward morph: ${JSON.stringify(morphing)}`);
+  }
+  await wait(290);
+  const opened = await window.webContents.executeJavaScript(`(() => {
+    const detail = document.getElementById("conversationDetail");
+    const strip = document.getElementById("informationStrip").getBoundingClientRect();
+    const rect = detail.getBoundingClientRect();
+    return {
+      hidden: detail.hidden,
+      open: detail.classList.contains("open"),
+      expanded: document.getElementById("informationStrip").getAttribute("aria-expanded"),
+      width: rect.width,
+      height: rect.height,
+      islandTopDelta: Math.abs(rect.top - strip.top),
+      stripWidth: strip.width,
+      originScaleX: parseFloat(detail.style.getPropertyValue("--conversation-origin-scale-x")),
+      originScaleY: parseFloat(detail.style.getPropertyValue("--conversation-origin-scale-y")),
+      messages: document.querySelectorAll(".conversation-message").length
+    };
+  })()`, true);
+  if (opened.hidden || !opened.open || opened.expanded !== "true"
+      || Math.abs(opened.width - 342) > .5 || Math.abs(opened.height - 270) > .5
+      || Math.abs(opened.stripWidth - 342) > .5 || opened.islandTopDelta > .5
+      || Math.abs(opened.originScaleX - collapsed.stripWidth / 342) > .001
+      || Math.abs(opened.originScaleY - collapsed.stripHeight / 270) > .001
+      || opened.messages !== 2) {
+    throw new Error(`task conversation did not expand like an island: ${JSON.stringify(opened)}`);
+  }
+  fs.writeFileSync(
+    path.join(outputDirectory, "task-information-island@2x.png"),
+    (await window.webContents.capturePage()).toPNG()
+  );
+
+  await window.webContents.executeJavaScript(`render({
+    ...currentState,
+    task: {
+      ...currentState.task,
+      conversation: [
+        currentState.task.conversation[0],
+        { ...currentState.task.conversation[1], text: "我正在检查当前的窗口状态，并实时更新完整回复" }
+      ]
+    }
+  })`, true);
+  await wait(80);
+  const streamed = await window.webContents.executeJavaScript(
+    `document.querySelector(".conversation-message.assistant .conversation-message-text").textContent`,
+    true
+  );
+  if (!streamed.endsWith("实时更新完整回复")) {
+    throw new Error(`expanded conversation did not stream in place: ${streamed}`);
+  }
+
+  await window.webContents.executeJavaScript(`render({
+    ...currentState,
+    task: { state: "idle", label: "空闲", title: null, project: null, startedAt: null, conversation: [] }
+  })`, true);
+  await wait(380);
+  const restored = await window.webContents.executeJavaScript(`(() => ({
+    conversationHidden: document.getElementById("conversationDetail").hidden,
+    taskMode: document.getElementById("informationStrip").classList.contains("task-streaming"),
+    weatherVisible: document.getElementById("informationWeatherContent").getAttribute("aria-hidden"),
+    expanded: document.getElementById("informationStrip").getAttribute("aria-expanded")
+  }))()`, true);
+  if (!restored.conversationHidden || restored.taskMode
+      || restored.weatherVisible !== "false" || restored.expanded !== "false") {
+    throw new Error(`task conversation did not retract to weather: ${JSON.stringify(restored)}`);
+  }
+  window.destroy();
 }
 
 async function captureSettingsAndAssertMiniPicker() {
@@ -404,10 +733,10 @@ async function captureSettingsAndAssertMiniPicker() {
       document.getElementById("moreSettingsToggle").click();
       requestAnimationFrame(() => requestAnimationFrame(() => {
         const row = document.querySelector(".mini-style-preference-row");
-        const updateRow = document.querySelector(".update-preference-row");
+        const petRow = document.querySelector(".pet-preference-row");
         const container = document.getElementById("appearanceSettings");
         const rowRect = row.getBoundingClientRect();
-        const updateRect = updateRow.getBoundingClientRect();
+        const petRect = petRow.getBoundingClientRect();
         const containerRect = container.getBoundingClientRect();
         resolve({
           hidden: container.hidden,
@@ -415,20 +744,102 @@ async function captureSettingsAndAssertMiniPicker() {
           height: rowRect.height,
           inside: rowRect.top >= containerRect.top && rowRect.bottom <= containerRect.bottom,
           label: document.getElementById("miniStyleLabel").textContent,
-          updateDisplay: getComputedStyle(updateRow).display,
-          updateInside: updateRect.top >= containerRect.top && updateRect.bottom <= containerRect.bottom,
-          updateVersion: document.getElementById("updateVersion").textContent
+          petDisplay: getComputedStyle(petRow).display,
+          petInside: petRect.top >= containerRect.top && petRect.bottom <= containerRect.bottom,
+          petLabel: document.getElementById("petCharacterLabel").textContent,
+          updateRowRemoved: document.querySelector(".update-preference-row") === null
         });
       }));
     }, 280);
   })`, true);
   if (result.hidden || result.display === "none" || result.height < 28 || !result.inside || !result.label
-      || result.updateDisplay === "none" || !result.updateInside || !result.updateVersion) {
+      || result.petDisplay === "none" || !result.petInside || result.petLabel !== "小恐龙"
+      || !result.updateRowRemoved) {
     throw new Error(`mini settings picker is not visible: ${JSON.stringify(result)}`);
   }
   await wait(150);
   const image = await window.webContents.capturePage();
   fs.writeFileSync(path.join(outputDirectory, "clear-settings@2x.png"), image.toPNG());
+}
+
+async function assertAPIMiniStyleRules() {
+  const window = new BrowserWindow({
+    width: 390,
+    height: 810,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    resizable: false,
+    webPreferences: {
+      preload: path.join(__dirname, "visual-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      additionalArguments: ["--fixture=api-rain"]
+    }
+  });
+  captureWindows.push(window);
+  const pagePath = path.resolve(__dirname, "../src/renderer/index.html");
+  await window.loadFile(pagePath);
+  await window.webContents.executeJavaScript(`localStorage.removeItem("codexPulse.apiMiniStyle")`, true);
+  await window.reload();
+  await wait(450);
+  const initial = await window.webContents.executeJavaScript(`(() => {
+    const quota = document.querySelector('#miniStyleMenu [data-value="quota"]');
+    const visible = [...document.querySelectorAll('#miniStyleMenu .preference-option')]
+      .filter((option) => !option.hidden)
+      .map((option) => option.dataset.value);
+    document.getElementById("capsule").dispatchEvent(
+      new MouseEvent("dblclick", { button: 0, bubbles: true })
+    );
+    return {
+      label: document.getElementById("miniStyleLabel").textContent,
+      style: document.getElementById("capsule").dataset.miniStyle,
+      quotaHidden: quota.hidden,
+      visible,
+      accountStyle: localStorage.getItem("codexPulse.miniStyle"),
+      apiStyle: localStorage.getItem("codexPulse.apiMiniStyle")
+    };
+  })()`, true);
+  await wait(300);
+  const monitorText = await window.webContents.executeJavaScript(
+    `document.getElementById("miniValue").textContent`,
+    true
+  );
+  if (initial.label !== "当地时间"
+      || initial.style !== "time"
+      || !initial.quotaHidden
+      || JSON.stringify(initial.visible) !== JSON.stringify(["tokens", "status", "weather", "time"])
+      || initial.apiStyle !== "time"
+      || !/^\d{2}:\d{2}$/.test(monitorText)) {
+    throw new Error(`API mini styles did not default to time: ${JSON.stringify({ initial, monitorText })}`);
+  }
+  const selected = await window.webContents.executeJavaScript(`(() => {
+    document.querySelector('#miniStyleMenu [data-value="tokens"]').click();
+    return {
+      label: document.getElementById("miniStyleLabel").textContent,
+      style: document.getElementById("capsule").dataset.miniStyle,
+      apiStyle: localStorage.getItem("codexPulse.apiMiniStyle")
+    };
+  })()`, true);
+  if (selected.label !== "今日 Token" || selected.style !== "tokens" || selected.apiStyle !== "tokens") {
+    throw new Error(`API mini style selection was not persisted: ${JSON.stringify(selected)}`);
+  }
+  const activeMonitor = await window.webContents.executeJavaScript(`(() => {
+    const startedAt = Date.now();
+    renderMini({
+      ...currentState,
+      limits: [{ name: "模拟额度", remainingPercent: 42 }],
+      task: { state: "working", label: "思考中", startedAt }
+    }, new Date(startedAt + 5500));
+    return {
+      value: document.getElementById("miniValue").textContent,
+      quotaPage: document.getElementById("capsule").classList.contains("pet-quota-page")
+    };
+  })()`, true);
+  if (activeMonitor.quotaPage || activeMonitor.value.startsWith("额度")) {
+    throw new Error(`API mini monitor must not rotate account quota: ${JSON.stringify(activeMonitor)}`);
+  }
 }
 
 async function assertUpdateReminderInteraction() {
@@ -503,13 +914,11 @@ async function assertUpdateReminderInteraction() {
     expanded: document.getElementById("capsule").getAttribute("aria-expanded"),
     indicatorHidden: document.getElementById("updateIndicator").hidden,
     hasUpdateClass: document.getElementById("capsule").classList.contains("has-update"),
-    status: document.getElementById("updateStatus").textContent,
     capsuleWidth: document.getElementById("capsule").getBoundingClientRect().width
   }))()`, true);
   if (skipped.expanded !== "false"
       || !skipped.indicatorHidden
       || skipped.hasUpdateClass
-      || skipped.status !== "已跳过版本 v0.1.27"
       || skipped.capsuleWidth !== 275) {
     throw new Error(`skipped update remained visible: ${JSON.stringify(skipped)}`);
   }
@@ -578,11 +987,11 @@ async function assertPointerDoubleClickMinimizes() {
     && miniLayout.mini.top >= 0
     && miniLayout.mini.left + miniLayout.mini.width <= miniLayout.viewport.width
     && miniLayout.mini.top + miniLayout.mini.height <= miniLayout.viewport.height;
-  const expectedMiniLeft = miniLayout.viewport.width - 78;
-  if (Math.abs(miniLayout.capsule.width - 68) > 0.5
-      || Math.abs(miniLayout.capsule.height - 68) > 0.5
+  const expectedMiniLeft = miniLayout.viewport.width - 228;
+  if (Math.abs(miniLayout.capsule.width - 216) > 0.5
+      || Math.abs(miniLayout.capsule.height - 129.6) > 0.5
       || Math.abs(miniLayout.capsule.left - expectedMiniLeft) > 0.5
-      || Math.abs(miniLayout.capsule.top - 10) > 0.5
+      || Math.abs(miniLayout.capsule.top - 12) > 0.5
       || !visible) {
     throw new Error(`mini capsule is clipped or outside the window: ${JSON.stringify(miniLayout)}`);
   }
@@ -594,17 +1003,17 @@ async function assertPointerDoubleClickMinimizes() {
   })`, true);
   const afterBlurBounds = window.getBounds();
   if (!afterDesktopBlur.isMini
-      || Math.abs(afterDesktopBlur.capsuleWidth - 68) > 0.5
+      || Math.abs(afterDesktopBlur.capsuleWidth - 216) > 0.5
       || afterBlurBounds.width !== 390
       || afterBlurBounds.height !== 810) {
     throw new Error(`desktop blur restored the full capsule: ${JSON.stringify({ afterDesktopBlur, afterBlurBounds })}`);
   }
 
   // Match the macOS event contract: a second double-click restores the full
-  // collapsed capsule, while a single click from mini restores and opens the
-  // detail card. Neither path may leave a pending single-click behind.
-  const miniCenterX = 346;
-  click(2, miniCenterX, 44);
+  // collapsed capsule. Neither path may leave a pending single-click behind.
+  const miniCenterX = 350;
+  const miniCenterY = 26;
+  click(2, miniCenterX, miniCenterY);
   await wait(720);
   const restored = await window.webContents.executeJavaScript(`({
     isMini: document.documentElement.classList.contains('mini-mode'),
@@ -629,19 +1038,71 @@ async function assertPointerDoubleClickMinimizes() {
     true
   );
   if (!minimizedAgain) throw new Error('second double click cycle did not return to mini mode');
-  click(1, miniCenterX, 44);
-  await wait(980);
-  const expandedFromMini = await window.webContents.executeJavaScript(`({
-    isMini: document.documentElement.classList.contains('mini-mode'),
-    expanded: document.getElementById('capsule').getAttribute('aria-expanded'),
-    detailOpen: document.getElementById('detail').classList.contains('open'),
-    informationVisible: getComputedStyle(document.getElementById('informationStrip')).display !== 'none'
+
+  const petBeforeConversation = await window.webContents.executeJavaScript(`(() => {
+    const rect = document.getElementById('capsule').getBoundingClientRect();
+    return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+  })()`, true);
+  await window.webContents.executeJavaScript(`render({
+    ...currentState,
+    task: {
+      state: "working",
+      label: "思考中",
+      title: "正在输出回复",
+      startedAt: Date.now(),
+      conversation: [
+        { id: "mini-user", role: "user", text: "保留宠物并展开对话", isStreaming: false },
+        { id: "mini-assistant", role: "assistant", text: "正在实时处理", isStreaming: true }
+      ]
+    }
   })`, true);
-  if (expandedFromMini.isMini
-      || expandedFromMini.expanded !== 'true'
-      || !expandedFromMini.detailOpen
-      || expandedFromMini.informationVisible) {
-    throw new Error(`single click from mini did not open details like macOS: ${JSON.stringify(expandedFromMini)}`);
+  click(1, miniCenterX, miniCenterY);
+  await wait(720);
+  const expandedFromMini = await window.webContents.executeJavaScript(`(() => {
+    const pet = document.getElementById('capsule').getBoundingClientRect();
+    const conversation = document.getElementById('conversationDetail');
+    const conversationRect = conversation.getBoundingClientRect();
+    return {
+      isMini: document.documentElement.classList.contains('mini-mode'),
+      miniConversation: document.documentElement.classList.contains('mini-conversation-expanded'),
+      expanded: document.getElementById('capsule').getAttribute('aria-expanded'),
+      conversationHidden: conversation.hidden,
+      conversationOpen: conversation.classList.contains('open'),
+      conversationWidth: conversationRect.width,
+      messages: document.querySelectorAll('.conversation-message').length,
+      pet: { left: pet.left, top: pet.top, width: pet.width, height: pet.height }
+    };
+  })()`, true);
+  const petDrift = Math.max(
+    Math.abs(expandedFromMini.pet.left - petBeforeConversation.left),
+    Math.abs(expandedFromMini.pet.top - petBeforeConversation.top),
+    Math.abs(expandedFromMini.pet.width - petBeforeConversation.width),
+    Math.abs(expandedFromMini.pet.height - petBeforeConversation.height)
+  );
+  if (!expandedFromMini.isMini
+      || !expandedFromMini.miniConversation
+      || expandedFromMini.expanded !== 'false'
+      || expandedFromMini.conversationHidden
+      || !expandedFromMini.conversationOpen
+      || Math.abs(expandedFromMini.conversationWidth - 342) > .5
+      || expandedFromMini.messages !== 2
+      || petDrift > .75) {
+    throw new Error(`mini conversation did not keep the pet anchored: ${JSON.stringify({ ...expandedFromMini, petDrift })}`);
+  }
+  fs.writeFileSync(
+    path.join(outputDirectory, "mini-pet-conversation-island@2x.png"),
+    (await window.webContents.capturePage()).toPNG()
+  );
+
+  click(1, miniCenterX, miniCenterY);
+  await wait(720);
+  const collapsedConversation = await window.webContents.executeJavaScript(`({
+    isMini: document.documentElement.classList.contains('mini-mode'),
+    miniConversation: document.documentElement.classList.contains('mini-conversation-expanded'),
+    conversationHidden: document.getElementById('conversationDetail').hidden
+  })`, true);
+  if (!collapsedConversation.isMini || collapsedConversation.miniConversation || !collapsedConversation.conversationHidden) {
+    throw new Error(`second mini single click did not retract conversation: ${JSON.stringify(collapsedConversation)}`);
   }
 }
 
@@ -852,12 +1313,21 @@ app.whenReady().then(async () => {
     await captureFixture("clear", true, theme, `theme-${theme}`);
   }
   await captureSettingsAndAssertMiniPicker();
+  await assertAPIMiniStyleRules();
   await assertUpdateReminderInteraction();
   await assertPointerDoubleClickMinimizes();
+  await assertLiveTokenRoll();
+  await assertOfflineAPIMiniTime();
+  await assertTaskConversationIsland();
   await assertMagnetAndDetailStayStable("clear");
   await assertMagnetAndDetailStayStable("off");
   for (const style of ["quota", "tokens", "status", "weather", "time"]) {
     await captureMini(style);
+  }
+  for (const pet of ["cat", "bunny", "ghost", "robot"]) {
+    await captureMini("quota", null, null, null, pet);
+    await captureMini("quota", "working", null, null, pet);
+    await captureMini("quota", "attention", null, null, pet);
   }
   await captureMini("quota", "working");
   await captureMini("quota", "attention");

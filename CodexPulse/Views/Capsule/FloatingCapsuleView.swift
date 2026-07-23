@@ -14,6 +14,8 @@ struct FloatingCapsuleView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var isExpanded = false
     @State private var isShowingUpdateDetails = false
+    @State private var isConversationExpanded = false
+    @State private var isMiniConversationExpanded = false
     @State private var isMini = false
     @State private var areResetCardsExpanded = false
     @State private var tokenChartRevealed = false
@@ -102,6 +104,12 @@ struct FloatingCapsuleView: View {
             && store.snapshot.rateLimits.primaryBucket == nil
     }
 
+    private var activeMiniCapsuleStyle: MiniCapsuleStyle {
+        store.snapshot.account.authMode == .apiKey
+            ? store.settings.resolvedAPIMiniCapsuleStyle
+            : store.settings.resolvedMiniCapsuleStyle
+    }
+
     private var todayTokens: Int64? {
         store.snapshot.usage.todayTokens
     }
@@ -119,41 +127,107 @@ struct FloatingCapsuleView: View {
         informationBarEnabled && !isExpanded
     }
 
+    private var isTaskStreamActive: Bool {
+        informationBarEnabled && !isExpanded && (mode == .working || mode == .attention)
+    }
+
+    private var isMiniTaskConversationAvailable: Bool {
+        isMini && (mode == .working || mode == .attention)
+    }
+
+    private var taskConversation: [TaskConversationMessage] {
+        store.snapshot.currentTask.conversation ?? []
+    }
+
+    private var taskStreamSummary: String {
+        let candidate = taskConversation.last(where: { $0.role == .assistant })?.text
+            ?? store.snapshot.currentTask.currentStep
+            ?? store.snapshot.currentTask.lastStatusMessage
+            ?? (mode == .attention ? "等待你确认后继续" : "Codex 正在组织回复…")
+        let singleLine = candidate
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        return singleLine.isEmpty ? "Codex 正在组织回复…" : singleLine
+    }
+
+    private var isRealtimeTokenMode: Bool {
+        mode == .working || mode == .attention
+    }
+
+    private var displayedTokenText: String {
+        isRealtimeTokenMode
+            ? PulseFormatters.liveTokens(todayTokens)
+            : PulseFormatters.tokens(todayTokens)
+    }
+
     private var needsWeatherData: Bool {
         guard weatherLocation != nil else { return false }
         return informationBarEnabled
-            || (isMini && store.settings.resolvedMiniCapsuleStyle == .weather)
+            || (isMini && activeMiniCapsuleStyle == .weather)
     }
 
     private var weatherTaskID: String {
         guard needsWeatherData, let location = weatherLocation else { return "weather-off" }
-        return "weather-\(location.id)-\(store.settings.resolvedMiniCapsuleStyle.rawValue)-\(isMini)"
+        return "weather-\(location.id)-\(activeMiniCapsuleStyle.rawValue)-\(isMini)"
     }
 
     private var miniCapsule: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            MiniCapsuleCircleView(
-                style: store.settings.resolvedMiniCapsuleStyle,
-                presentation: miniPresentation(at: context.date),
-                isWorking: mode == .working,
-                isAttention: mode == .attention,
-                activityStyle: store.settings.resolvedActivityBandStyle,
-                activityBandEnabled: store.settings.resolvedActivityBandEnabled,
-                isPreviewingActivity: activityPreviewStartedAt != nil,
+            let presentation = miniPresentation(at: context.date)
+            let activeQuota = activePetQuotaPresentation(at: context.date)
+            PetCapsuleView(
+                character: store.settings.resolvedPetCharacter,
+                animationState: petAnimationState(at: context.date),
+                idleStyle: activeMiniCapsuleStyle,
+                idleValue: presentation.value,
+                idleColor: presentation.color,
+                idleHelp: presentation.help,
+                showsIdleContent: mode == .idle || mode == .offline,
+                activeQuotaValue: activeQuota?.value,
+                activeQuotaColor: activeQuota?.color ?? PulseTheme.green,
                 reduceMotion: reduceMotion
             )
         }
-        .frame(width: 68, height: 68)
-        .padding(10)
-        .contentShape(Circle())
-        .help("\(miniPresentation(at: Date()).help) · 双击恢复完整胶囊")
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("极简胶囊，\(miniPresentation(at: Date()).help)")
-        .accessibilityHint("双击恢复完整胶囊")
+        .frame(width: 216, height: 129.6)
+        .padding(12)
+        .background(Color.black.opacity(0.001))
+        .contentShape(Rectangle())
+    }
+
+    /// Account sessions briefly rotate the live remaining quota through the
+    /// pet monitor while a task is active. API Key sessions have no ChatGPT
+    /// quota, so they intentionally retain only the task status page.
+    private func activePetQuotaPresentation(at date: Date) -> MiniCapsulePresentation? {
+        guard mode == .working || mode == .attention,
+              store.snapshot.account.authMode != .apiKey,
+              let remainingPercent else {
+            return nil
+        }
+        let startedAt = store.snapshot.currentTask.startedAt ?? date
+        let elapsed = max(0, date.timeIntervalSince(startedAt))
+        guard elapsed.truncatingRemainder(dividingBy: 8) >= 5 else { return nil }
+        let percent = min(100, max(0, remainingPercent))
+        return MiniCapsulePresentation(
+            value: String(format: "额度%.0f%%", percent),
+            progress: percent / 100,
+            color: PulseTheme.usage(percent),
+            help: String(format: "当前账号剩余额度 %.0f%%", percent)
+        )
+    }
+
+    private func petAnimationState(at date: Date) -> PetAnimationState {
+        switch mode {
+        case .working:
+            // Ten seconds of focused typing, then a short natural thinking pause.
+            let phase = Int(date.timeIntervalSince1970) % 13
+            return (9...11).contains(phase) ? .scratch : .thinking
+        case .attention: return .authorization
+        case .idle, .offline: return .idle
+        }
     }
 
     private func miniPresentation(at date: Date) -> MiniCapsulePresentation {
-        switch store.settings.resolvedMiniCapsuleStyle {
+        switch activeMiniCapsuleStyle {
         case .quota:
             if usesAPIKeyUsageFallback {
                 return MiniCapsulePresentation(
@@ -172,11 +246,14 @@ struct FloatingCapsuleView: View {
             )
 
         case .tokens:
+            let value = isRealtimeTokenMode
+                ? PulseFormatters.liveTokens(todayTokens)
+                : PulseFormatters.tokens(todayTokens)
             return MiniCapsulePresentation(
-                value: PulseFormatters.tokens(todayTokens),
+                value: value,
                 progress: todayTokens == nil ? 0 : 0.72,
                 color: PulseTheme.blue,
-                help: "今日 Token \(PulseFormatters.tokens(todayTokens))"
+                help: "今日 Token \(value)"
             )
 
         case .status:
@@ -229,8 +306,31 @@ struct FloatingCapsuleView: View {
     var body: some View {
         Group {
             if isMini {
-                miniCapsule
-                    .transition(.scale(scale: 0.72).combined(with: .opacity))
+                VStack(alignment: .trailing, spacing: isMiniConversationExpanded ? -14 : 8) {
+                    miniCapsule
+                        .zIndex(2)
+                        .transition(.scale(scale: 0.72, anchor: .topTrailing).combined(with: .opacity))
+                    if isMiniConversationExpanded && isMiniTaskConversationAvailable {
+                        miniTaskConversationCard
+                            .zIndex(1)
+                            .frame(width: 323, alignment: .trailing)
+                            .transition(
+                                .asymmetric(
+                                    insertion: .opacity
+                                        .combined(with: .scale(
+                                            scale: 0.16,
+                                            anchor: UnitPoint(x: 0.82, y: 0)
+                                        )),
+                                    removal: .opacity
+                                        .combined(with: .scale(
+                                            scale: 0.22,
+                                            anchor: UnitPoint(x: 0.82, y: 0)
+                                        ))
+                                )
+                            )
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .trailing)
             } else {
                 VStack(
                     alignment: .center,
@@ -238,8 +338,13 @@ struct FloatingCapsuleView: View {
                 ) {
                     capsuleBar
                     if showsWeatherMetadata {
-                        weatherMetadata
-                            .frame(width: resolvedInformationCapsuleWidth, alignment: .center)
+                        informationMetadata
+                            .frame(
+                                width: isConversationExpanded && isTaskStreamActive
+                                    ? 323
+                                    : informationCapsuleWidth,
+                                alignment: .center
+                            )
                             .transition(.opacity.combined(with: .move(edge: .top)))
                     }
                     if isExpanded {
@@ -263,10 +368,12 @@ struct FloatingCapsuleView: View {
         }
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: isMini)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: isExpanded)
+        .animation(.spring(response: 0.38, dampingFraction: 0.84), value: isConversationExpanded)
+        .animation(.spring(response: 0.38, dampingFraction: 0.86), value: isMiniConversationExpanded)
         .animation(.easeInOut(duration: 0.35), value: mode.label)
         .onReceive(NotificationCenter.default.publisher(for: .pulseCapsuleToggleDetails)) { _ in
             if isMini {
-                expandDetailsFromMini()
+                handleMiniSingleClick()
             } else {
                 toggleDetails()
             }
@@ -286,6 +393,24 @@ struct FloatingCapsuleView: View {
             withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
                 isShowingUpdateDetails = false
                 isExpanded = false
+            }
+        }
+        .onChange(of: isTaskStreamActive) { _, active in
+            guard !active, isConversationExpanded else { return }
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.88)) {
+                isConversationExpanded = false
+            }
+        }
+        .onChange(of: isMiniTaskConversationAvailable) { _, active in
+            guard !active, isMiniConversationExpanded else { return }
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.88)) {
+                isMiniConversationExpanded = false
+            }
+        }
+        .onChange(of: isExpanded) { _, expanded in
+            guard expanded, isConversationExpanded else { return }
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
+                isConversationExpanded = false
             }
         }
         .task(id: weatherTaskID) {
@@ -387,6 +512,7 @@ struct FloatingCapsuleView: View {
         withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
             isExpanded = false
             isShowingUpdateDetails = false
+            isMiniConversationExpanded = false
             isMini = nextValue
         }
         areResetCardsExpanded = false
@@ -396,14 +522,28 @@ struct FloatingCapsuleView: View {
         PulseLog.write("capsule mini mode \(isMini ? "enabled" : "disabled")")
     }
 
-    private func expandDetailsFromMini() {
-        withAnimation(.spring(response: 0.36, dampingFraction: 0.84)) {
-            isMini = false
-            isExpanded = true
-            isShowingUpdateDetails = false
+    private func handleMiniSingleClick() {
+        if isMiniTaskConversationAvailable {
+            withAnimation(.spring(response: 0.38, dampingFraction: 0.86)) {
+                isMiniConversationExpanded.toggle()
+            }
+            PulseLog.write("mini pet conversation \(isMiniConversationExpanded ? "expanded" : "collapsed")")
+            return
         }
-        resetMagneticOffset()
-        PulseLog.write("capsule mini mode restored and details expanded")
+
+        let apiMode = store.snapshot.account.authMode == .apiKey
+        let styles: [MiniCapsuleStyle] = apiMode
+            ? [.tokens, .weather, .time]
+            : [.quota, .tokens, .weather, .time]
+        let current = activeMiniCapsuleStyle
+        let next = styles[(styles.firstIndex(of: current).map { $0 + 1 } ?? 0) % styles.count]
+        if apiMode {
+            store.settings.resolvedAPIMiniCapsuleStyle = next
+        } else {
+            store.settings.resolvedMiniCapsuleStyle = next
+        }
+        store.saveSettings()
+        PulseLog.write("mini pet display cycled to \(next.rawValue)")
     }
 
     private func toggleDetails() {
@@ -413,6 +553,7 @@ struct FloatingCapsuleView: View {
                 isExpanded = false
                 isShowingUpdateDetails = false
             } else {
+                isConversationExpanded = false
                 isShowingUpdateDetails = false
                 isExpanded = true
             }
@@ -471,9 +612,18 @@ struct FloatingCapsuleView: View {
         .accessibilityHidden(true)
     }
 
+    @ViewBuilder
     private var weatherMetadata: some View {
-        guard let location = weatherLocation else { return AnyView(EmptyView()) }
-        return AnyView(
+        if weatherLocation != nil {
+            weatherMetadataPill
+                .frame(width: informationCapsuleWidth, alignment: .center)
+                .padding(.top, 0)
+        }
+    }
+
+    @ViewBuilder
+    private var weatherMetadataPill: some View {
+        if let location = weatherLocation {
             TimelineView(.periodic(from: .now, by: 30)) { context in
                 HStack(spacing: 5) {
                     HStack(spacing: 4) {
@@ -520,8 +670,124 @@ struct FloatingCapsuleView: View {
                     "\(location.displayName)，\(weatherTemperatureText)\(weatherFreshnessStatus(at: context.date) == nil ? "" : "，天气可能不是最新数据")，\(localDateText(context.date, timezoneIdentifier: location.timezone))"
                 )
             }
-            .frame(width: informationCapsuleWidth, alignment: .center)
-            .padding(.top, 0)
+        }
+    }
+
+    @ViewBuilder
+    private var informationMetadata: some View {
+        if isTaskStreamActive {
+            taskInformationIsland
+        } else {
+            weatherMetadata
+        }
+    }
+
+    /// One persistent surface owns both states, so the conversation grows out of
+    /// the information pill instead of presenting as a second card below it.
+    private var taskInformationIsland: some View {
+        let shape = RoundedRectangle(
+            cornerRadius: isConversationExpanded ? 22 : 999,
+            style: .continuous
+        )
+        return ZStack {
+            if isConversationExpanded {
+                taskConversationCard
+                    .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
+            } else {
+                taskStreamStrip
+                    .transition(.opacity)
+            }
+        }
+        .frame(
+            width: isConversationExpanded ? 323 : nil,
+            height: isConversationExpanded ? 246 : nil
+        )
+        .background {
+            PulseThemedSurface(
+                shape: shape,
+                role: isConversationExpanded ? .panel : .capsule,
+                castsShadow: true
+            )
+        }
+        .clipShape(shape)
+        .contentShape(shape)
+        .animation(.spring(response: 0.38, dampingFraction: 0.84), value: isConversationExpanded)
+        .help(isConversationExpanded ? "收起实时对话" : "展开实时对话")
+    }
+
+    private var taskStreamStrip: some View {
+        weatherMetadataPill
+            .hidden()
+            .accessibilityHidden(true)
+            .overlay {
+                Button {
+                    withAnimation(.spring(response: 0.38, dampingFraction: 0.84)) {
+                        isConversationExpanded.toggle()
+                    }
+                } label: {
+                    ZStack {
+                        StreamingTaskSummary(
+                            text: taskStreamSummary,
+                            color: Color.primary.opacity(colorScheme == .dark ? 0.94 : 0.86),
+                            activityColor: mode == .attention ? PulseTheme.red : visualTheme.accent
+                        )
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.horizontal, 30)
+
+                        HStack(spacing: 0) {
+                            ZStack {
+                                Circle()
+                                    .fill(mode == .attention ? PulseTheme.red.opacity(0.18) : visualTheme.accent.opacity(0.18))
+                                    .frame(width: 16, height: 16)
+                                Image(systemName: mode == .attention ? "exclamationmark" : "waveform")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .foregroundStyle(mode == .attention ? PulseTheme.red : visualTheme.accent)
+                            }
+                            Spacer(minLength: 0)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(Color.secondary.opacity(0.72))
+                                .rotationEffect(.degrees(isConversationExpanded ? 180 : 0))
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Capsule(style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            .help(isConversationExpanded ? "收起实时对话" : "展开实时对话")
+            .accessibilityLabel("Codex 实时回复：\(taskStreamSummary)")
+            .accessibilityValue(isConversationExpanded ? "已展开" : "已收起")
+    }
+
+    private var taskConversationCard: some View {
+        TaskConversationCard(
+            width: 323,
+            messages: taskConversation,
+            isStreaming: mode == .working,
+            accent: visualTheme.accent,
+            showsSurface: false,
+            onClose: {
+                withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                    isConversationExpanded = false
+                }
+            }
+        )
+    }
+
+    private var miniTaskConversationCard: some View {
+        TaskConversationCard(
+            width: 323,
+            messages: taskConversation,
+            isStreaming: mode == .working,
+            accent: mode == .attention ? PulseTheme.red : visualTheme.accent,
+            onClose: {
+                withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                    isMiniConversationExpanded = false
+                }
+            }
         )
     }
 
@@ -810,13 +1076,19 @@ struct FloatingCapsuleView: View {
             CoffeeBeanIcon(color: visualTheme.accent)
                 .frame(width: 15, height: 17)
                 .allowsHitTesting(false)
-            Text(PulseFormatters.tokens(todayTokens))
+            Text(displayedTokenText)
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .monospacedDigit()
                 .lineLimit(1)
                 .minimumScaleFactor(0.76)
-                .frame(maxWidth: 60)
-                .contentTransition(.numericText())
+                .frame(maxWidth: 66)
+                .contentTransition(.numericText(countsDown: false))
+                .animation(
+                    isRealtimeTokenMode && !reduceMotion
+                        ? .easeOut(duration: 0.22)
+                        : nil,
+                    value: todayTokens
+                )
         }
         .fixedSize(horizontal: true, vertical: false)
         .help(
@@ -1570,7 +1842,7 @@ private struct MiniCapsuleCircleView: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.66)
                 .frame(width: 49)
-                .contentTransition(.numericText())
+                .contentTransition(.numericText(countsDown: false))
 
             if isActive {
                 activeOrbit
@@ -1584,6 +1856,12 @@ private struct MiniCapsuleCircleView: View {
         }
         .animation(.easeOut(duration: 0.45), value: presentation.progress)
         .animation(.easeInOut(duration: 0.22), value: isActive)
+        .animation(
+            (isWorking || isAttention) && !reduceMotion
+                ? .easeOut(duration: 0.22)
+                : nil,
+            value: presentation.value
+        )
     }
 
     @ViewBuilder
@@ -1907,6 +2185,210 @@ private struct AnimatedWeatherSVGView: NSViewRepresentable {
     static func dismantleNSView(_ webView: WKWebView, coordinator: Coordinator) {
         webView.stopLoading()
         webView.loadHTMLString("", baseURL: nil)
+    }
+}
+
+/// 信息栏展开后的当前 turn 对话。固定外框尺寸避免每个文本 delta 都触发
+/// NSPanel 重排；内容只在内部滚动，胶囊本体因此保持原位。
+private struct StreamingTaskSummary: View {
+    let text: String
+    let color: Color
+    let activityColor: Color
+
+    private var latestText: String {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > 34 else { return normalized }
+        return "…" + String(normalized.suffix(34))
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ZStack(alignment: .center) {
+                Text(latestText)
+                    .id(latestText)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(color)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .transition(
+                        .asymmetric(
+                            insertion: .opacity.combined(with: .move(edge: .bottom)),
+                            removal: .opacity.combined(with: .move(edge: .top))
+                        )
+                    )
+            }
+            .frame(maxWidth: .infinity, maxHeight: 13, alignment: .center)
+            .padding(.horizontal, 2)
+            .clipped()
+            .animation(.easeOut(duration: 0.18), value: latestText)
+
+            StreamingActivityDots(color: activityColor)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .allowsHitTesting(false)
+    }
+}
+
+private struct StreamingActivityDots: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let color: Color
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 18.0, paused: reduceMotion)) { context in
+            let time = context.date.timeIntervalSinceReferenceDate * 4.4
+            HStack(spacing: 2) {
+                ForEach(0..<3, id: \.self) { index in
+                    let wave = (sin(time - Double(index) * 0.82) + 1) / 2
+                    Circle()
+                        .fill(color)
+                        .frame(width: 2.5, height: 2.5)
+                        .opacity(reduceMotion ? 0.62 : 0.22 + wave * 0.78)
+                        .offset(y: reduceMotion ? 0 : -wave * 1.4)
+                }
+            }
+        }
+        .frame(width: 12, height: 10)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct TaskConversationCard: View {
+    let width: CGFloat
+    let messages: [TaskConversationMessage]
+    let isStreaming: Bool
+    let accent: Color
+    var showsSurface = true
+    let onClose: () -> Void
+
+    private let bottomAnchor = "task-conversation-bottom"
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 7) {
+                Image(systemName: "text.bubble.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(accent)
+                Text("当前对话")
+                    .font(.system(size: 11, weight: .semibold))
+                if isStreaming {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(accent)
+                            .frame(width: 5, height: 5)
+                        Text("实时输出")
+                    }
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(accent)
+                }
+                Spacer(minLength: 8)
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 20, height: 20)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.secondary)
+                .help("收起实时对话")
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 34)
+
+            Divider().opacity(0.35)
+
+            ScrollViewReader { proxy in
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 9) {
+                        if messages.isEmpty {
+                            VStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(accent)
+                                Text("Codex 正在组织回复…")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(Color.secondary)
+                            }
+                            .frame(maxWidth: .infinity, minHeight: 142)
+                        } else {
+                            ForEach(messages) { message in
+                                TaskConversationBubble(message: message, accent: accent)
+                            }
+                        }
+                        Color.clear
+                            .frame(height: 1)
+                            .id(bottomAnchor)
+                    }
+                    .padding(11)
+                }
+                .scrollIndicators(.automatic)
+                .onAppear { scrollToBottom(proxy, animated: false) }
+                .onChange(of: messages) { _, _ in
+                    scrollToBottom(proxy, animated: true)
+                }
+            }
+        }
+        .frame(width: width, height: 246)
+        .background {
+            if showsSurface {
+                PulseThemedSurface(
+                    shape: RoundedRectangle(cornerRadius: 22, style: .continuous),
+                    role: .panel,
+                    castsShadow: true
+                )
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("当前 Codex 对话")
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.16)) {
+                    proxy.scrollTo(bottomAnchor, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(bottomAnchor, anchor: .bottom)
+            }
+        }
+    }
+}
+
+private struct TaskConversationBubble: View {
+    let message: TaskConversationMessage
+    let accent: Color
+
+    var body: some View {
+        VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                if message.role == .assistant, message.isStreaming {
+                    Circle()
+                        .fill(accent)
+                        .frame(width: 4, height: 4)
+                }
+                Text(message.role == .user ? "你" : "Codex")
+                    .font(.system(size: 8.5, weight: .semibold))
+                    .foregroundStyle(message.role == .user ? accent : Color.secondary)
+            }
+            Text(message.text)
+                .font(.system(size: 10.5, weight: .regular))
+                .foregroundStyle(Color.primary.opacity(0.9))
+                .lineSpacing(2)
+                .textSelection(.enabled)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(
+                            message.role == .user
+                                ? accent.opacity(0.13)
+                                : Color.primary.opacity(0.055)
+                        )
+                }
+        }
+        .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
     }
 }
 

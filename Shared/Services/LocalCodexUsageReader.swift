@@ -350,6 +350,10 @@ struct LocalCodexActivity: Sendable {
     var modifiedAt: Date
     var startedAt: Date?
     var state: CodexRunState
+    /// session 尾部最近一次 token_count 的线程累计值。
+    var totalTokens: Int64?
+    /// 当前 turn 中用户可见的用户/助手消息。
+    var conversation: [TaskConversationMessage]
 }
 
 actor LocalCodexActivityReader {
@@ -423,7 +427,9 @@ actor LocalCodexActivityReader {
                 cwd: metadata.cwd,
                 modifiedAt: candidate.modifiedAt,
                 startedAt: cached.analysis.startedAt,
-                state: cached.analysis.state
+                state: cached.analysis.state,
+                totalTokens: cached.analysis.totalTokens,
+                conversation: cached.analysis.conversation
             ))
         }
         // 防止长期运行后缓存无限增长；只保留仍处于活动检测窗口内的文件。
@@ -476,7 +482,9 @@ actor LocalCodexActivityReader {
             cwd: metadata.cwd,
             modifiedAt: candidate.modifiedAt,
             startedAt: cached.analysis.startedAt,
-            state: cached.analysis.state
+            state: cached.analysis.state,
+            totalTokens: cached.analysis.totalTokens,
+            conversation: cached.analysis.conversation
         )
     }
 
@@ -580,6 +588,8 @@ actor LocalCodexActivityReader {
         var isActive: Bool
         var startedAt: Date?
         var state: CodexRunState
+        var totalTokens: Int64?
+        var conversation: [TaskConversationMessage]
     }
 
     private func cachedAnalysis(
@@ -605,7 +615,7 @@ actor LocalCodexActivityReader {
     /// 顺序分析尾部事件，既判断是否完成，也尽量恢复当前 turn 的开始时间。
     private func analyzeSession(at url: URL) -> SessionAnalysis {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return SessionAnalysis(isActive: false, startedAt: nil, state: .idle)
+            return SessionAnalysis(isActive: false, startedAt: nil, state: .idle, totalTokens: nil, conversation: [])
         }
         defer { try? handle.close() }
 
@@ -613,7 +623,7 @@ actor LocalCodexActivityReader {
         let offset = size > tailByteCount ? size - tailByteCount : 0
         try? handle.seek(toOffset: offset)
         guard var data = try? handle.readToEnd(), !data.isEmpty else {
-            return SessionAnalysis(isActive: false, startedAt: nil, state: .idle)
+            return SessionAnalysis(isActive: false, startedAt: nil, state: .idle, totalTokens: nil, conversation: [])
         }
 
         // 从文件中段开始读取时，第一行可能是不完整 JSON。
@@ -625,6 +635,36 @@ actor LocalCodexActivityReader {
         var startedAt: Date?
         var recognizedEvent = false
         var state: CodexRunState = .thinking
+        var totalTokens: Int64?
+        var conversation: [TaskConversationMessage] = []
+        var messageSequence = 0
+
+        func appendConversationMessage(
+            role: TaskConversationMessage.Role,
+            text rawText: String,
+            timestamp: Date?,
+            fallbackID: String
+        ) {
+            let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return }
+            if let lastIndex = conversation.indices.last,
+               conversation[lastIndex].role == role,
+               conversation[lastIndex].text == text {
+                conversation[lastIndex].isStreaming = false
+                return
+            }
+            messageSequence += 1
+            conversation.append(TaskConversationMessage(
+                id: "\(fallbackID)-\(messageSequence)",
+                role: role,
+                text: String(text.prefix(16_000)),
+                timestamp: timestamp,
+                isStreaming: false
+            ))
+            if conversation.count > 32 {
+                conversation.removeFirst(conversation.count - 32)
+            }
+        }
 
         for line in data.split(separator: 0x0A) {
             guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
@@ -648,6 +688,11 @@ actor LocalCodexActivityReader {
                 continue
             }
 
+            if envelopeType == "event_msg", payloadType == "token_count" {
+                totalTokens = sessionTokenTotal(from: payload) ?? totalTokens
+                continue
+            }
+
             if envelopeType == "event_msg" {
                 switch payloadType {
                 case "task_complete", "turn_complete", "turn_completed", "turn_aborted":
@@ -660,11 +705,56 @@ actor LocalCodexActivityReader {
                     isActive = true
                     startedAt = timestamp ?? startedAt
                     state = .thinking
-                case "agent_reasoning", "agent_message":
+                    if payloadType == "turn_started" || payloadType == "task_started" {
+                        conversation.removeAll(keepingCapacity: true)
+                    }
+                    if payloadType == "user_message" {
+                        let text = (payload["message"] as? String)
+                            ?? (payload["text"] as? String)
+                            ?? (payload["content"] as? String)
+                            ?? ""
+                        appendConversationMessage(
+                            role: .user,
+                            text: text,
+                            timestamp: timestamp,
+                            fallbackID: "user"
+                        )
+                    }
+                case "agent_reasoning", "agent_message", "agent_message_content_delta":
                     recognizedEvent = true
                     isActive = true
                     startedAt = startedAt ?? timestamp
                     state = payloadType == "agent_reasoning" ? .thinking : .generatingCode
+                    if payloadType == "agent_message" {
+                        let text = (payload["message"] as? String)
+                            ?? (payload["text"] as? String)
+                            ?? (payload["content"] as? String)
+                            ?? ""
+                        appendConversationMessage(
+                            role: .assistant,
+                            text: text,
+                            timestamp: timestamp,
+                            fallbackID: "assistant"
+                        )
+                    } else if payloadType == "agent_message_content_delta",
+                              let delta = payload["delta"] as? String,
+                              !delta.isEmpty {
+                        let itemID = (payload["item_id"] as? String)
+                            ?? (payload["itemId"] as? String)
+                            ?? "streaming-assistant"
+                        if let index = conversation.lastIndex(where: { $0.id == itemID }) {
+                            conversation[index].text += delta
+                            conversation[index].isStreaming = true
+                        } else {
+                            conversation.append(TaskConversationMessage(
+                                id: itemID,
+                                role: .assistant,
+                                text: delta,
+                                timestamp: timestamp,
+                                isStreaming: true
+                            ))
+                        }
+                    }
                 default:
                     continue
                 }
@@ -682,6 +772,19 @@ actor LocalCodexActivityReader {
                         isActive = true
                         startedAt = startedAt ?? timestamp
                         state = .generatingCode
+                    }
+                    if (payload["role"] as? String)?.lowercased() == "assistant" {
+                        let content = payload["content"] as? [[String: Any]] ?? []
+                        let text = content.compactMap { item in
+                            (item["text"] as? String)
+                                ?? (item["output_text"] as? String)
+                        }.joined(separator: "\n")
+                        appendConversationMessage(
+                            role: .assistant,
+                            text: text,
+                            timestamp: timestamp,
+                            fallbackID: "response"
+                        )
                     }
                     continue
                 }
@@ -709,8 +812,26 @@ actor LocalCodexActivityReader {
         return SessionAnalysis(
             isActive: resolvedActive,
             startedAt: startedAt,
-            state: resolvedActive ? state : .idle
+            state: resolvedActive ? state : .idle,
+            totalTokens: totalTokens,
+            conversation: conversation
         )
+    }
+
+    private func sessionTokenTotal(from payload: [String: Any]) -> Int64? {
+        guard let info = payload["info"] as? [String: Any],
+              let total = (info["total_token_usage"] as? [String: Any])
+                ?? (info["totalTokenUsage"] as? [String: Any]) else {
+            return nil
+        }
+        let value = total["total_tokens"] ?? total["totalTokens"]
+        switch value {
+        case let number as NSNumber: return number.int64Value
+        case let number as Int64: return number
+        case let number as Int: return Int64(number)
+        case let text as String: return Int64(text)
+        default: return nil
+        }
     }
 
     private func inferredToolState(payloadType: String, payload: [String: Any]) -> CodexRunState {

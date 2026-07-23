@@ -30,6 +30,8 @@ enum CodexServerEvent: Sendable {
     case localTaskStateChanged(TaskRecord)
     case turnStarted(CurrentTaskInfo)
     case turnCompleted(CurrentTaskInfo)
+    /// 新版 App Server 的可见回复文本增量；不包含隐藏推理内容。
+    case agentMessageDelta(threadID: String, itemID: String, delta: String)
     /// App Server 推送的线程累计 Token。值是该线程截至当前的累计量，不是增量。
     case tokenUsageUpdated(threadID: String, turnID: String?, totalTokens: Int64)
     case itemStarted(String)

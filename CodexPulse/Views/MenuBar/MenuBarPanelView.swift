@@ -57,6 +57,8 @@ struct MenuBarPanelView: View {
             hairline
             miniCapsuleControls
             hairline
+            petControls
+            hairline
             informationBarControls
             hairline
             actions
@@ -648,15 +650,55 @@ struct MenuBarPanelView: View {
             Picker(
                 "缩小展示",
                 selection: Binding(
-                    get: { store.settings.resolvedMiniCapsuleStyle },
-                    set: {
-                        store.settings.resolvedMiniCapsuleStyle = $0
+                    get: {
+                        isAPIKeyMode
+                            ? store.settings.resolvedAPIMiniCapsuleStyle
+                            : store.settings.resolvedMiniCapsuleStyle
+                    },
+                    set: { style in
+                        if isAPIKeyMode {
+                            store.settings.resolvedAPIMiniCapsuleStyle = style
+                        } else {
+                            store.settings.resolvedMiniCapsuleStyle = style
+                        }
                         store.saveSettings()
                     }
                 )
             ) {
-                ForEach(MiniCapsuleStyle.allCases) { style in
+                ForEach(availableMiniCapsuleStyles) { style in
                     Text(style.displayName).tag(style)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 98)
+        }
+    }
+
+    private var isAPIKeyMode: Bool {
+        store.snapshot.account.authMode == .apiKey
+    }
+
+    private var availableMiniCapsuleStyles: [MiniCapsuleStyle] {
+        isAPIKeyMode ? MiniCapsuleStyle.apiKeyCases : MiniCapsuleStyle.allCases
+    }
+
+    private var petControls: some View {
+        HStack(spacing: 10) {
+            Label("宠物", systemImage: "pawprint")
+                .font(.system(size: 11, weight: .medium))
+            Spacer(minLength: 4)
+            Picker(
+                "宠物",
+                selection: Binding(
+                    get: { store.settings.resolvedPetCharacter },
+                    set: {
+                        store.settings.resolvedPetCharacter = $0
+                        store.saveSettings()
+                    }
+                )
+            ) {
+                ForEach(PetCharacter.allCases) { pet in
+                    Text(pet.displayName).tag(pet)
                 }
             }
             .labelsHidden()

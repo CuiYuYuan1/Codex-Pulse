@@ -94,6 +94,21 @@ enum PulseStatusColor: String, Sendable {
     case gray   // 未启动或未登录
 }
 
+/// 当前 Codex turn 中可展示的对话内容。只保留用户可见消息，不包含推理原文、
+/// 工具参数、权限数据或隐藏上下文。
+struct TaskConversationMessage: Codable, Equatable, Identifiable, Sendable {
+    enum Role: String, Codable, Sendable {
+        case user
+        case assistant
+    }
+
+    var id: String
+    var role: Role
+    var text: String
+    var timestamp: Date?
+    var isStreaming: Bool
+}
+
 /// 当前任务快照
 struct CurrentTaskInfo: Codable, Equatable, Identifiable, Sendable {
     var id: String
@@ -109,6 +124,8 @@ struct CurrentTaskInfo: Codable, Equatable, Identifiable, Sendable {
     var linesAdded: Int
     var linesRemoved: Int
     var lastStatusMessage: String?
+    /// 当前 turn 的可见对话；可选字段保证旧版共享快照能够继续解码。
+    var conversation: [TaskConversationMessage]? = nil
 
     var elapsedSeconds: TimeInterval {
         guard let startedAt else { return 0 }
@@ -151,6 +168,8 @@ struct TaskRecord: Codable, Identifiable, Equatable, Sendable {
     var activeFlags: [String]? = nil
     /// 当前活动 turn 的开始时间；历史缓存或接口未提供时为 nil。
     var startedAt: Date? = nil
+    /// 本机会话监听提取出的当前 turn 可见对话，不写入历史导出时可保持 nil。
+    var conversation: [TaskConversationMessage]? = nil
 
     var indicatorColor: PulseStatusColor {
         if let runState { return runState.indicatorColor }

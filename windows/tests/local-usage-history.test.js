@@ -14,6 +14,7 @@ function loadUsageFunctions() {
       dayKey,
       mergeLocalDailyUsage,
       mergeLocalTodayUsage,
+      mergeLocalSessionFallback,
       millisecondsUntilNextLocalDay,
       parseSessionDailyTokenText,
       parseSessionTodayTokenText,
@@ -246,6 +247,20 @@ assert.strictEqual(crossedDayDaily.today, 8, "daily merge must ignore an undated
 const boundaryDelay = usage.millisecondsUntilNextLocalDay(localTime(2026, 7, 14, 23, 59, 59));
 assert(boundaryDelay >= 1_000 && boundaryDelay <= 1_500, "midnight timer must target the next local day");
 assert.strictEqual(merged.localDailyAvailable, true);
+
+const remoteFailureDate = localTime(2026, 7, 14, 12);
+const remoteFailureFallback = usage.mergeLocalSessionFallback(
+  { today: 0, total: 0, daily: [] },
+  { tokens: 4321, estimated: false },
+  [{ date: usage.dayKey(remoteFailureDate), tokens: 4321, estimated: false }],
+  remoteFailureDate
+);
+assert.strictEqual(remoteFailureFallback.today, 4321, "remote failure must promote local session today usage");
+assert.strictEqual(remoteFailureFallback.localSessionFallback, true, "remote failure must mark local fallback source");
+assert(
+  remoteFailureFallback.sourceNote.includes("本机 Codex session"),
+  "remote failure must explain the local session source"
+);
 
 usage.setAccount("API Key");
 assert.strictEqual(usage.shouldPromoteLocalTodayUsage(), true);

@@ -19,7 +19,8 @@ const INFORMATION_COLLAPSED_SIZE = { width: 323, height: 128 };
 const INFORMATION_MIN_WIDTH = 323;
 const INFORMATION_MAX_WIDTH = 471;
 const EXPANDED_SIZE = { width: 390, height: 810 };
-const MINI_SIZE = { width: 88, height: 88 };
+// 216×130 宠物场景外加四周 12px 安全区。
+const MINI_SIZE = { width: 240, height: 154 };
 const USE_STABLE_DESKTOP_SURFACE = process.platform === "win32";
 const SETTINGS_FILE = () => path.join(app.getPath("userData"), "settings.json");
 const WEATHER_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -91,7 +92,7 @@ let state = {
   limits: [],
   resetCards: [],
   usage: { today: 0, total: 0, daily: [] },
-  task: { state: "idle", label: "空闲", title: null, project: null, startedAt: null },
+  task: { state: "idle", label: "空闲", title: null, project: null, startedAt: null, threadID: null, conversation: [] },
   informationBar: {
     enabled: false,
     location: null,
@@ -858,12 +859,50 @@ function notificationStatus(params) {
 
 function handleNotification(method, params = {}) {
   const lower = method.toLowerCase();
-  if (lower.includes("turn/started") || lower.includes("item/started")) {
-    publish({ task: { ...state.task, state: "working", label: "思考中", startedAt: state.task.startedAt || Date.now() } });
+  if (lower === "item/agentmessage/delta") {
+    const delta = typeof params.delta === "string" ? params.delta : "";
+    if (!delta) return;
+    const threadID = String(params.threadId || state.task.threadID || "unknown");
+    const itemID = String(params.itemId || `assistant-${threadID}`);
+    const conversation = Array.isArray(state.task.conversation)
+      ? state.task.conversation.map((message) => ({ ...message }))
+      : [];
+    const existing = conversation.findIndex((message) => message.id === itemID);
+    if (existing >= 0) {
+      conversation[existing].text += delta;
+      conversation[existing].isStreaming = true;
+    } else {
+      conversation.push({
+        id: itemID,
+        role: "assistant",
+        text: delta,
+        timestamp: Date.now(),
+        isStreaming: true
+      });
+    }
+    if (conversation.length > 32) conversation.splice(0, conversation.length - 32);
+    publish({ task: {
+      ...state.task,
+      state: "working",
+      label: "思考中",
+      title: "正在输出回复",
+      threadID,
+      conversation,
+      startedAt: state.task.startedAt || Date.now()
+    } });
+  } else if (lower.includes("turn/started") || lower.includes("item/started")) {
+    const isTurnStart = lower.includes("turn/started");
+    publish({ task: {
+      ...state.task,
+      state: "working",
+      label: "思考中",
+      conversation: isTurnStart ? [] : (state.task.conversation || []),
+      startedAt: state.task.startedAt || Date.now()
+    } });
   } else if (lower.includes("approval") || lower.includes("request/userinput")) {
     publish({ task: { ...state.task, state: "attention", label: "等待授权" } });
   } else if (lower.includes("turn/completed") || lower.includes("turn/aborted") || lower.includes("turn/failed")) {
-    publish({ task: { state: "idle", label: "空闲", title: null, project: null, startedAt: null } });
+    publish({ task: { state: "idle", label: "空闲", title: null, project: null, startedAt: null, threadID: null, conversation: [] } });
     setTimeout(() => refreshAll(true), 120);
   } else if (lower.includes("account/updated")) {
     scheduleAccountTransition(false);
@@ -1063,6 +1102,25 @@ function mergeLocalDailyUsage(usage, localDaily, reference = new Date()) {
     localDailyAvailable: true,
     localSevenDayTokens,
     localHistoryEstimated
+  };
+}
+
+// A failed or unavailable remote profile must never leave the headline at a
+// stale zero when Codex has already written usage into local session JSONL.
+// In this path both today's value and the local seven-day buckets become the
+// displayed fallback regardless of authentication mode.
+function mergeLocalSessionFallback(usage, localToday, localDaily, reference = new Date()) {
+  let fallback = usage && typeof usage === "object" ? usage : normalizeUsage({});
+  if (localToday !== null && localToday !== undefined) {
+    fallback = mergeLocalTodayUsage(fallback, localToday, reference);
+  }
+  if (Array.isArray(localDaily) && localDaily.length) {
+    fallback = mergeLocalDailyUsage(fallback, localDaily, reference);
+  }
+  return {
+    ...fallback,
+    localSessionFallback: true,
+    sourceNote: "Token 远端统计失败，当前使用本机 Codex session 汇总"
   };
 }
 
@@ -1537,6 +1595,24 @@ async function publishLocalTodayUsage(force = false) {
   publish({ usage: mergeLocalTodayUsage(state.usage, localToday) });
 }
 
+function mergeSessionConversation(snapshot) {
+  const recorded = Array.isArray(snapshot.conversation)
+    ? snapshot.conversation.map((message) => ({ ...message }))
+    : [];
+  const live = state.task?.threadID === snapshot.threadID && Array.isArray(state.task?.conversation)
+    ? state.task.conversation[state.task.conversation.length - 1]
+    : null;
+  if (live?.isStreaming) {
+    const index = recorded.findIndex((message) => message.id === live.id);
+    if (index >= 0) recorded[index] = { ...live };
+    else if (!recorded.some((message) => message.role === live.role
+      && (message.text === live.text || message.text.startsWith(live.text)))) {
+      recorded.push({ ...live });
+    }
+  }
+  return recorded.slice(-32);
+}
+
 function sessionTask(snapshot) {
   const attention = snapshot.state === "attention";
   return {
@@ -1544,7 +1620,9 @@ function sessionTask(snapshot) {
     label: attention ? "等待授权" : "思考中",
     title: "Codex 正在处理",
     project: snapshot.cwd ? path.basename(snapshot.cwd) : null,
-    startedAt: snapshot.startedAt || snapshot.modifiedAt || Date.now()
+    startedAt: snapshot.startedAt || snapshot.modifiedAt || Date.now(),
+    threadID: snapshot.threadID,
+    conversation: mergeSessionConversation(snapshot)
   };
 }
 
@@ -1571,6 +1649,27 @@ function parseSessionFile(file) {
     let cwd = null;
     let modelProvider = null;
     let threadID = path.basename(file, path.extname(file)).slice(-36);
+    let conversation = [];
+    let messageSequence = 0;
+
+    const appendConversationMessage = (role, rawText, timestamp, fallbackID) => {
+      const textValue = String(rawText || "").trim();
+      if (!textValue) return;
+      const previous = conversation[conversation.length - 1];
+      if (previous?.role === role && previous.text === textValue) {
+        previous.isStreaming = false;
+        return;
+      }
+      messageSequence += 1;
+      conversation.push({
+        id: `${fallbackID}-${messageSequence}`,
+        role,
+        text: textValue.slice(0, 16_000),
+        timestamp,
+        isStreaming: false
+      });
+      if (conversation.length > 32) conversation = conversation.slice(-32);
+    };
 
     for (const line of text.split(/\r?\n/)) {
       if (!line) continue;
@@ -1608,11 +1707,47 @@ function parseSessionFile(file) {
           active = true;
           startedAt = eventTime || startedAt;
           runState = "working";
-        } else if (["agent_reasoning", "agent_message"].includes(payloadType)) {
+          if (payloadType === "turn_started" || payloadType === "task_started") conversation = [];
+          if (payloadType === "user_message") {
+            appendConversationMessage(
+              "user",
+              payload.message || payload.text || payload.content,
+              eventTime,
+              "user"
+            );
+          }
+        } else if (["agent_reasoning", "agent_message", "agent_message_content_delta"].includes(payloadType)) {
           recognized = true;
           active = true;
           startedAt = startedAt || eventTime;
           runState = "working";
+          if (payloadType === "agent_message") {
+            appendConversationMessage(
+              "assistant",
+              payload.message || payload.text || payload.content,
+              eventTime,
+              "assistant"
+            );
+          } else if (payloadType === "agent_message_content_delta") {
+            const delta = typeof payload.delta === "string" ? payload.delta : "";
+            const itemID = String(payload.item_id || payload.itemId || "streaming-assistant");
+            if (delta) {
+              const index = conversation.findIndex((message) => message.id === itemID);
+              if (index >= 0) {
+                conversation[index].text += delta;
+                conversation[index].isStreaming = true;
+              } else {
+                conversation.push({
+                  id: itemID,
+                  role: "assistant",
+                  text: delta,
+                  timestamp: eventTime,
+                  isStreaming: true
+                });
+              }
+              if (conversation.length > 32) conversation = conversation.slice(-32);
+            }
+          }
         }
         continue;
       }
@@ -1623,6 +1758,14 @@ function parseSessionFile(file) {
         active = phase !== "final" && phase !== "final_answer";
         startedAt = active ? (startedAt || eventTime) : null;
         runState = active ? "working" : "idle";
+        if (String(payload.role || "").toLowerCase() === "assistant") {
+          appendConversationMessage(
+            "assistant",
+            responseMessageText(object),
+            eventTime,
+            "response"
+          );
+        }
         continue;
       }
       if (payloadType === "reasoning") {
@@ -1659,7 +1802,8 @@ function parseSessionFile(file) {
       state: active ? runState : "idle",
       startedAt,
       modifiedAt: stat.mtimeMs,
-      size: stat.size
+      size: stat.size,
+      conversation
     };
   } catch {
     return null;
@@ -1680,7 +1824,7 @@ function applySessionSnapshot(snapshot) {
   if (snapshot.active) {
     publish({ task: sessionTask(snapshot) });
   } else if (wasActiveFile || (state.task.state !== "idle" && Date.now() - snapshot.modifiedAt < 10_000)) {
-    publish({ task: { state: "idle", label: "空闲", title: null, project: null, startedAt: null } });
+    publish({ task: { state: "idle", label: "空闲", title: null, project: null, startedAt: null, threadID: null, conversation: [] } });
   }
 }
 
@@ -2028,14 +2172,28 @@ async function refreshLimits() {
 }
 
 async function refreshUsage() {
-  if (!rpc) return;
   const refreshDay = resetLocalUsageDay();
   const accountIdentity = currentAccountIdentity();
   const generation = accountGeneration;
+  if (!rpc) {
+    const [localToday, localDaily] = await Promise.all([
+      refreshLocalTodayUsage(true),
+      refreshLocalDailyUsage(false)
+    ]);
+    if (generation !== accountGeneration
+        || refreshDay !== localUsageDayKey
+        || accountIdentity !== currentAccountIdentity()) return;
+    publish({
+      usage: mergeLocalSessionFallback(state.usage, localToday, localDaily)
+    });
+    return;
+  }
   let usage;
+  let remoteUsageFailed = false;
   try {
     usage = normalizeUsage(await rpc.request("account/usage/read", {}, 25000));
   } catch (error) {
+    remoteUsageFailed = true;
     // Keep the last account-scoped snapshot during a transient RPC failure;
     // account transitions clear it before requesting the new account.
     usage = state.usage && typeof state.usage === "object"
@@ -2048,7 +2206,16 @@ async function refreshUsage() {
   // complete local-session history so the 7-day chart remains useful in that
   // mode. The separate today reader remains the authoritative fast path for
   // the headline while the history reader fills all seven buckets.
-  if (shouldPromoteLocalTodayUsage()) {
+  if (remoteUsageFailed) {
+    const [localToday, localDaily] = await Promise.all([
+      refreshLocalTodayUsage(true),
+      refreshLocalDailyUsage(false)
+    ]);
+    if (generation === accountGeneration
+        && accountIdentity === currentAccountIdentity()) {
+      usage = mergeLocalSessionFallback(usage, localToday, localDaily);
+    }
+  } else if (shouldPromoteLocalTodayUsage()) {
     const [localToday, localDaily] = await Promise.all([
       refreshLocalTodayUsage(true),
       shouldPromoteLocalDailyUsage() ? refreshLocalDailyUsage(true) : Promise.resolve(null)
@@ -2077,7 +2244,7 @@ async function refreshThreads() {
       task = sessionTask(localSessionSnapshot);
     } else if (localSessionSnapshot && Date.now() - localSessionSnapshot.modifiedAt < 10_000) {
       // final_answer/task_complete 比独立 app-server 的 thread/list 更新更及时。
-      task = { state: "idle", label: "空闲", title: null, project: null, startedAt: null };
+      task = { state: "idle", label: "空闲", title: null, project: null, startedAt: null, threadID: null, conversation: [] };
     }
     publish({ task });
   }
