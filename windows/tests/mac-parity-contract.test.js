@@ -61,7 +61,12 @@ const releaseWorkflow = fs
   .replace(/\r\n/g, "\n");
 
 function includes(source, fragment, label) {
-  assert(source.includes(fragment), `${label} drifted; missing ${JSON.stringify(fragment)}`);
+  const normalizedSource = source.replace(/\r\n/g, "\n");
+  const normalizedFragment = fragment.replace(/\r\n/g, "\n");
+  assert(
+    normalizedSource.includes(normalizedFragment),
+    `${label} drifted; missing ${JSON.stringify(fragment)}`
+  );
 }
 
 // Shared collapsed layout contract.
