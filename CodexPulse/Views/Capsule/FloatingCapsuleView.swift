@@ -443,13 +443,17 @@ struct FloatingCapsuleView: View {
         }
     }
 
-    var body: some View {
+    private var animatedCapsuleScene: some View {
         capsuleScene
-        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: isMini)
-        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: isExpanded)
-        .animation(.spring(response: 0.38, dampingFraction: 0.84), value: isConversationExpanded)
-        .animation(.spring(response: 0.38, dampingFraction: 0.86), value: isMiniConversationExpanded)
-        .animation(.easeInOut(duration: 0.35), value: mode.label)
+            .animation(.spring(response: 0.34, dampingFraction: 0.86), value: isMini)
+            .animation(.spring(response: 0.34, dampingFraction: 0.86), value: isExpanded)
+            .animation(.spring(response: 0.38, dampingFraction: 0.84), value: isConversationExpanded)
+            .animation(.spring(response: 0.38, dampingFraction: 0.86), value: isMiniConversationExpanded)
+            .animation(.easeInOut(duration: 0.35), value: mode.label)
+    }
+
+    private var lifecycleObservedCapsuleScene: some View {
+        animatedCapsuleScene
         .onReceive(NotificationCenter.default.publisher(for: .pulseCapsuleToggleDetails)) { _ in
             if isMini {
                 handleMiniSingleClick()
@@ -520,6 +524,10 @@ struct FloatingCapsuleView: View {
                   abs(newValue - oldValue) >= 1_000 else { return }
             revealCatMonitor(for: 2.8)
         }
+    }
+
+    private var activityObservedCapsuleScene: some View {
+        lifecycleObservedCapsuleScene
         .onChange(of: store.settings.resolvedActivityBandStyle) { _, _ in
             previewActivityBand()
         }
@@ -527,6 +535,10 @@ struct FloatingCapsuleView: View {
             if enabled { previewActivityBand() }
             else { activityPreviewStartedAt = nil }
         }
+    }
+
+    var body: some View {
+        activityObservedCapsuleScene
         .onChange(of: appUpdates.availableRelease) { _, release in
             guard release == nil, isShowingUpdateDetails else { return }
             withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
