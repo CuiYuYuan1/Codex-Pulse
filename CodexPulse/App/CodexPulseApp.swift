@@ -9,14 +9,29 @@ struct CodexPulseApp: App {
     @State private var modelRankings = ArtificialAnalysisLeaderboardStore()
     @State private var resetPrediction = CodexResetPredictionStore()
     @State private var appUpdates = AppUpdateService.shared
+    private let isSecondaryInstance: Bool
 
     init() {
         #if os(macOS)
-        // 显示 Dock 图标，避免“后台无界面、像没反应”
-        DispatchQueue.main.async {
-            NSApp.setActivationPolicy(.regular)
-            NSApp.activate(ignoringOtherApps: true)
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let existing = NSRunningApplication
+            .runningApplications(withBundleIdentifier: AppConstants.bundleID)
+            .first { $0.processIdentifier != currentPID && !$0.isTerminated }
+        isSecondaryInstance = existing != nil
+        if let existing {
+            existing.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            DispatchQueue.main.async {
+                NSApplication.shared.terminate(nil)
+            }
+        } else {
+            // 显示 Dock 图标，避免“后台无界面、像没反应”
+            DispatchQueue.main.async {
+                NSApp.setActivationPolicy(.regular)
+                NSApp.activate(ignoringOtherApps: true)
+            }
         }
+        #else
+        isSecondaryInstance = false
         #endif
     }
 
@@ -33,6 +48,7 @@ struct CodexPulseApp: App {
                 .preferredColorScheme(store.settings.resolvedAppearanceMode.colorScheme)
                 .frame(minWidth: 860, minHeight: 620)
                 .onAppear {
+                    guard !isSecondaryInstance else { return }
                     store.start()
                     appUpdates.startAutomaticChecks()
                     #if os(macOS)

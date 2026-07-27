@@ -26,6 +26,15 @@ struct FloatingCapsuleView: View {
     @State private var hoverZoneSize = CGSize(width: 300, height: 64)
     @State private var activityPreviewStartedAt: Date?
     @State private var weatherViewModel = WeatherViewModel()
+    @State private var catRoamingActivity: CatRoamingActivity = .resting
+    @State private var catFacesLeft = false
+    // Cat/fox monitors are intentionally transient while idle. Starting this
+    // at `true` could leave the bubble permanently visible when the view first
+    // appeared in compact mode without triggering an `isMini` change.
+    @State private var isCatMonitorVisible = false
+    @State private var catMonitorHideTask: Task<Void, Never>?
+    @State private var catTransientAnimation: PetAnimationState?
+    @State private var catTransientAnimationTask: Task<Void, Never>?
 
     /// 面板本身透明，但 SwiftUI 光效仍会被 NSPanel 边界裁切。
     /// 这里需要同时容纳磁吸位移、悬停缩放和模糊描边。
@@ -114,6 +123,10 @@ struct FloatingCapsuleView: View {
         store.snapshot.usage.todayTokens
     }
 
+    private var petGrowthScale: CGFloat {
+        CGFloat(PetGrowth.scale(forTodayTokens: todayTokens))
+    }
+
     private var informationBarEnabled: Bool {
         store.settings.resolvedInformationBarEnabled
             && store.settings.weatherLocation != nil
@@ -133,6 +146,53 @@ struct FloatingCapsuleView: View {
 
     private var isMiniTaskConversationAvailable: Bool {
         isMini && (mode == .working || mode == .attention)
+    }
+
+    private var isCatPet: Bool {
+        switch store.settings.resolvedPetCharacter {
+        case .cat, .fox:
+            return true
+        case .dino, .bunny, .ghost, .robot, .blackHole:
+            return false
+        }
+    }
+
+    private var catRoamingEnabled: Bool {
+        isMini
+            && (mode == .idle || mode == .offline)
+            && !isMiniConversationExpanded
+            && !reduceMotion
+    }
+
+    private var petLocomotionCycleDuration: TimeInterval {
+        switch store.settings.resolvedPetCharacter {
+        case .dino: return 1.06
+        case .cat: return 1.0 / 1.12
+        case .bunny: return 1.38
+        case .ghost: return 1.24
+        case .robot: return 0.94
+        case .fox: return 1.12
+        case .blackHole: return 1.28
+        }
+    }
+
+    private var petRoamingArcHeight: CGFloat {
+        switch store.settings.resolvedPetCharacter {
+        case .dino: return 5
+        case .cat: return 7
+        case .bunny: return 10
+        case .ghost: return 18
+        case .robot: return 4
+        case .fox: return 8
+        case .blackHole: return 5
+        }
+    }
+
+    private var petMinimumHorizontalTravel: CGFloat {
+        switch store.settings.resolvedPetCharacter {
+        case .ghost, .blackHole: return 90
+        case .dino, .cat, .bunny, .robot, .fox: return 140
+        }
     }
 
     private var taskConversation: [TaskConversationMessage] {
@@ -185,10 +245,13 @@ struct FloatingCapsuleView: View {
                 showsIdleContent: mode == .idle || mode == .offline,
                 activeQuotaValue: activeQuota?.value,
                 activeQuotaColor: activeQuota?.color ?? PulseTheme.green,
-                reduceMotion: reduceMotion
+                reduceMotion: reduceMotion,
+                catRoamingActivity: catRoamingActivity,
+                catFacesLeft: catFacesLeft,
+                showsTransientMonitor: isCatMonitorVisible,
+                growthScale: petGrowthScale
             )
         }
-        .frame(width: 216, height: 129.6)
         .padding(12)
         .background(Color.black.opacity(0.001))
         .contentShape(Rectangle())
@@ -216,12 +279,22 @@ struct FloatingCapsuleView: View {
     }
 
     private func petAnimationState(at date: Date) -> PetAnimationState {
+        if isCatPet, let catTransientAnimation {
+            return catTransientAnimation
+        }
+        let runState = store.snapshot.currentTask.state
+        if runState == .failed || runState == .networkError {
+            return .error
+        }
         switch mode {
         case .working:
-            // Ten seconds of focused typing, then a short natural thinking pause.
+            // Focused paw work is punctuated by a longer, readable thinking hold.
             let phase = Int(date.timeIntervalSince1970) % 13
-            return (9...11).contains(phase) ? .scratch : .thinking
-        case .attention: return .authorization
+            return (8...11).contains(phase) ? .thinking : .running
+        case .attention:
+            return runState == .awaitingAuthorization
+                ? .waitingAuthorization
+                : .waiting
         case .idle, .offline: return .idle
         }
     }
@@ -303,69 +376,75 @@ struct FloatingCapsuleView: View {
 
     // MARK: - Body
 
-    var body: some View {
-        Group {
-            if isMini {
-                VStack(alignment: .trailing, spacing: isMiniConversationExpanded ? -14 : 8) {
-                    miniCapsule
-                        .zIndex(2)
-                        .transition(.scale(scale: 0.72, anchor: .topTrailing).combined(with: .opacity))
-                    if isMiniConversationExpanded && isMiniTaskConversationAvailable {
-                        miniTaskConversationCard
-                            .zIndex(1)
-                            .frame(width: 323, alignment: .trailing)
-                            .transition(
-                                .asymmetric(
-                                    insertion: .opacity
-                                        .combined(with: .scale(
-                                            scale: 0.16,
-                                            anchor: UnitPoint(x: 0.82, y: 0)
-                                        )),
-                                    removal: .opacity
-                                        .combined(with: .scale(
-                                            scale: 0.22,
-                                            anchor: UnitPoint(x: 0.82, y: 0)
-                                        ))
-                                )
+    @ViewBuilder
+    private var capsuleScene: some View {
+        if isMini {
+            VStack(alignment: .trailing, spacing: isMiniConversationExpanded ? -14 : 8) {
+                miniCapsule
+                    .zIndex(2)
+                    .transition(.scale(scale: 0.72, anchor: .topTrailing).combined(with: .opacity))
+                if isMiniConversationExpanded && isMiniTaskConversationAvailable {
+                    miniTaskConversationCard
+                        .zIndex(1)
+                        .frame(width: 323, alignment: .trailing)
+                        .transition(
+                            .asymmetric(
+                                insertion: .opacity
+                                    .combined(with: .scale(
+                                        scale: 0.16,
+                                        anchor: UnitPoint(x: 0.82, y: 0)
+                                    )),
+                                removal: .opacity
+                                    .combined(with: .scale(
+                                        scale: 0.22,
+                                        anchor: UnitPoint(x: 0.82, y: 0)
+                                    ))
                             )
-                    }
+                        )
                 }
-                .frame(maxWidth: .infinity, alignment: .trailing)
-            } else {
-                VStack(
-                    alignment: .center,
-                    spacing: isExpanded ? 2 : (showsWeatherMetadata ? 4 : 8)
-                ) {
-                    capsuleBar
-                    if showsWeatherMetadata {
-                        informationMetadata
-                            .frame(
-                                width: isConversationExpanded && isTaskStreamActive
-                                    ? 323
-                                    : informationCapsuleWidth,
-                                alignment: .center
-                            )
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-                    if isExpanded {
-                        Group {
-                            if isShowingUpdateDetails, appUpdates.availableRelease != nil {
-                                updateDetailCard
-                            } else {
-                                detailCard
-                            }
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        } else {
+            VStack(
+                alignment: .center,
+                spacing: isExpanded ? 2 : (showsWeatherMetadata ? 4 : 8)
+            ) {
+                capsuleBar
+                if showsWeatherMetadata {
+                    informationMetadata
+                        .frame(
+                            width: isConversationExpanded && isTaskStreamActive
+                                ? 323
+                                : informationCapsuleWidth,
+                            alignment: .center
+                        )
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+                if isExpanded {
+                    Group {
+                        if isShowingUpdateDetails, appUpdates.availableRelease != nil {
+                            updateDetailCard
+                        } else {
+                            detailCard
                         }
-                            .frame(width: informationBarEnabled ? 422 : nil, alignment: .center)
-                            .transition(
-                                .asymmetric(
-                                    insertion: .opacity.combined(with: .move(edge: .top)).combined(with: .scale(scale: 0.96, anchor: .top)),
-                                    removal: .opacity.combined(with: .scale(scale: 0.96, anchor: .top))
-                                )
-                            )
                     }
+                    .frame(width: informationBarEnabled ? 422 : nil, alignment: .center)
+                    .transition(
+                        .asymmetric(
+                            insertion: .opacity
+                                .combined(with: .move(edge: .top))
+                                .combined(with: .scale(scale: 0.96, anchor: .top)),
+                            removal: .opacity
+                                .combined(with: .scale(scale: 0.96, anchor: .top))
+                        )
+                    )
                 }
             }
         }
+    }
+
+    var body: some View {
+        capsuleScene
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: isMini)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: isExpanded)
         .animation(.spring(response: 0.38, dampingFraction: 0.84), value: isConversationExpanded)
@@ -380,6 +459,66 @@ struct FloatingCapsuleView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .pulseCapsuleToggleMini)) { _ in
             toggleMiniMode()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .pulseCatRoamingActivityChanged)) { note in
+            guard let update = note.object as? CatRoamingVisualUpdate else { return }
+            // The renderer owns its state transition timing. A second implicit
+            // SwiftUI animation here occasionally composited old/new canvases
+            // and produced a one-frame flash.
+            catRoamingActivity = update.activity
+            catFacesLeft = update.facesLeft
+        }
+        .onAppear {
+            synchronizeCatRoaming()
+            if isMini, isCatPet {
+                revealCatMonitor(for: 3.4)
+            }
+        }
+        .onDisappear {
+            catMonitorHideTask?.cancel()
+            catMonitorHideTask = nil
+            catTransientAnimationTask?.cancel()
+            FloatingCapsuleController.shared.setCatRoamingEnabled(false)
+        }
+        .onChange(of: catRoamingEnabled) { _, _ in
+            synchronizeCatRoaming()
+        }
+        .onChange(of: store.settings.resolvedPetCharacter) { _, _ in
+            synchronizeCatRoaming()
+        }
+        .onChange(of: isMini) { _, mini in
+            guard mini, isCatPet else { return }
+            revealCatMonitor(for: 3.4)
+        }
+        .onChange(of: mode.label) { oldMode, newMode in
+            guard isMini, isCatPet, oldMode != newMode, mode == .idle else { return }
+            revealCatMonitor(for: 3.2)
+        }
+        .modifier(
+            CatTaskStateObserver(
+                state: store.snapshot.currentTask.state,
+                action: handleCatTaskStateChange
+            )
+        )
+        .onChange(of: remainingPercent) { oldValue, newValue in
+            guard isMini,
+                  isCatPet,
+                  mode == .idle,
+                  activeMiniCapsuleStyle == .quota,
+                  let oldValue,
+                  let newValue,
+                  abs(newValue - oldValue) >= 1 else { return }
+            revealCatMonitor(for: 2.8)
+        }
+        .onChange(of: todayTokens) { oldValue, newValue in
+            guard isMini,
+                  isCatPet,
+                  mode == .idle,
+                  activeMiniCapsuleStyle == .tokens,
+                  let oldValue,
+                  let newValue,
+                  abs(newValue - oldValue) >= 1_000 else { return }
+            revealCatMonitor(for: 2.8)
         }
         .onChange(of: store.settings.resolvedActivityBandStyle) { _, _ in
             previewActivityBand()
@@ -502,7 +641,11 @@ struct FloatingCapsuleView: View {
         }
         .contentShape(Capsule(style: .continuous))
         .scaleEffect(isHovering && !isExpanded ? 1.025 : 1.0)
-        .help("Codex \(mode.label) · 点击\(isExpanded ? "收起" : "展开")详情 · 右键更多操作")
+        .help(
+            isMini
+                ? "\(store.settings.resolvedPetCharacter.displayName) · 右键切换宠物 · 双击恢复完整胶囊"
+                : "Codex \(mode.label) · 点击\(isExpanded ? "收起" : "展开")详情 · 右键更多操作"
+        )
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isHovering)
         .animation(.spring(response: 0.3, dampingFraction: 0.88), value: hasAvailableUpdate)
     }
@@ -531,6 +674,12 @@ struct FloatingCapsuleView: View {
             return
         }
 
+        if isCatPet && (mode == .idle || mode == .offline) && !isCatMonitorVisible {
+            revealCatMonitor(for: 3.4)
+            PulseLog.write("mini cat display revealed")
+            return
+        }
+
         let apiMode = store.snapshot.account.authMode == .apiKey
         let styles: [MiniCapsuleStyle] = apiMode
             ? [.tokens, .weather, .time]
@@ -543,7 +692,85 @@ struct FloatingCapsuleView: View {
             store.settings.resolvedMiniCapsuleStyle = next
         }
         store.saveSettings()
+        if isCatPet {
+            revealCatMonitor(for: 3.4)
+        }
         PulseLog.write("mini pet display cycled to \(next.rawValue)")
+    }
+
+    private func synchronizeCatRoaming() {
+        FloatingCapsuleController.shared.setCatRoamingEnabled(
+            catRoamingEnabled,
+            cycleDuration: petLocomotionCycleDuration,
+            arcHeight: petRoamingArcHeight,
+            minimumHorizontalDistance: petMinimumHorizontalTravel
+        )
+        if !catRoamingEnabled {
+            catRoamingActivity = .resting
+            catFacesLeft = false
+        }
+        if !isCatPet {
+            catMonitorHideTask?.cancel()
+            catMonitorHideTask = nil
+            isCatMonitorVisible = true
+        } else if isMini, (mode == .idle || mode == .offline) {
+            // Rebuilding the compact scene must never resurrect a stale idle
+            // monitor. Only an explicit reveal action owns the visible timer.
+            if catMonitorHideTask == nil {
+                isCatMonitorVisible = false
+            }
+        }
+    }
+
+    private func revealCatMonitor(for seconds: Double) {
+        guard isCatPet else { return }
+        catMonitorHideTask?.cancel()
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+            isCatMonitorVisible = true
+        }
+        let nanoseconds = UInt64(max(0.5, seconds) * 1_000_000_000)
+        catMonitorHideTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: nanoseconds)
+            } catch {
+                return
+            }
+            catMonitorHideTask = nil
+            guard isMini, isCatPet, mode == .idle || mode == .offline else { return }
+            withAnimation(.easeOut(duration: 0.26)) {
+                isCatMonitorVisible = false
+            }
+        }
+    }
+
+    private func playCatTransient(_ state: PetAnimationState, for seconds: Double) {
+        catTransientAnimationTask?.cancel()
+        catTransientAnimation = state
+        let delay = UInt64(max(0.8, seconds) * 1_000_000_000)
+        catTransientAnimationTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
+                return
+            }
+            catTransientAnimation = nil
+        }
+    }
+
+    private func handleCatTaskStateChange(
+        _ oldState: CodexRunState,
+        _ newState: CodexRunState
+    ) {
+        guard isMini, isCatPet, oldState != newState else { return }
+        switch newState {
+        case .completed:
+            playCatTransient(.success, for: 3.2)
+        case .failed, .networkError:
+            playCatTransient(.error, for: 4.2)
+        default:
+            catTransientAnimationTask?.cancel()
+            catTransientAnimation = nil
+        }
     }
 
     private func toggleDetails() {
@@ -1811,6 +2038,15 @@ struct FloatingCapsuleView: View {
         if remaining <= 0 || remaining < 24 * 3600 { return PulseTheme.red }
         if remaining < 3 * 24 * 3600 { return PulseTheme.orange }
         return .secondary
+    }
+}
+
+private struct CatTaskStateObserver: ViewModifier {
+    let state: CodexRunState
+    let action: (CodexRunState, CodexRunState) -> Void
+
+    func body(content: Content) -> some View {
+        content.onChange(of: state, action)
     }
 }
 

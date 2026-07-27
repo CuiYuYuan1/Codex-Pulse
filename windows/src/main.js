@@ -1,4 +1,17 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, nativeImage, screen, shell, powerMonitor } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  Tray,
+  Menu,
+  ipcMain,
+  dialog,
+  nativeImage,
+  screen,
+  shell,
+  powerMonitor,
+  desktopCapturer,
+  session
+} = require("electron");
 const { spawn, execFile } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -19,7 +32,7 @@ const INFORMATION_COLLAPSED_SIZE = { width: 323, height: 128 };
 const INFORMATION_MIN_WIDTH = 323;
 const INFORMATION_MAX_WIDTH = 471;
 const EXPANDED_SIZE = { width: 390, height: 810 };
-// 216×130 宠物场景外加四周 12px 安全区。
+// 普通宠物为 216×130；黑洞使用 216×184，为竖向吸积盘留出透明空间。
 const MINI_SIZE = { width: 240, height: 154 };
 const USE_STABLE_DESKTOP_SURFACE = process.platform === "win32";
 const SETTINGS_FILE = () => path.join(app.getPath("userData"), "settings.json");
@@ -28,8 +41,18 @@ const WEATHER_REFRESH_MS = 15 * 60 * 1000;
 const WEATHER_REQUEST_TIMEOUT_MS = 9000;
 const GEOCODING_CACHE_TTL_MS = 30 * 60 * 1000;
 const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const PET_SWITCH_ITEMS = Object.freeze([
+  { id: "dino", label: "小恐龙" },
+  { id: "cat", label: "猫咪" },
+  { id: "bunny", label: "兔子" },
+  { id: "ghost", label: "幽灵" },
+  { id: "robot", label: "机器人" },
+  { id: "fox", label: "九尾狐" },
+  { id: "black_hole", label: "事件视界" }
+]);
 
 let windowRef;
+let currentWindowLayoutMode = "collapsed";
 let startupCapsuleShown = false;
 let backgroundStartupScheduled = false;
 let collapsedWidth = COLLAPSED_SIZE.width;
@@ -82,8 +105,12 @@ let weatherRequestGeneration = 0;
 const weatherCache = new Map();
 const geocodingCache = new Map();
 let dragState;
+let petRoamGeneration = 0;
+let petRoamTimer;
+let petRoamResolve;
 let windowShapeBounds = null;
 let windowShapeSignature = null;
+let blackHoleCaptureEnabled = false;
 let connectionAttempt = 0;
 let state = {
   connection: "discovering",
@@ -2602,22 +2629,48 @@ function resizeWindow(mode) {
   }
   const mini = resolvedMode === "mini";
   const expanded = resolvedMode === true || resolvedMode === "expanded";
+  const wasMini = currentWindowLayoutMode === "mini";
+  const requestedPetScale = adaptiveRequest ? Number(mode.petScale) : 1;
+  const petScale = Number.isFinite(requestedPetScale)
+    ? Math.max(1, Math.min(10, requestedPetScale))
+    : 1;
+  const miniSceneHeight = adaptiveRequest && mode.petCharacter === "black_hole"
+    ? 184
+    : 129.6;
+  const miniSize = {
+    width: Math.ceil(216 * petScale + 24),
+    height: Math.ceil(miniSceneHeight * petScale + 24)
+  };
+  const miniConversationExpanded = mini
+    && adaptiveRequest
+    && mode.conversationExpanded === true;
+  const miniConversationSize = {
+    width: Math.max(EXPANDED_SIZE.width, miniSize.width),
+    // Pet scene + 8px separation + 246px conversation surface + stage inset.
+    height: Math.max(
+      miniSize.height,
+      Math.ceil(miniSceneHeight * petScale + 8 + 246 + 24)
+    )
+  };
   const informationSize = { ...INFORMATION_COLLAPSED_SIZE, width: informationCollapsedWidth };
-  // A transparent Windows DirectComposition surface can retain an old frame
-  // when it is resized between 390x810 and 88x88. Keep one native surface for
-  // every mode and let setShape define the interactive/visible region.
-  const target = USE_STABLE_DESKTOP_SURFACE
+  // Full and collapsed modes share the stable DirectComposition surface. Mini
+  // mode follows the token-grown pet envelope so a 10x companion is never
+  // clipped; setShape still limits interaction to the visible pet.
+  const target = mini
+    ? (miniConversationExpanded ? miniConversationSize : miniSize)
+    : USE_STABLE_DESKTOP_SURFACE
     ? EXPANDED_SIZE
-    : mini
-    ? MINI_SIZE
     : expanded
     ? { ...EXPANDED_SIZE, width: state.informationBar?.enabled ? Math.max(INFORMATION_COLLAPSED_SIZE.width, informationCollapsedWidth) : EXPANDED_SIZE.width }
     : informationLayout ? informationSize : { ...COLLAPSED_SIZE, width: collapsedWidth };
   const old = windowRef.getBounds();
+  currentWindowLayoutMode = mini ? "mini" : expanded ? "expanded" : "collapsed";
   if (old.width === target.width && old.height === target.height) return old;
   const display = screen.getDisplayMatching(old).workArea;
   const usesLeftEdgeAnchor = adaptiveRequest && resolvedMode === "collapsed";
-  const usesRightEdgeAnchor = !usesLeftEdgeAnchor && (mini || old.width <= 100);
+  const usesRightEdgeAnchor = !usesLeftEdgeAnchor && (
+    mini || wasMini || old.width <= 100
+  );
   const preferredX = usesLeftEdgeAnchor
     ? old.x
     : usesRightEdgeAnchor
@@ -2659,6 +2712,240 @@ function clampWindowPositionToVisibleShape(wantedX, wantedY, area, windowBounds,
     x: Math.min(maxX, Math.max(minX, wantedX)),
     y: Math.min(maxY, Math.max(minY, wantedY))
   };
+}
+
+function cancelPetRoamAnimation() {
+  petRoamGeneration += 1;
+  clearTimeout(petRoamTimer);
+  petRoamTimer = null;
+  if (petRoamResolve) {
+    const resolve = petRoamResolve;
+    petRoamResolve = null;
+    resolve({ cancelled: true });
+  }
+}
+
+function nativeWindowCoordinate(value, fallback = 0) {
+  const numeric = Number(value);
+  const fallbackNumeric = Number(fallback);
+  const rounded = Math.round(
+    Number.isFinite(numeric)
+      ? numeric
+      : Number.isFinite(fallbackNumeric) ? fallbackNumeric : 0
+  );
+  // Math.round(-0.4) is JavaScript -0. Electron's Windows native converter
+  // rejects that value for BrowserWindow.setPosition even though it prints as
+  // zero. Normalize it and keep every coordinate inside the signed Win32 range.
+  if (Object.is(rounded, -0)) return 0;
+  return Math.max(-2147483648, Math.min(2147483647, rounded));
+}
+
+function inferredTaskbarEdge(area, full) {
+  const gaps = {
+    top: Math.max(0, area.y - full.y),
+    bottom: Math.max(0, full.y + full.height - area.y - area.height),
+    left: Math.max(0, area.x - full.x),
+    right: Math.max(0, full.x + full.width - area.x - area.width)
+  };
+  const rankedEdges = Object.entries(gaps)
+    .sort((left, right) => right[1] - left[1]);
+  return Number(rankedEdges[0]?.[1]) > 8
+    ? rankedEdges[0][0]
+    : "bottom";
+}
+
+function planPetRoam(options = {}) {
+  if (!windowRef || windowRef.isDestroyed() || dragState) return null;
+  const bounds = windowRef.getBounds();
+  const visible = USE_STABLE_DESKTOP_SURFACE && windowShapeBounds
+    ? windowShapeBounds
+    : { x: 0, y: 0, width: bounds.width, height: bounds.height };
+  const visibleCenter = {
+    x: bounds.x + visible.x + visible.width / 2,
+    y: bounds.y + visible.y + visible.height / 2
+  };
+  const display = screen.getDisplayNearestPoint(visibleCenter);
+  const area = display.workArea;
+  const full = display.bounds;
+  const forceInteraction = options?.forceInteraction === true;
+  const roll = Math.random();
+  const kind = forceInteraction
+    ? (Math.random() < .56 ? "desktop" : "dock")
+    : roll < .38
+    ? "desktop"
+    : roll < .66
+    ? "dock"
+    : "wander";
+
+  if (kind !== "wander") {
+    let targetCenter;
+    let clampArea = area;
+    if (kind === "desktop") {
+      // Windows normally lays desktop icons down the left edge. Position the
+      // visible pet just to the right of a grid slot without reading user files
+      // or requesting accessibility/screen-capture permissions.
+      const slotCount = Math.max(1, Math.min(7, Math.floor((area.height - 96) / 74)));
+      const slot = Math.floor(Math.random() * slotCount);
+      const iconCenter = {
+        x: area.x + 42,
+        y: area.y + 50 + slot * 74
+      };
+      targetCenter = {
+        x: iconCenter.x + Math.min(92, visible.width * .42),
+        y: iconCenter.y + 8
+      };
+    } else {
+      // Infer the taskbar edge from the display/work-area gap and sit the pet
+      // immediately above or beside one of the taskbar icons.
+      const taskbarEdge = inferredTaskbarEdge(area, full);
+      const slotOffset = (Math.floor(Math.random() * 7) - 3) * 54;
+      clampArea = full;
+      if (taskbarEdge === "top") {
+        targetCenter = {
+          x: area.x + area.width / 2 + slotOffset,
+          y: area.y + visible.height * .33
+        };
+      } else if (taskbarEdge === "left") {
+        targetCenter = {
+          x: area.x + visible.width * .34,
+          y: area.y + area.height / 2 + slotOffset
+        };
+      } else if (taskbarEdge === "right") {
+        targetCenter = {
+          x: area.x + area.width - visible.width * .34,
+          y: area.y + area.height / 2 + slotOffset
+        };
+      } else {
+        targetCenter = {
+          x: area.x + area.width / 2 + slotOffset,
+          y: area.y + area.height - visible.height * .30
+        };
+      }
+    }
+    const target = clampWindowPositionToVisibleShape(
+      targetCenter.x - visible.x - visible.width / 2,
+      targetCenter.y - visible.y - visible.height / 2,
+      clampArea,
+      bounds,
+      visible
+    );
+    const horizontalDelta = target.x - bounds.x;
+    return {
+      x: Math.round(target.x),
+      y: Math.round(target.y),
+      direction: horizontalDelta < 0 ? "left" : "right",
+      distance: Math.round(Math.hypot(horizontalDelta, target.y - bounds.y)),
+      kind
+    };
+  }
+
+  const distance = 150 + Math.random() * 150;
+  const preferredDirection = Math.random() < 0.5 ? -1 : 1;
+  const candidates = [preferredDirection, -preferredDirection].map((direction) => {
+    const desiredX = bounds.x + direction * distance;
+    const desiredY = bounds.y + (Math.random() - 0.5) * 56;
+    const target = clampWindowPositionToVisibleShape(
+      desiredX,
+      desiredY,
+      area,
+      bounds,
+      visible
+    );
+    return {
+      x: Math.round(target.x),
+      y: Math.round(target.y),
+      direction,
+      horizontalDistance: Math.abs(target.x - bounds.x),
+      distance: Math.hypot(target.x - bounds.x, target.y - bounds.y)
+    };
+  });
+  const plan = candidates.sort(
+    (left, right) => right.horizontalDistance - left.horizontalDistance
+  )[0];
+  if (!plan || plan.horizontalDistance < 100) return null;
+  return {
+    x: plan.x,
+    y: plan.y,
+    direction: plan.direction < 0 ? "left" : "right",
+    distance: Math.round(plan.distance),
+    kind: "wander"
+  };
+}
+
+function runPetRoam(plan) {
+  cancelPetRoamAnimation();
+  if (!windowRef || windowRef.isDestroyed() || dragState) {
+    return Promise.resolve({ cancelled: true });
+  }
+  const generation = petRoamGeneration;
+  const from = windowRef.getBounds();
+  const x = Number(plan?.x);
+  const y = Number(plan?.y);
+  const duration = Math.max(1.5, Math.min(8.5, Number(plan?.duration) || 2.4));
+  const arcHeight = Math.max(0, Math.min(24, Number(plan?.arcHeight) || 0));
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return Promise.resolve({ cancelled: true });
+  }
+  const startedAt = performance.now();
+  let lastPositionX = from.x;
+  let lastPositionY = from.y;
+  return new Promise((resolve) => {
+    petRoamResolve = resolve;
+    const finish = (cancelled) => {
+      if (petRoamResolve !== resolve) return;
+      petRoamResolve = null;
+      if (generation === petRoamGeneration) petRoamTimer = null;
+      resolve({ cancelled });
+    };
+    const step = () => {
+      if (generation !== petRoamGeneration
+          || dragState
+          || !windowRef
+          || windowRef.isDestroyed()) {
+        finish(true);
+        return;
+      }
+      const progress = Math.min(1, (performance.now() - startedAt) / (duration * 1000));
+      // A cosine ease keeps the first and last paw contacts planted without
+      // producing the abrupt "window sliding" start/stop seen previously.
+      const eased = 0.5 - Math.cos(Math.PI * progress) / 2;
+      const nextX = nativeWindowCoordinate(
+        from.x + (x - from.x) * eased,
+        lastPositionX
+      );
+      // Windows screen coordinates grow downward, so subtract the shallow
+      // species-specific arc to lift the companion between foot contacts.
+      const arc = Math.sin(Math.PI * progress) * arcHeight;
+      const nextY = nativeWindowCoordinate(
+        from.y + (y - from.y) * eased - arc,
+        lastPositionY
+      );
+      if (nextX !== lastPositionX || nextY !== lastPositionY) {
+        try {
+          windowRef.setPosition(nextX, nextY, false);
+          publishBlackHoleCaptureGeometry({
+            ...windowRef.getContentBounds(),
+            x: nextX,
+            y: nextY
+          });
+        } catch {
+          // Roaming is decorative. Display topology can change while a step is
+          // in flight, so cancel this walk instead of surfacing a main-process
+          // JavaScript error or leaving the renderer waiting indefinitely.
+          finish(true);
+          return;
+        }
+        lastPositionX = nextX;
+        lastPositionY = nextY;
+      }
+      if (progress >= 1) {
+        finish(false);
+        return;
+      }
+      petRoamTimer = setTimeout(step, 1000 / 60);
+    };
+    step();
+  });
 }
 
 function createWindow() {
@@ -2707,6 +2994,8 @@ function createWindow() {
   };
   windowRef.on("blur", collapseDetail);
   windowRef.on("hide", collapseDetail);
+  windowRef.on("move", () => publishBlackHoleCaptureGeometry());
+  windowRef.on("resize", () => publishBlackHoleCaptureGeometry());
   windowRef.on("close", (event) => {
     if (!app.isQuitting) {
       event.preventDefault();
@@ -2728,6 +3017,7 @@ function showStartupCapsule() {
   const x = Math.max(display.x, display.x + display.width - target.width - margin);
   const y = Math.max(display.y, display.y + margin);
   windowRef.setBounds({ x, y, ...target }, false);
+  publishBlackHoleCaptureGeometry({ x, y, ...target });
   windowRef.show();
   windowRef.moveTop();
   startupCapsuleShown = true;
@@ -2879,19 +3169,127 @@ ipcMain.handle("pulse:set-window-shape", (_event, rects) => {
   windowRef.setShape(normalized);
   return true;
 });
+ipcMain.handle("pulse:set-black-hole-capture-mode", (event, enabled) => {
+  if (!windowRef || windowRef.isDestroyed() || event.sender !== windowRef.webContents) {
+    return false;
+  }
+  // Electron maps this to SetWindowDisplayAffinity on Windows. Excluding the
+  // transparent pet window prevents the desktop stream from feeding the black
+  // hole back into itself while normal app windows remain capturable.
+  blackHoleCaptureEnabled = enabled === true;
+  windowRef.setContentProtection(process.platform === "win32" && blackHoleCaptureEnabled);
+  if (blackHoleCaptureEnabled) publishBlackHoleCaptureGeometry();
+  return true;
+});
+
+function blackHoleCaptureGeometry(windowBounds = null) {
+  if (!windowRef || windowRef.isDestroyed()) return null;
+  const resolvedBounds = windowBounds || windowRef.getContentBounds();
+  const display = screen.getDisplayMatching(resolvedBounds);
+  return {
+    windowBounds: resolvedBounds,
+    displayBounds: display.bounds,
+    displayId: String(display.id),
+    scaleFactor: display.scaleFactor
+  };
+}
+
+function publishBlackHoleCaptureGeometry(windowBounds = null) {
+  if (!blackHoleCaptureEnabled || !windowRef || windowRef.isDestroyed()) return;
+  const geometry = blackHoleCaptureGeometry(windowBounds);
+  if (geometry) windowRef.webContents.send("pulse:black-hole-capture-geometry", geometry);
+}
+
+ipcMain.handle("pulse:get-black-hole-capture-geometry", (event) => {
+  if (!windowRef || windowRef.isDestroyed() || event.sender !== windowRef.webContents) {
+    return null;
+  }
+  return blackHoleCaptureGeometry();
+});
+ipcMain.handle("pulse:black-hole-trash-files", async (event, filePaths) => {
+  if (!windowRef || windowRef.isDestroyed() || event.sender !== windowRef.webContents) {
+    return { ok: false, trashed: 0, errors: ["unauthorized renderer"] };
+  }
+  const candidates = Array.isArray(filePaths) ? filePaths.slice(0, 64) : [];
+  const errors = [];
+  let trashed = 0;
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || !candidate.trim()) continue;
+    const resolved = path.resolve(candidate);
+    if (resolved === path.parse(resolved).root) {
+      errors.push("volume roots cannot be moved to the Recycle Bin");
+      continue;
+    }
+    try {
+      await shell.trashItem(resolved);
+      trashed += 1;
+    } catch (error) {
+      errors.push(`${path.basename(resolved)}: ${error?.message || String(error)}`);
+    }
+  }
+  return { ok: errors.length === 0 && trashed > 0, trashed, errors };
+});
+ipcMain.handle("pulse:show-pet-switch-menu", (event, current) => {
+  if (!windowRef || windowRef.isDestroyed() || event.sender !== windowRef.webContents) {
+    return null;
+  }
+  const selected = PET_SWITCH_ITEMS.some((item) => item.id === current) ? current : "dino";
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const menu = Menu.buildFromTemplate(PET_SWITCH_ITEMS.map((item) => ({
+      label: item.label,
+      type: "radio",
+      checked: item.id === selected,
+      click: () => finish(item.id)
+    })));
+    menu.popup({
+      window: windowRef,
+      callback: () => finish(null)
+    });
+  });
+});
+ipcMain.handle("pulse:pet-roam-plan", (event, options) => {
+  if (!windowRef || windowRef.isDestroyed() || event.sender !== windowRef.webContents) return null;
+  return planPetRoam(options);
+});
+ipcMain.handle("pulse:pet-roam-run", (event, plan) => {
+  if (!windowRef || windowRef.isDestroyed() || event.sender !== windowRef.webContents) {
+    return { cancelled: true };
+  }
+  return runPetRoam(plan);
+});
+ipcMain.on("pulse:pet-roam-cancel", (event) => {
+  if (!windowRef || windowRef.isDestroyed() || event.sender !== windowRef.webContents) return;
+  cancelPetRoamAnimation();
+});
 ipcMain.on("pulse:drag-begin", (event, point) => {
   if (!windowRef || windowRef.isDestroyed() || event.sender !== windowRef.webContents) return;
+  cancelPetRoamAnimation();
   const bounds = windowRef.getBounds();
   dragState = {
     pointerX: Number(point?.x) || 0,
     pointerY: Number(point?.y) || 0,
     windowX: bounds.x,
-    windowY: bounds.y
+    windowY: bounds.y,
+    encounterKind: null,
+    encounterDirection: null
   };
 });
 ipcMain.on("pulse:drag-move", (event, point) => {
   if (!dragState || !windowRef || windowRef.isDestroyed() || event.sender !== windowRef.webContents) return;
   const pointer = { x: Number(point?.x) || 0, y: Number(point?.y) || 0 };
+  const encounter = classifyManualPetDrop(pointer);
+  if (encounter) {
+    if (encounter.kind === "dock" || !dragState.encounterKind) {
+      dragState.encounterKind = encounter.kind;
+      dragState.encounterDirection = encounter.direction;
+    }
+  }
   const bounds = windowRef.getBounds();
   const area = screen.getDisplayNearestPoint(pointer).workArea;
   const wantedX = Math.round(dragState.windowX + pointer.x - dragState.pointerX);
@@ -2907,17 +3305,98 @@ ipcMain.on("pulse:drag-move", (event, point) => {
   const nextY = Math.round(next.y);
   if (nextX !== bounds.x || nextY !== bounds.y) {
     windowRef.setPosition(nextX, nextY, false);
+    publishBlackHoleCaptureGeometry({
+      ...windowRef.getContentBounds(),
+      x: nextX,
+      y: nextY
+    });
   }
 });
-ipcMain.on("pulse:drag-end", () => { dragState = null; });
+function classifyManualPetDrop(point) {
+  if (!windowRef || windowRef.isDestroyed()) return null;
+  const pointer = {
+    x: Number(point?.x),
+    y: Number(point?.y)
+  };
+  if (!Number.isFinite(pointer.x) || !Number.isFinite(pointer.y)) return null;
+  const display = screen.getDisplayNearestPoint(pointer);
+  const area = display.workArea;
+  const full = display.bounds;
+  const taskbarEdge = inferredTaskbarEdge(area, full);
+  const threshold = 110;
+  const nearTaskbar = taskbarEdge === "top"
+    ? pointer.y <= area.y + threshold
+    : taskbarEdge === "left"
+    ? pointer.x <= area.x + threshold
+    : taskbarEdge === "right"
+    ? pointer.x >= area.x + area.width - threshold
+    : pointer.y >= area.y + area.height - threshold;
+  const bounds = windowRef.getBounds();
+  const visible = USE_STABLE_DESKTOP_SURFACE && windowShapeBounds
+    ? windowShapeBounds
+    : { x: 0, y: 0, width: bounds.width, height: bounds.height };
+  const visibleCenterX = bounds.x + visible.x + visible.width / 2;
+  return {
+    kind: nearTaskbar ? "dock" : "desktop",
+    direction: pointer.x < visibleCenterX ? "left" : "right"
+  };
+}
+
+ipcMain.on("pulse:drag-end", (event, point) => {
+  const didMove = point?.moved === true;
+  const encountered = dragState
+    ? {
+        kind: dragState.encounterKind,
+        direction: dragState.encounterDirection
+      }
+    : null;
+  dragState = null;
+  if (!didMove
+      || !windowRef
+      || windowRef.isDestroyed()
+      || event.sender !== windowRef.webContents) return;
+  const finalDrop = classifyManualPetDrop(point);
+  const drop = finalDrop && encountered?.kind
+    ? {
+        ...finalDrop,
+        kind: encountered.kind,
+        direction: encountered.direction || finalDrop.direction
+      }
+    : finalDrop;
+  if (drop) windowRef.webContents.send("pulse:pet-drop", drop);
+});
 ipcMain.on("pulse:quit", () => { app.isQuitting = true; app.quit(); });
 
 app.whenReady().then(() => {
   app.setAppUserModelId("com.codexpulse.windows");
+  session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
+    void desktopCapturer.getSources({
+      types: ["screen"],
+      thumbnailSize: { width: 0, height: 0 }
+    }).then((sources) => {
+      if (!sources.length) {
+        callback({});
+        return;
+      }
+      const bounds = windowRef && !windowRef.isDestroyed()
+        ? windowRef.getBounds()
+        : screen.getPrimaryDisplay().bounds;
+      const display = screen.getDisplayMatching(bounds);
+      const displayId = String(display.id);
+      const source = sources.find((candidate) =>
+        String(candidate.display_id || "") === displayId
+        || String(candidate.id || "").split(":")[1] === displayId
+      ) || sources[0];
+      callback({ video: source });
+    }).catch(() => callback({}));
+  }, { useSystemPicker: false });
   armLocalUsageDayTimer();
   powerMonitor.on("resume", () => {
     void handleLocalUsageDayBoundary(new Date()).finally(() => armLocalUsageDayTimer());
     triggerAutomaticUpdateCheck(true);
+    if (windowRef && !windowRef.isDestroyed()) {
+      windowRef.webContents.send("pulse:system-resume");
+    }
   });
   powerMonitor.on("unlock-screen", () => triggerAutomaticUpdateCheck(true));
   initializeInformationBar();
@@ -2928,6 +3407,7 @@ app.on("browser-window-focus", () => triggerAutomaticUpdateCheck(false));
 
 app.on("before-quit", () => {
   app.isQuitting = true;
+  cancelPetRoamAnimation();
   clearTimeout(refreshTimer);
   clearTimeout(localUsageDayTimer);
   clearTimeout(weatherRefreshTimer);

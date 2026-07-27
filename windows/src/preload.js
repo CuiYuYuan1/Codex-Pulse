@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("pulse", {
   getState: () => ipcRenderer.invoke("pulse:get-state"),
@@ -27,7 +27,10 @@ contextBridge.exposeInMainWorld("pulse", {
       return ipcRenderer.invoke("pulse:resize", {
         mode: String(mode.mode || "collapsed"),
         width: Number(mode.width),
-        informationEnabled: mode.informationEnabled === true
+        informationEnabled: mode.informationEnabled === true,
+        petScale: Number(mode.petScale),
+        petCharacter: String(mode.petCharacter || ""),
+        conversationExpanded: mode.conversationExpanded === true
       });
     }
     return ipcRenderer.invoke(
@@ -37,7 +40,37 @@ contextBridge.exposeInMainWorld("pulse", {
   },
   beginDrag: (x, y) => ipcRenderer.send("pulse:drag-begin", { x, y }),
   dragTo: (x, y) => ipcRenderer.send("pulse:drag-move", { x, y }),
-  endDrag: () => ipcRenderer.send("pulse:drag-end"),
+  endDrag: (x, y, moved = false) => ipcRenderer.send("pulse:drag-end", {
+    x: Number(x),
+    y: Number(y),
+    moved: moved === true
+  }),
+  planPetRoam: (options) => ipcRenderer.invoke("pulse:pet-roam-plan", {
+    forceInteraction: options?.forceInteraction === true
+  }),
+  runPetRoam: (plan) => ipcRenderer.invoke("pulse:pet-roam-run", {
+    x: Number(plan?.x),
+    y: Number(plan?.y),
+    duration: Number(plan?.duration),
+    arcHeight: Number(plan?.arcHeight)
+  }),
+  cancelPetRoam: () => ipcRenderer.send("pulse:pet-roam-cancel"),
+  setBlackHoleCaptureMode: (enabled) => ipcRenderer.invoke(
+    "pulse:set-black-hole-capture-mode",
+    enabled === true
+  ),
+  getBlackHoleCaptureGeometry: () => ipcRenderer.invoke(
+    "pulse:get-black-hole-capture-geometry"
+  ),
+  trashBlackHoleFiles: (files) => {
+    const paths = Array.from(files || [], (file) => webUtils.getPathForFile(file))
+      .filter(Boolean);
+    return ipcRenderer.invoke("pulse:black-hole-trash-files", paths);
+  },
+  showPetSwitchMenu: (current) => ipcRenderer.invoke(
+    "pulse:show-pet-switch-menu",
+    String(current || "")
+  ),
   quit: () => ipcRenderer.send("pulse:quit"),
   onState: (callback) => {
     const listener = (_event, state) => callback(state);
@@ -53,5 +86,20 @@ contextBridge.exposeInMainWorld("pulse", {
     const listener = () => callback();
     ipcRenderer.on("pulse:expand", listener);
     return () => ipcRenderer.removeListener("pulse:expand", listener);
+  },
+  onPetDrop: (callback) => {
+    const listener = (_event, drop) => callback(drop);
+    ipcRenderer.on("pulse:pet-drop", listener);
+    return () => ipcRenderer.removeListener("pulse:pet-drop", listener);
+  },
+  onBlackHoleCaptureGeometry: (callback) => {
+    const listener = (_event, geometry) => callback(geometry);
+    ipcRenderer.on("pulse:black-hole-capture-geometry", listener);
+    return () => ipcRenderer.removeListener("pulse:black-hole-capture-geometry", listener);
+  },
+  onSystemResume: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on("pulse:system-resume", listener);
+    return () => ipcRenderer.removeListener("pulse:system-resume", listener);
   }
 });

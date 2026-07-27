@@ -1,5 +1,39 @@
 import Foundation
+import Security
 import SQLite3
+
+/// Only touch the App Group container when the current executable is actually
+/// signed with that entitlement. Local unsigned/ad-hoc builds otherwise make
+/// macOS treat the existing group as another app's private data and repeatedly
+/// show an access prompt. The result is cached so a denied/unavailable group is
+/// never probed again during the same launch.
+private enum CodexDataContainer {
+    static let appGroupURL: URL? = {
+        guard let task = SecTaskCreateFromSelf(nil),
+              let entitlement = SecTaskCopyValueForEntitlement(
+                task,
+                "com.apple.security.application-groups" as CFString,
+                nil
+              ) as? [String],
+              entitlement.contains(AppConstants.appGroupID) else {
+            return nil
+        }
+        return FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: AppConstants.appGroupID
+        )
+    }()
+
+    static let applicationSupportURL: URL? = {
+        guard let support = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first?.appendingPathComponent("CodexPulse", isDirectory: true) else {
+            return nil
+        }
+        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        return support
+    }()
+}
 
 /// App Group 共享快照，供主 App 与 Widget 读写
 final class SnapshotStore: Sendable {
@@ -9,24 +43,12 @@ final class SnapshotStore: Sendable {
     /// 编码 + 写盘在后台串行队列执行，避免阻塞主线程。
     private let ioQueue = DispatchQueue(label: "com.codexpulse.snapshot-io", qos: .utility)
 
-    private var containerURL: URL? {
-        FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: AppConstants.appGroupID
-        )
-    }
-
     private var snapshotURL: URL? {
-        // 开发时若无 App Group，回退到 Application Support
-        if let containerURL {
+        // 未签名开发构建没有 App Group 权限，直接使用自己的 Application Support。
+        if let containerURL = CodexDataContainer.appGroupURL {
             return containerURL.appendingPathComponent(fileName)
         }
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("CodexPulse", isDirectory: true)
-        if let support {
-            try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-            return support.appendingPathComponent(fileName)
-        }
-        return nil
+        return CodexDataContainer.applicationSupportURL?.appendingPathComponent(fileName)
     }
 
     func save(_ snapshot: PulseSnapshot, synchronous: Bool = false) {
@@ -64,19 +86,11 @@ final class TaskHistoryStore: @unchecked Sendable {
     private var lastRateSamplePrunedAt: Date = .distantPast
 
     private var databaseURL: URL? {
-        if let container = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: AppConstants.appGroupID
-        ) {
+        if let container = CodexDataContainer.appGroupURL {
             return container.appendingPathComponent(AppConstants.historyDBName)
         }
-        guard let support = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first?.appendingPathComponent("CodexPulse", isDirectory: true) else {
-            return nil
-        }
-        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-        return support.appendingPathComponent(AppConstants.historyDBName)
+        return CodexDataContainer.applicationSupportURL?
+            .appendingPathComponent(AppConstants.historyDBName)
     }
 
     func persistAndMerge(
@@ -656,7 +670,7 @@ final class TaskHistoryStore: @unchecked Sendable {
             sqlite3_bind_null(statement, index)
             return
         }
-        value.withCString { pointer in
+        _ = value.withCString { pointer in
             sqlite3_bind_text(statement, index, pointer, -1, sqliteTransient)
         }
     }

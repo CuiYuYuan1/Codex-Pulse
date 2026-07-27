@@ -8,6 +8,7 @@ const isFullQuota = fixture === "full";
 const isActual = fixture === "actual";
 const isInformationRegression = fixture === "api-126k";
 const isUpdateAvailable = fixture === "update";
+const isPetRoamFixture = fixture === "pet-roam";
 const isAlmostFullQuota = fixture === "almost-full" || isActual;
 const isZeroToken = fixture === "zero" || isActual;
 const weatherFixtureName = isActual ? "thunder" : isInformationRegression ? "rain" : isAPIKey ? fixture.slice(4) : fixture;
@@ -101,11 +102,21 @@ contextBridge.exposeInMainWorld("pulse", {
     ipcRenderer.on("pulse:expand", listener);
     return () => ipcRenderer.removeListener("pulse:expand", listener);
   },
+  onPetDrop: (callback) => {
+    const listener = (_event, drop) => callback(drop);
+    ipcRenderer.on("pulse:pet-drop", listener);
+    return () => ipcRenderer.removeListener("pulse:pet-drop", listener);
+  },
   resize: (mode) => ipcRenderer.invoke("visual:resize", mode),
   setWindowShape: (rects) => ipcRenderer.invoke("visual:set-shape", rects),
   beginDrag: noop,
   dragTo: noop,
   endDrag: noop,
+  planPetRoam: async () => isPetRoamFixture
+    ? { x: 120, y: 120, direction: "left", distance: 88, kind: "desktop" }
+    : null,
+  runPetRoam: async () => ({ cancelled: !isPetRoamFixture }),
+  cancelPetRoam: noop,
   refresh: noop,
   checkForUpdates: async () => state.appUpdate,
   performUpdate: async () => {

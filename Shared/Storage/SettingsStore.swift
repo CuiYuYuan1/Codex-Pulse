@@ -63,6 +63,8 @@ enum PetCharacter: String, Codable, CaseIterable, Identifiable, Sendable {
     case bunny
     case ghost
     case robot
+    case fox
+    case blackHole = "black_hole"
 
     var id: String { rawValue }
 
@@ -73,6 +75,8 @@ enum PetCharacter: String, Codable, CaseIterable, Identifiable, Sendable {
         case .bunny: return "兔子"
         case .ghost: return "幽灵"
         case .robot: return "机器人"
+        case .fox: return "九尾狐"
+        case .blackHole: return "事件视界"
         }
     }
 }

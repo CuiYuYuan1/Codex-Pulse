@@ -17,14 +17,16 @@ function wait(milliseconds) {
 ipcMain.handle("visual:resize", (event, mode) => {
   const window = BrowserWindow.fromWebContents(event.sender);
   if (!window || window.isDestroyed()) return null;
+  window.visualResizeRequest = mode;
   const adaptiveRequest = mode && typeof mode === "object";
   const resolvedMode = adaptiveRequest ? mode.mode : mode;
   if (adaptiveRequest && resolvedMode === "collapsed" && Number.isFinite(Number(mode.width))) {
     window.visualCollapsedWidth = Math.max(283, Math.min(471, Math.round(Number(mode.width))));
     window.visualInformationEnabled = mode.informationEnabled === true;
   }
-  // Production Windows keeps one DirectComposition surface in every mode;
-  // only the native hit-test shape changes between full and mini layouts.
+  // Most visual fixtures retain a stable canvas so their screenshots remain
+  // directly comparable. Individual tests still inspect the exact adaptive
+  // resize request that production receives.
   const target = { width: 390, height: 810 };
   const old = window.getBounds();
   const area = screen.getDisplayMatching(old).workArea;
@@ -346,18 +348,37 @@ async function captureMini(style, taskMode = null, activityStyle = null, theme =
     );
     ${taskMode ? `render({ ...currentState, task: { state: "${taskMode}", label: "${taskMode === "attention" ? "等待授权" : "思考中"}", startedAt: Date.now() } });` : ""}
   `, true);
-  await wait(650);
+  if (pet === "fox" && taskMode === "working" && !activityStyle && !theme) {
+    await wait(220);
+    const bridgeImage = await window.webContents.capturePage();
+    fs.writeFileSync(
+      path.join(outputDirectory, "mini-fox-idle-to-working-bridge@2x.png"),
+      bridgeImage.toPNG()
+    );
+    await wait(430);
+  } else {
+    await wait(650);
+  }
   const expectedDisplayFrames = {
     dino: [126, 23, 76, 34],
     cat: [123, 17, 81, 36],
     bunny: [122, 21, 82, 34],
     ghost: [125, 17, 79, 36],
-    robot: [122, 21, 82, 34]
+    robot: [122, 21, 82, 34],
+    fox: [124, 19, 80, 34]
   };
   const [displayX, displayY, displayWidth, displayHeight] = expectedDisplayFrames[pet];
   const petLayout = await window.webContents.executeJavaScript(`(() => {
     const capsule = document.getElementById('miniCapsule').getBoundingClientRect();
-    const animation = document.getElementById('petAnimation');
+    const animations = [
+      document.getElementById('petAnimation'),
+      document.getElementById('petAnimationNext')
+    ];
+    const rasterAnimation = animations.find((candidate) =>
+      candidate.getAttribute('src') && Number.parseFloat(getComputedStyle(candidate).opacity) > .5
+    ) || animations.find((candidate) => candidate.getAttribute('src')) || animations[0];
+    const catCanvas = document.getElementById('petCatCanvas');
+    const animation = catCanvas;
     const image = animation.getBoundingClientRect();
     const value = document.getElementById('miniValue').getBoundingClientRect();
     return {
@@ -367,23 +388,34 @@ async function captureMini(style, taskMode = null, activityStyle = null, theme =
       imageDY: image.top - capsule.top,
       imageWidth: image.width,
       imageHeight: image.height,
-      naturalWidth: animation.naturalWidth,
-      naturalHeight: animation.naturalHeight,
+      naturalWidth: animation.naturalWidth || animation.width,
+      naturalHeight: animation.naturalHeight || animation.height,
       valueDisplay: getComputedStyle(document.getElementById('miniValue')).display,
+      valueOpacity: Number.parseFloat(getComputedStyle(document.getElementById('miniValue')).opacity),
       valueX: value.left - capsule.left,
       valueY: value.top - capsule.top,
       valueWidth: value.width,
       valueHeight: value.height,
-      source: animation.getAttribute('src')
+      source: "procedural",
+      proceduralState: catCanvas.dataset.state || ""
     };
   })()`, true);
-  const expectedPetStates = taskMode === "attention" ? ["auth"] : taskMode === "working" ? ["typing", "scratch"] : ["idle"];
+  const expectedPetStates = taskMode === "attention"
+    ? ["waiting_auth", "waiting"]
+    : taskMode === "working"
+      ? ["running", "thinking"]
+      : ["idle", "curious", "grooming", "stretch", "sleeping", "wave", "hop"];
+  const expectedPetSource = petLayout.source === "procedural"
+    && expectedPetStates.includes(petLayout.proceduralState);
+  const transientMonitorPet = pet === "cat" || pet === "fox";
   const idleMonitorInvalid = !taskMode && (
-    petLayout.valueDisplay === "none"
-      || Math.abs(petLayout.valueX - displayX) > 0.25
-      || Math.abs(petLayout.valueY - displayY) > 0.25
-      || Math.abs(petLayout.valueWidth - displayWidth) > 0.25
-      || Math.abs(petLayout.valueHeight - displayHeight) > 0.25
+    transientMonitorPet
+      ? petLayout.valueOpacity > 0.05
+      : petLayout.valueDisplay === "none"
+        || Math.abs(petLayout.valueX - displayX) > 0.25
+        || Math.abs(petLayout.valueY - displayY) > 0.25
+        || Math.abs(petLayout.valueWidth - displayWidth) > 0.25
+        || Math.abs(petLayout.valueHeight - displayHeight) > 0.25
   );
   if (Math.abs(petLayout.width - 216) > 0.25
       || Math.abs(petLayout.height - 129.6) > 0.25
@@ -393,10 +425,25 @@ async function captureMini(style, taskMode = null, activityStyle = null, theme =
       || Math.abs(petLayout.imageHeight - 129.6) > 0.25
       || petLayout.naturalWidth !== 480
       || petLayout.naturalHeight !== 288
-      || !expectedPetStates.some((state) => petLayout.source.endsWith(`codex_${pet}_v2_${state}.gif`))
+      || !expectedPetSource
       || (taskMode && petLayout.valueDisplay === "none")
+      || (taskMode && petLayout.valueOpacity < 0.95)
       || idleMonitorInvalid) {
     throw new Error(`pet mini layout/state mismatch: ${JSON.stringify({ style, taskMode, ...petLayout })}`);
+  }
+  if (pet === "cat") {
+    const firstFrame = await window.webContents.executeJavaScript(
+      `document.getElementById("petCatCanvas").toDataURL()`,
+      true
+    );
+    await wait(140);
+    const nextFrame = await window.webContents.executeJavaScript(
+      `document.getElementById("petCatCanvas").toDataURL()`,
+      true
+    );
+    if (firstFrame === nextFrame) {
+      throw new Error(`procedural cat did not advance continuously: ${JSON.stringify({ style, taskMode })}`);
+    }
   }
   if (taskMode && pet === "dino" && !activityStyle && !theme) {
     const activeQuota = await window.webContents.executeJavaScript(`(() => {
@@ -432,6 +479,223 @@ async function captureMini(style, taskMode = null, activityStyle = null, theme =
       throw new Error(`idle mini single click did not cycle its display: ${JSON.stringify(interaction)}`);
     }
   }
+}
+
+async function assertPetDesktopInteraction() {
+  const window = new BrowserWindow({
+    width: 390,
+    height: 810,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    resizable: false,
+    webPreferences: {
+      preload: path.join(__dirname, "visual-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      additionalArguments: ["--fixture=pet-roam"]
+    }
+  });
+  captureWindows.push(window);
+
+  await window.loadFile(path.resolve(__dirname, "../src/renderer/index.html"));
+  await wait(250);
+  await window.webContents.executeJavaScript(`
+    Math.random = () => 0;
+    document.querySelector('#petCharacterMenu [data-value="fox"]').click();
+    document.getElementById("capsule").dispatchEvent(
+      new MouseEvent("dblclick", { button: 0, bubbles: true })
+    );
+  `, true);
+  await wait(5300);
+  const interaction = await window.webContents.executeJavaScript(`(() => {
+    const canvas = document.getElementById("petCatCanvas");
+    return {
+      isMini: document.documentElement.classList.contains("mini-mode"),
+      state: canvas.dataset.state || "",
+      width: canvas.getBoundingClientRect().width,
+      height: canvas.getBoundingClientRect().height
+    };
+  })()`, true);
+  if (!interaction.isMini
+      || interaction.state !== "pawing"
+      || Math.abs(interaction.width - 216) > .25
+      || Math.abs(interaction.height - 129.6) > .25) {
+    throw new Error(`desktop interaction choreography did not become visible: ${JSON.stringify(interaction)}`);
+  }
+  const image = await window.webContents.capturePage();
+  fs.writeFileSync(path.join(outputDirectory, "mini-fox-desktop-pawing@2x.png"), image.toPNG());
+
+  window.webContents.send("pulse:pet-drop", { kind: "dock", direction: "right" });
+  await wait(1100);
+  const manualDock = await window.webContents.executeJavaScript(`(() => {
+    const canvas = document.getElementById("petCatCanvas");
+    return {
+      state: canvas.dataset.state || "",
+      facesLeft: canvas.dataset.facesLeft || ""
+    };
+  })()`, true);
+  if (manualDock.state !== "pouncing" || manualDock.facesLeft === "true") {
+    throw new Error(`manual taskbar drop did not start dock interaction: ${JSON.stringify(manualDock)}`);
+  }
+
+  const wakeStarted = await window.webContents.executeJavaScript(`(() => {
+    cancelPetRoam();
+    catIdleState = "sleeping";
+    catIdleStateUntil = Date.now() + 10000;
+    petRoamingState = "sleeping";
+    proceduralCat.setState("sleeping");
+    return {
+      consumed: wakeSleepingPetFromClick(),
+      state: document.getElementById("petCatCanvas").dataset.state || ""
+    };
+  })()`, true);
+  if (!wakeStarted.consumed || wakeStarted.state !== "stretch") {
+    throw new Error(`sleeping pet did not enter click-to-wake stretch: ${JSON.stringify(wakeStarted)}`);
+  }
+  await wait(2100);
+  const heldStretch = await window.webContents.executeJavaScript(
+    `document.getElementById("petCatCanvas").dataset.state || ""`,
+    true
+  );
+  if (heldStretch !== "stretch") {
+    throw new Error(`click-to-wake stretch ended before two seconds: ${heldStretch}`);
+  }
+  await wait(650);
+  const wokeState = await window.webContents.executeJavaScript(
+    `document.getElementById("petCatCanvas").dataset.state || ""`,
+    true
+  );
+  if (wokeState !== "idle") {
+    throw new Error(`click-to-wake stretch did not settle naturally: ${wokeState}`);
+  }
+  window.destroy();
+}
+
+async function assertFootstepImpactEffect() {
+  const window = new BrowserWindow({
+    width: 390,
+    height: 810,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    resizable: false,
+    webPreferences: {
+      preload: path.join(__dirname, "visual-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      additionalArguments: ["--fixture=pet-roam"]
+    }
+  });
+  captureWindows.push(window);
+
+  await window.loadFile(path.resolve(__dirname, "../src/renderer/index.html"));
+  await wait(250);
+  await window.webContents.executeJavaScript(`
+    document.querySelector('#petCharacterMenu [data-value="cat"]').click();
+    document.getElementById("capsule").dispatchEvent(
+      new MouseEvent("dblclick", { button: 0, bubbles: true })
+    );
+  `, true);
+  await wait(850);
+  const baseline = await window.webContents.executeJavaScript(`(() => {
+    cancelPetRoam();
+    petRoamingState = "idle";
+    proceduralCat.setState("idle");
+    const canvas = document.getElementById("petCatCanvas");
+    const pixels = canvas.getContext("2d").getImageData(0, 222, 30, 55).data;
+    return Array.from(pixels).filter((_, index) => index % 4 === 3 && pixels[index] > 8).length;
+  })()`, true);
+  const impactGeometry = await window.webContents.executeJavaScript(`(() => {
+    const canvas = document.getElementById("petCatCanvas");
+    const context = canvas.getContext("2d");
+    proceduralCat.renderFootstepImpactForQA(.09);
+    const pixels = context.getImageData(150, 218, 120, 62).data;
+    return {
+      visiblePixels: Array.from(pixels)
+        .filter((_, index) => index % 4 === 3 && pixels[index] > 12).length
+    };
+  })()`, true);
+  if (impactGeometry.visiblePixels < 220) {
+    throw new Error(`footstep contact decal was not visible: ${JSON.stringify(impactGeometry)}`);
+  }
+  fs.writeFileSync(
+    path.join(outputDirectory, "footstep-impact-geometry.json"),
+    JSON.stringify(impactGeometry, null, 2)
+  );
+  await window.webContents.executeJavaScript(`
+    proceduralCat.setFacesLeft(false);
+    proceduralCat.renderFrameForQA("walk_right", ${1 / 1.12 / 2 - 0.01});
+  `, true);
+  await wait(30);
+  const beforeImpactImage = await window.webContents.capturePage();
+  fs.writeFileSync(
+    path.join(outputDirectory, "mini-cat-footstep-before-contact@2x.png"),
+    beforeImpactImage.toPNG()
+  );
+  await window.webContents.executeJavaScript(`
+    proceduralCat.renderFrameForQA("walk_right", ${1 / 1.12 / 2 + 0.09});
+  `, true);
+  await wait(30);
+  const impact = await window.webContents.executeJavaScript(`(() => {
+    const canvas = document.getElementById("petCatCanvas");
+    const pixels = canvas.getContext("2d").getImageData(0, 222, 30, 55).data;
+    return {
+      state: canvas.dataset.state || "",
+      visiblePixels: Array.from(pixels)
+        .filter((_, index) => index % 4 === 3 && pixels[index] > 8).length
+    };
+  })()`, true);
+  if (impact.state !== "walk_right" || impact.visiblePixels <= baseline + 8) {
+    throw new Error(`walking footstep impact was not visible behind the pet: ${JSON.stringify({ baseline, impact })}`);
+  }
+  const compressedImage = await window.webContents.capturePage();
+  fs.writeFileSync(
+    path.join(outputDirectory, "mini-cat-footstep-contact@2x.png"),
+    compressedImage.toPNG()
+  );
+  await window.webContents.executeJavaScript(`
+    proceduralCat.renderFrameForQA("walk_right", ${1 / 1.12 / 2 + 0.27});
+  `, true);
+  await wait(30);
+  const fracturedImage = await window.webContents.capturePage();
+  fs.writeFileSync(
+    path.join(outputDirectory, "mini-cat-footstep-settle@2x.png"),
+    fracturedImage.toPNG()
+  );
+  await window.webContents.executeJavaScript(`
+    proceduralCat.setVisible(false);
+    proceduralCat.setVisible(true);
+    proceduralCat.setState("walk_right");
+  `, true);
+  const frameStats = await window.webContents.executeJavaScript(`new Promise((resolve) => {
+    const samples = [];
+    let previous = performance.now();
+    const tick = (now) => {
+      samples.push(now - previous);
+      previous = now;
+      if (samples.length < 72) {
+        requestAnimationFrame(tick);
+        return;
+      }
+      const sorted = samples.slice(8).sort((left, right) => left - right);
+      resolve({
+        frameCount: samples.length,
+        p95: sorted[Math.floor(sorted.length * .95)] || 0
+      });
+    };
+    requestAnimationFrame(tick);
+  })`, true);
+  if (frameStats.frameCount < 72 || frameStats.p95 > 28) {
+    throw new Error(`walking footstep effect missed the smooth-frame budget: ${JSON.stringify(frameStats)}`);
+  }
+  fs.writeFileSync(
+    path.join(outputDirectory, "mini-cat-footstep-impact@2x.png"),
+    compressedImage.toPNG()
+  );
+  window.destroy();
 }
 
 async function assertLiveTokenRoll() {
@@ -615,7 +879,7 @@ async function assertTaskConversationIsland() {
       || collapsed.leftInset < 8.5 || collapsed.rightInset < 8.5
       || collapsed.copyCenterDelta > .75
       || Math.abs(collapsed.capsuleWidth - 275) > .5) {
-    throw new Error(`task stream strip did not preserve weather size: ${JSON.stringify({ weatherStripSize, collapsed })}`);
+    throw new Error(`task stream strip changed size before click: ${JSON.stringify({ weatherStripSize, collapsed })}`);
   }
   fs.writeFileSync(
     path.join(outputDirectory, "task-information-stream-collapsed@2x.png"),
@@ -630,13 +894,16 @@ async function assertTaskConversationIsland() {
     return {
       scaleX: matrix.a,
       scaleY: matrix.d,
-      originScaleX: parseFloat(detail.style.getPropertyValue("--conversation-origin-scale-x")),
-      originScaleY: parseFloat(detail.style.getPropertyValue("--conversation-origin-scale-y"))
+      translateY: matrix.f,
+      backdropFilter: getComputedStyle(detail).backdropFilter
     };
   })()`, true);
-  if (!(morphing.scaleX > morphing.originScaleX && morphing.scaleX < .999)
-      || !(morphing.scaleY > morphing.originScaleY && morphing.scaleY < .999)) {
-    throw new Error(`task conversation skipped the outward morph: ${JSON.stringify(morphing)}`);
+  if (Math.abs(morphing.scaleX - 1) > .001
+      || Math.abs(morphing.scaleY - 1) > .001
+      || morphing.translateY < -6.01
+      || morphing.translateY > .01
+      || morphing.backdropFilter !== "none") {
+    throw new Error(`task conversation restored a scaled glass layer: ${JSON.stringify(morphing)}`);
   }
   await wait(290);
   const opened = await window.webContents.executeJavaScript(`(() => {
@@ -649,20 +916,17 @@ async function assertTaskConversationIsland() {
       expanded: document.getElementById("informationStrip").getAttribute("aria-expanded"),
       width: rect.width,
       height: rect.height,
-      islandTopDelta: Math.abs(rect.top - strip.top),
+      islandGap: rect.top - strip.bottom,
       stripWidth: strip.width,
-      originScaleX: parseFloat(detail.style.getPropertyValue("--conversation-origin-scale-x")),
-      originScaleY: parseFloat(detail.style.getPropertyValue("--conversation-origin-scale-y")),
       messages: document.querySelectorAll(".conversation-message").length
     };
   })()`, true);
   if (opened.hidden || !opened.open || opened.expanded !== "true"
       || Math.abs(opened.width - 342) > .5 || Math.abs(opened.height - 270) > .5
-      || Math.abs(opened.stripWidth - 342) > .5 || opened.islandTopDelta > .5
-      || Math.abs(opened.originScaleX - collapsed.stripWidth / 342) > .001
-      || Math.abs(opened.originScaleY - collapsed.stripHeight / 270) > .001
+      || Math.abs(opened.stripWidth - 342) > .5
+      || Math.abs(opened.islandGap - 6) > .5
       || opened.messages !== 2) {
-    throw new Error(`task conversation did not expand like an island: ${JSON.stringify(opened)}`);
+    throw new Error(`task conversation did not open as one non-overlapping surface: ${JSON.stringify(opened)}`);
   }
   fs.writeFileSync(
     path.join(outputDirectory, "task-information-island@2x.png"),
@@ -753,7 +1017,7 @@ async function captureSettingsAndAssertMiniPicker() {
     }, 280);
   })`, true);
   if (result.hidden || result.display === "none" || result.height < 28 || !result.inside || !result.label
-      || result.petDisplay === "none" || !result.petInside || result.petLabel !== "小恐龙"
+      || result.petDisplay === "none" || !result.petInside || !result.petLabel
       || !result.updateRowRemoved) {
     throw new Error(`mini settings picker is not visible: ${JSON.stringify(result)}`);
   }
@@ -987,6 +1251,14 @@ async function assertPointerDoubleClickMinimizes() {
   captureWindows.push(window);
   await window.loadFile(path.resolve(__dirname, "../src/renderer/index.html"));
   await wait(250);
+  // User preferences persist between BrowserWindows in one Electron session;
+  // keep this geometry test deterministic even when the local app currently
+  // uses the taller black-hole companion.
+  await window.webContents.executeJavaScript(
+    `document.querySelector('#petCharacterMenu [data-value="dino"]').click()`,
+    true
+  );
+  await wait(80);
   const click = (clickCount, x = 195, y = 46) => {
     window.webContents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount });
     window.webContents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount });
@@ -1116,6 +1388,7 @@ async function assertPointerDoubleClickMinimizes() {
       pet: { left: pet.left, top: pet.top, width: pet.width, height: pet.height }
     };
   })()`, true);
+  const expandedResizeRequest = window.visualResizeRequest;
   const petDrift = Math.max(
     Math.abs(expandedFromMini.pet.left - petBeforeConversation.left),
     Math.abs(expandedFromMini.pet.top - petBeforeConversation.top),
@@ -1129,8 +1402,10 @@ async function assertPointerDoubleClickMinimizes() {
       || !expandedFromMini.conversationOpen
       || Math.abs(expandedFromMini.conversationWidth - 342) > .5
       || expandedFromMini.messages !== 2
+      || expandedResizeRequest?.mode !== "mini"
+      || expandedResizeRequest?.conversationExpanded !== true
       || petDrift > .75) {
-    throw new Error(`mini conversation did not keep the pet anchored: ${JSON.stringify({ ...expandedFromMini, petDrift })}`);
+    throw new Error(`mini conversation did not keep the pet anchored: ${JSON.stringify({ ...expandedFromMini, expandedResizeRequest, petDrift })}`);
   }
   fs.writeFileSync(
     path.join(outputDirectory, "mini-pet-conversation-island@2x.png"),
@@ -1144,8 +1419,13 @@ async function assertPointerDoubleClickMinimizes() {
     miniConversation: document.documentElement.classList.contains('mini-conversation-expanded'),
     conversationHidden: document.getElementById('conversationDetail').hidden
   })`, true);
-  if (!collapsedConversation.isMini || collapsedConversation.miniConversation || !collapsedConversation.conversationHidden) {
-    throw new Error(`second mini single click did not retract conversation: ${JSON.stringify(collapsedConversation)}`);
+  const collapsedResizeRequest = window.visualResizeRequest;
+  if (!collapsedConversation.isMini
+      || collapsedConversation.miniConversation
+      || !collapsedConversation.conversationHidden
+      || collapsedResizeRequest?.mode !== "mini"
+      || collapsedResizeRequest?.conversationExpanded !== false) {
+    throw new Error(`second mini single click did not retract conversation: ${JSON.stringify({ collapsedConversation, collapsedResizeRequest })}`);
   }
 }
 
@@ -1343,6 +1623,19 @@ app.whenReady().then(async () => {
   // the gap before the next fixture starts loading.
   const keeperWindow = new BrowserWindow({ width: 1, height: 1, show: false });
   captureWindows.push(keeperWindow);
+  if (process.argv.includes("--footstep-only")) {
+    await assertFootstepImpactEffect();
+    captureWindows.forEach((window) => { if (!window.isDestroyed()) window.destroy(); });
+    app.quit();
+    return;
+  }
+  if (process.argv.includes("--conversation-only")) {
+    await assertTaskConversationIsland();
+    await assertPointerDoubleClickMinimizes();
+    captureWindows.forEach((window) => { if (!window.isDestroyed()) window.destroy(); });
+    app.quit();
+    return;
+  }
   for (const fixture of fixtures) await captureFixture(fixture);
   if ((collapsedWidths.get("large-token") || 0) < (collapsedWidths.get("zero") || 0)) {
     throw new Error(`Token width made the information capsule shrink: ${JSON.stringify(Object.fromEntries(collapsedWidths))}`);
@@ -1367,11 +1660,13 @@ app.whenReady().then(async () => {
   for (const style of ["quota", "tokens", "status", "weather", "time"]) {
     await captureMini(style);
   }
-  for (const pet of ["cat", "bunny", "ghost", "robot"]) {
+  for (const pet of ["cat", "bunny", "ghost", "robot", "fox"]) {
     await captureMini("quota", null, null, null, pet);
     await captureMini("quota", "working", null, null, pet);
     await captureMini("quota", "attention", null, null, pet);
   }
+  await assertPetDesktopInteraction();
+  await assertFootstepImpactEffect();
   await captureMini("quota", "working");
   await captureMini("quota", "attention");
   await captureMini("quota", "working", "classic", "classic");

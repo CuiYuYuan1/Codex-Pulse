@@ -1,0 +1,427 @@
+// Event Horizon pet renderer (compiled at runtime so the app build does not require the optional Metal Toolchain).
+// Adapted from tiyda/blackhole-desktop and s0xDk/ghostty-blackhole (MIT).
+// See THIRD_PARTY_NOTICES.md.
+
+#include <metal_stdlib>
+using namespace metal;
+
+struct BlackHolePetParams {
+    float2 resolution;
+    float2 captureOrigin;
+    float2 captureSize;
+    float time;
+};
+
+struct BlackHolePetVertexOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+struct BlackHolePreset {
+    float diskTemp;
+    float diskIncl;
+    float diskRoll;
+    float diskInner;
+    float diskOuter;
+    float diskOpacity;
+    float dopplerMix;
+    float diskBeam;
+    float diskGain;
+    float diskContrast;
+    float diskWind;
+    float diskSpeed;
+    float starGain;
+    float exposure;
+};
+
+BlackHolePreset blackHolePresetAt(int index) {
+    switch (index) {
+        case 1: return {4500.0, 1.52, 0.10, 2.2, 7.0, 0.85, 0.35, 2.0, 1.4, 0.5, 7.0, 5.0, 0.0, 1.20};
+        case 2: return {3800.0, 0.55, -0.30, 2.2, 6.0, 0.45, 0.90, 3.5, 1.6, 0.4, 3.0, 2.5, 0.0, 1.10};
+        case 3: return {6500.0, 0.30, 0.00, 3.0, 10.0, 0.50, 0.80, 2.5, 1.0, 1.1, 7.0, 5.0, 0.0, 1.00};
+        case 4: return {15000.0, 1.30, 0.35, 3.0, 14.0, 0.35, 1.00, 4.0, 1.2, 1.3, 8.0, 5.0, 0.0, 0.80};
+        case 5: return {18000.0, 1.05, 0.55, 3.0, 16.0, 0.30, 1.00, 5.0, 1.0, 1.5, 9.0, 6.0, 0.0, 0.75};
+        case 6: return {5500.0, 1.50, 0.35, 1.8, 8.0, 0.00, 1.00, 2.5, 0.0, 1.6, 7.0, 5.0, 0.6, 1.00};
+        default: return {5500.0, 1.50, 0.35, 1.8, 8.0, 0.90, 0.60, 2.5, 2.2, 1.6, 7.0, 5.0, 0.0, 1.40};
+    }
+}
+
+BlackHolePreset blackHoleMixPreset(
+    BlackHolePreset a,
+    BlackHolePreset b,
+    float amount
+) {
+    BlackHolePreset result;
+    result.diskTemp = mix(a.diskTemp, b.diskTemp, amount);
+    result.diskIncl = mix(a.diskIncl, b.diskIncl, amount);
+    result.diskRoll = mix(a.diskRoll, b.diskRoll, amount);
+    result.diskInner = mix(a.diskInner, b.diskInner, amount);
+    result.diskOuter = mix(a.diskOuter, b.diskOuter, amount);
+    result.diskOpacity = mix(a.diskOpacity, b.diskOpacity, amount);
+    result.dopplerMix = mix(a.dopplerMix, b.dopplerMix, amount);
+    result.diskBeam = mix(a.diskBeam, b.diskBeam, amount);
+    result.diskGain = mix(a.diskGain, b.diskGain, amount);
+    result.diskContrast = mix(a.diskContrast, b.diskContrast, amount);
+    result.diskWind = mix(a.diskWind, b.diskWind, amount);
+    result.diskSpeed = mix(a.diskSpeed, b.diskSpeed, amount);
+    result.starGain = mix(a.starGain, b.starGain, amount);
+    result.exposure = mix(a.exposure, b.exposure, amount);
+    return result;
+}
+
+BlackHolePreset blackHoleDemoPreset(float time) {
+    float slotClock = fmod(time, 42.0) / 42.0 * 8.0;
+    int index = min(int(floor(slotClock)), 7);
+    int nextIndex = (index + 1) % 8;
+    float blend = smoothstep(0.82, 1.0, fract(slotClock));
+    return blackHoleMixPreset(
+        blackHolePresetAt(index),
+        blackHolePresetAt(nextIndex),
+        blend
+    );
+}
+
+vertex BlackHolePetVertexOut blackHolePetVertex(uint id [[vertex_id]]) {
+    constexpr float2 positions[] = {
+        float2(-1.0, -1.0), float2(1.0, -1.0),
+        float2(-1.0, 1.0), float2(1.0, 1.0)
+    };
+    BlackHolePetVertexOut out;
+    out.position = float4(positions[id], 0.0, 1.0);
+    out.uv = float2(positions[id].x * 0.5 + 0.5, 0.5 - positions[id].y * 0.5);
+    return out;
+}
+
+float2 blackHoleMirrorUV(float2 value) {
+    return 1.0 - abs(1.0 - fmod(value, 2.0));
+}
+
+float2 blackHoleRotate(float2 point, float angle) {
+    float cosine = cos(angle);
+    float sine = sin(angle);
+    return float2(
+        cosine * point.x - sine * point.y,
+        sine * point.x + cosine * point.y
+    );
+}
+
+float blackHoleHash(float2 point) {
+    point = fract(point * float2(234.34, 435.345));
+    point += dot(point, point + 34.23);
+    return fract(point.x * point.y);
+}
+
+float blackHoleNoise(float2 point) {
+    float2 index = floor(point);
+    float2 fraction = fract(point);
+    fraction = fraction * fraction * (3.0 - 2.0 * fraction);
+    return mix(
+        mix(blackHoleHash(index), blackHoleHash(index + float2(1.0, 0.0)), fraction.x),
+        mix(blackHoleHash(index + float2(0.0, 1.0)), blackHoleHash(index + 1.0), fraction.x),
+        fraction.y
+    );
+}
+
+float blackHoleNoiseWrapY(float2 point, float periodY) {
+    float2 index = floor(point);
+    float2 fraction = fract(point);
+    fraction = fraction * fraction * (3.0 - 2.0 * fraction);
+    float y0 = fmod(index.y, periodY);
+    float y1 = fmod(index.y + 1.0, periodY);
+    return mix(
+        mix(
+            blackHoleHash(float2(index.x, y0)),
+            blackHoleHash(float2(index.x + 1.0, y0)),
+            fraction.x
+        ),
+        mix(
+            blackHoleHash(float2(index.x, y1)),
+            blackHoleHash(float2(index.x + 1.0, y1)),
+            fraction.x
+        ),
+        fraction.y
+    );
+}
+
+float3 blackHoleBlackbody(float temperature) {
+    float t = clamp(temperature, 1500.0f, 40000.0f) / 100.0f;
+    float red = t <= 66.0
+        ? 1.0
+        : clamp(1.292936 * pow(t - 60.0, -0.1332047), 0.0, 1.0);
+    float green = t <= 66.0
+        ? clamp(0.3900816 * log(t) - 0.6318414, 0.0, 1.0)
+        : clamp(1.1298909 * pow(t - 60.0, -0.0755148), 0.0, 1.0);
+    float blue = t >= 66.0
+        ? 1.0
+        : (t <= 19.0 ? 0.0 : clamp(0.5432068 * log(t - 10.0) - 1.196254, 0.0, 1.0));
+    return float3(red, green, blue);
+}
+
+float3 sampleCapturedDesktop(
+    texture2d<float> desktop,
+    sampler desktopSampler,
+    constant BlackHolePetParams &params,
+    float2 localUV
+) {
+    if (params.captureSize.x <= 0.0 || params.captureSize.y <= 0.0) {
+        return float3(0.006, 0.008, 0.014);
+    }
+    float2 captureUV = params.captureOrigin
+        + clamp(localUV, float2(0.0), float2(1.0)) * params.captureSize;
+    return desktop.sample(desktopSampler, clamp(captureUV, float2(0.0), float2(1.0))).rgb;
+}
+
+fragment float4 blackHolePetFragment(
+    BlackHolePetVertexOut in [[stage_in]],
+    texture2d<float> desktop [[texture(0)]],
+    constant BlackHolePetParams &params [[buffer(0)]]
+) {
+    constexpr sampler linearSampler(filter::linear, address::clamp_to_edge);
+    float time = params.time;
+    BlackHolePreset preset = blackHoleDemoPreset(time);
+    // Presets may change silhouette, inclination and color, but not the
+    // desktop-pet envelope. Token growth owns the only geometric scale.
+    preset.diskOuter = 8.0;
+
+    float2 uv = in.uv;
+    float2 resolution = params.resolution;
+    float aspect = resolution.x / max(resolution.y, 1.0);
+    bool captureReady = params.captureSize.x > 0.0
+        && params.captureSize.y > 0.0;
+    float breathing = 1.0
+        + 0.055 * sin(time * 1.25)
+        + 0.020 * sin(time * 0.53 + 1.2);
+    float intensity = 1.0;
+    // Base the physical hole radius on scene width. The black-hole pet owns a
+    // taller transparent canvas than other pets so vertical disk presets have
+    // room, while Token growth remains the only geometric scale.
+    float radius = aspect * 0.0926;
+    float dynamicRoll = preset.diskRoll + 0.12 * sin(time * 0.31);
+    float maskExtent = max(4.2, preset.diskOuter / 2.5980762 + 0.8);
+    // Desktop roaming is owned by the native pet window. Keeping the shader
+    // center aligned here lets code and Finder items fall into the real hole.
+    float2 center = float2(0.48, 0.53);
+    float2 point = (uv - center) * float2(aspect, 1.0);
+    float pointLength = length(point);
+    float window = exp(-pow(pointLength / (7.0 * radius), 2.0));
+    float mask = 1.0 - smoothstep(
+        (maskExtent - 0.7) * radius,
+        maskExtent * radius,
+        pointLength
+    );
+    if (mask < 0.002) {
+        return float4(0.0);
+    }
+
+    constexpr float criticalImpact = 2.5980762;
+    constexpr float startingDepth = 14.0;
+    float scale = criticalImpact / max(radius, 0.0001);
+    float2 projectedRay = blackHoleRotate(
+        float2(point.x, -point.y),
+        dynamicRoll
+    ) * scale;
+    float impact = length(projectedRay);
+
+    if (impact > preset.diskOuter + 3.0) {
+        if (!captureReady) {
+            return float4(0.0);
+        }
+        float deflection = (2.0 / (scale * scale))
+            / max(pointLength, 0.0001)
+            * (13.0 / window * window)
+            * window;
+        float2 sampledUV = blackHoleMirrorUV(
+            center
+                + (point - normalize(point) * deflection)
+                / float2(aspect, 1.0)
+        );
+        float3 color = sampleCapturedDesktop(
+            desktop,
+            linearSampler,
+            params,
+            sampledUV
+        );
+        return float4(color, mask);
+    }
+
+    float3 position = float3(projectedRay, startingDepth);
+    float3 velocity = float3(0.0, 0.0, -1.0);
+    float3 previous = position;
+    float angularMomentumSquared = dot(projectedRay, projectedRay);
+    float3 diskNormal = float3(0.0, sin(preset.diskIncl), cos(preset.diskIncl));
+    float previousPlane = dot(position, diskNormal);
+    float3 emission = float3(0.0);
+    float transmittance = 1.0;
+    bool captured = false;
+
+    for (uint step = 0; step < 48; step++) {
+        float radiusSquared = dot(position, position);
+        if (radiusSquared < 1.0) {
+            captured = true;
+            break;
+        }
+        if (position.z < -startingDepth && velocity.z < 0.0) {
+            break;
+        }
+
+        float physicalRadius = sqrt(radiusSquared);
+        float delta = clamp(0.16 * physicalRadius, 0.03, 1.5);
+        float3 acceleration = -1.5
+            * angularMomentumSquared
+            * position
+            / (radiusSquared * radiusSquared * physicalRadius);
+        velocity += acceleration * 0.5 * delta;
+        position += velocity * delta;
+
+        radiusSquared = dot(position, position);
+        physicalRadius = sqrt(radiusSquared);
+        acceleration = -1.5
+            * angularMomentumSquared
+            * position
+            / (radiusSquared * radiusSquared * physicalRadius);
+        velocity += acceleration * 0.5 * delta;
+
+        float plane = dot(position, diskNormal);
+        if (plane * previousPlane < 0.0 && transmittance > 0.02) {
+            float interpolation = previousPlane / (previousPlane - plane);
+            float3 hit = mix(previous, position, interpolation);
+            float crossingRadius = length(hit);
+            if (crossingRadius > preset.diskInner && crossingRadius < preset.diskOuter) {
+                float angle = atan2(
+                    dot(hit, float3(0.0, cos(preset.diskIncl), -sin(preset.diskIncl))),
+                    hit.x
+                );
+                float turns = angle / 6.2831853;
+                float localDilation = sqrt(
+                    max(1.0 - 1.5 / crossingRadius, 0.02)
+                );
+                float kepler = pow(preset.diskInner / crossingRadius, 1.5);
+                float speedDirection = preset.diskSpeed < 0.0 ? -1.0 : 1.0;
+                float dilation = mix(1.0, 0.20, intensity);
+                float swirl = crossingRadius * preset.diskWind * 0.12
+                    - time
+                        * kepler
+                        * abs(preset.diskSpeed)
+                        * localDilation
+                        * dilation
+                        * speedDirection;
+                float streak = blackHoleNoiseWrapY(
+                    float2(
+                        crossingRadius * 2.8,
+                        turns * 19.0 + swirl * 3.0
+                    ),
+                    19.0
+                ) * 0.65 + blackHoleNoiseWrapY(
+                    float2(
+                        crossingRadius,
+                        turns * 9.0 + swirl * 1.5 + 7.0
+                    ),
+                    9.0
+                ) * 0.35;
+                streak = 0.35 + preset.diskContrast * streak * streak;
+                float band = smoothstep(
+                    preset.diskInner,
+                    preset.diskInner * 1.25,
+                    crossingRadius
+                ) * (
+                    1.0 - smoothstep(
+                        preset.diskOuter * 0.70,
+                        preset.diskOuter,
+                        crossingRadius
+                    )
+                );
+                float beta = clamp(
+                    rsqrt(max(2.0 * (crossingRadius - 1.0), 0.2)),
+                    0.0,
+                    0.99
+                );
+                float gPhysics = localDilation
+                    / max(
+                        1.0 + beta * dot(
+                            normalize(cross(diskNormal, hit)) * speedDirection,
+                            normalize(velocity)
+                        ),
+                        0.05
+                    );
+                float redshift = mix(1.0, gPhysics, preset.dopplerMix);
+                float temperature = pow(preset.diskInner / crossingRadius, 0.75)
+                    * pow(
+                        max(1.0 - sqrt(preset.diskInner / crossingRadius), 0.0),
+                        0.25
+                    )
+                    / 0.488;
+                float density = band * streak;
+                emission += transmittance
+                    * blackHoleBlackbody(preset.diskTemp * temperature * redshift)
+                    * (
+                        2.2
+                        * preset.diskGain
+                        * density
+                        * temperature
+                        * temperature
+                        * pow(redshift, preset.diskBeam)
+                    );
+                transmittance *= 1.0 - clamp(
+                    preset.diskOpacity * density,
+                    0.0,
+                    1.0
+                );
+            }
+        }
+        previousPlane = plane;
+        previous = position;
+    }
+
+    if (!captured && dot(position, position) < 4.0) {
+        captured = true;
+    }
+
+    float3 background = float3(0.0);
+    float2 starUV = uv;
+    if (!captured) {
+        float3 direction = normalize(velocity);
+        if (direction.z < -0.05) {
+            float distance = (-13.0 - position.z) / direction.z;
+            float2 sky = blackHoleRotate(
+                (position + direction * distance).xy,
+                -dynamicRoll
+            ) / scale;
+            float2 sampledUV = blackHoleMirrorUV(
+                center
+                    + (point + (float2(sky.x, -sky.y) - point) * window)
+                    / float2(aspect, 1.0)
+            );
+            starUV = sampledUV;
+            background = sampleCapturedDesktop(
+                desktop,
+                linearSampler,
+                params,
+                sampledUV
+            );
+        }
+    }
+
+    if (preset.starGain > 0.0) {
+        float star = pow(
+            blackHoleHash(floor(starUV * resolution / 5.0)),
+            32.0
+        ) * preset.starGain;
+        background += float3(0.55, 0.72, 1.0) * star;
+    }
+
+    float brightnessPulse = mix(
+        0.72,
+        1.25,
+        0.5 + 0.5 * sin(time * 0.74 + 0.6)
+    ) * breathing;
+    float3 visibleEmission = (1.0 - exp(-emission * preset.exposure))
+        * brightnessPulse;
+    float3 color = background * transmittance + visibleEmission;
+    float emissionAlpha = clamp(
+        max(visibleEmission.r, max(visibleEmission.g, visibleEmission.b)) * 1.35,
+        0.0,
+        1.0
+    );
+    float fallbackAlpha = captured ? 1.0 : emissionAlpha;
+    return float4(color, captureReady ? mask : min(mask, fallbackAlpha));
+}

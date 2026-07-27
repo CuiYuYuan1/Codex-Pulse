@@ -1,5 +1,5 @@
 const elements = Object.fromEntries([
-  "capsule", "detail", "miniCapsule", "miniRingProgress", "miniValue", "miniValuePrevious", "petAnimation", "weatherScene", "weatherAnimation", "weatherSpacer", "statusDot", "quotaRing", "quotaArc", "remaining", "todayTokens", "todayTokensPrevious", "chevron",
+  "capsule", "detail", "miniCapsule", "miniRingProgress", "miniValue", "miniValuePrevious", "petAnimation", "petAnimationNext", "petCatCanvas", "petBlackHoleCanvas", "petBlackHoleCode", "weatherScene", "weatherAnimation", "weatherSpacer", "statusDot", "quotaRing", "quotaArc", "remaining", "todayTokens", "todayTokensPrevious", "chevron",
   "informationStrip", "informationWeatherContent", "informationTaskContent", "informationTaskStatus", "informationTaskSummary", "weatherMiniIcon", "weatherSummary", "informationLocation", "informationWeekday", "informationTime",
   "conversationDetail", "conversationMessages", "conversationLiveLabel", "conversationClose",
   "email", "plan", "taskBadge", "connectionMessage", "chooseCodex", "resetTime",
@@ -22,6 +22,7 @@ let conversationExpanded = false;
 let miniConversationExpanded = false;
 let conversationCollapseTimer;
 let miniConversationCollapseTimer;
+let miniConversationTransitionGeneration = 0;
 let conversationStructureSignature = "";
 let taskSummaryAnimation;
 let lastTaskSummaryMotionAt = 0;
@@ -50,9 +51,36 @@ let windowShapeFrame;
 let lastCollapsedWindowWidth;
 let adaptiveResizeInFlight = false;
 let adaptiveResizeReleaseTimer;
+let petFrontElement = elements.petAnimation;
+let petBackElement = elements.petAnimationNext;
+let petVisualSource = "";
+let petTransitionGeneration = 0;
+let petTransitionTimer;
+let catIdleState = "idle";
+let catIdleStateUntil = 0;
+let catIdleSequence = [];
+let catTransientState = null;
+let catTransientStateUntil = 0;
+let lastPetTaskMode = "idle";
+let petRoamTimer;
+let petRoamGeneration = 0;
+let petRoamingState = null;
+let petRoamInFlight = false;
+let petRoamHasInteracted = false;
+let petInteractionCooldownUntil = 0;
+let petMonitorVisibleUntil = 0;
+let petMonitorHideTimer;
 
 const exactNumber = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 });
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const proceduralCat = window.CodexCatRig.create(elements.petCatCanvas, { reduceMotion });
+const blackHolePet = window.CodexBlackHole.create(
+  elements.petBlackHoleCanvas,
+  elements.petBlackHoleCode,
+  { reduceMotion }
+);
+let petGrowthScale = 1;
+let petGrowthResizeGeneration = 0;
 function readChartPalette() {
   const styles = getComputedStyle(document.documentElement);
   return {
@@ -91,13 +119,15 @@ const miniStyleLabels = Object.freeze({
 let miniStylePreference = loadMiniStylePreference();
 let apiMiniStylePreference = loadAPIMiniStylePreference();
 const petPreferenceKey = "codexPulse.petCharacter";
-const petCharacters = new Set(["dino", "cat", "bunny", "ghost", "robot"]);
+const petCharacters = new Set(["dino", "cat", "bunny", "ghost", "robot", "fox", "black_hole"]);
 const petCharacterLabels = Object.freeze({
   dino: "小恐龙",
   cat: "猫咪",
   bunny: "兔子",
   ghost: "幽灵",
-  robot: "机器人"
+  robot: "机器人",
+  fox: "九尾狐",
+  black_hole: "事件视界"
 });
 let petCharacterPreference = loadPetPreference();
 let activePreferenceMenu = null;
@@ -329,6 +359,13 @@ function cycleMiniDisplay() {
   const next = styles[(currentIndex >= 0 ? currentIndex + 1 : 0) % styles.length];
   if (apiMode) apiMiniStylePreference = next;
   else miniStylePreference = next;
+  if (miniMode && (petCharacterPreference === "cat" || petCharacterPreference === "fox")) {
+    petMonitorVisibleUntil = Date.now() + 3400;
+    clearTimeout(petMonitorHideTimer);
+    petMonitorHideTimer = setTimeout(() => {
+      if (currentState) renderMini(currentState);
+    }, 3420);
+  }
   applyMiniStylePreference();
 }
 
@@ -373,7 +410,24 @@ function applyPetPreference() {
   try {
     localStorage.setItem(petPreferenceKey, petCharacterPreference);
   } catch { /* 设置仍在本次运行内生效。 */ }
+  void blackHolePet.setActive(miniMode && petCharacterPreference === "black_hole");
   if (currentState) renderMini(currentState);
+  if (miniMode && !miniTransitioning) {
+    void window.pulse.resize({
+      mode: "mini",
+      petScale: petGrowthScale,
+      petCharacter: petCharacterPreference,
+      conversationExpanded: miniConversationExpanded
+    }).then(() => syncWindowShape(false));
+  }
+}
+
+function selectPetCharacter(value) {
+  const nextCharacter = petCharacters.has(value) ? value : "dino";
+  if (petCharacterPreference === nextCharacter) return false;
+  petCharacterPreference = nextCharacter;
+  applyPetPreference();
+  return true;
 }
 
 function previewActivityBand() {
@@ -612,8 +666,356 @@ function updateInformationClock() {
   setText(elements.informationTime, parts.time);
 }
 
+function nextCatIdleState(nowMs) {
+  if (nowMs < catIdleStateUntil) return catIdleState;
+
+  if (catIdleSequence.length) {
+    const next = catIdleSequence.shift();
+    catIdleState = next.state;
+    catIdleStateUntil = nowMs + next.duration;
+    return catIdleState;
+  }
+
+  // Every expressive action is followed by an actual rest. This prevents
+  // grooming, hopping, and waving from becoming a mechanical playlist.
+  if (catIdleState !== "idle") {
+    catIdleState = "idle";
+    catIdleStateUntil = nowMs + (7 + Math.random() * 7) * 1000;
+    return catIdleState;
+  }
+
+  const roll = Math.random();
+  if (roll < 0.56) {
+    catIdleState = "idle";
+    catIdleStateUntil = nowMs + (7 + Math.random() * 9) * 1000;
+  } else if (roll < 0.66) {
+    catIdleState = "curious";
+    catIdleStateUntil = nowMs + (5 + Math.random() * 3) * 1000;
+  } else if (roll < 0.75) {
+    catIdleState = "grooming";
+    catIdleStateUntil = nowMs + (6 + Math.random() * 3) * 1000;
+  } else if (roll < 0.82) {
+    catIdleState = "stretch";
+    catIdleStateUntil = nowMs + (4.2 + Math.random() * 2) * 1000;
+  } else if (roll < 0.88) {
+    // A real sleep cycle has a readable wind-down and wake-up. Keep both
+    // stretches on screen for 2–3 seconds instead of jumping poses.
+    catIdleState = "stretch";
+    catIdleStateUntil = nowMs + 2200 + Math.random() * 700;
+    catIdleSequence = [
+      { state: "sleeping", duration: (13 + Math.random() * 10) * 1000 },
+      { state: "stretch", duration: 2200 + Math.random() * 700 },
+      { state: "idle", duration: (7 + Math.random() * 7) * 1000 }
+    ];
+  } else if (roll < 0.94) {
+    catIdleState = "wave";
+    catIdleStateUntil = nowMs + (3.2 + Math.random() * 1.8) * 1000;
+  } else {
+    catIdleState = "hop";
+    catIdleStateUntil = nowMs + (2.8 + Math.random() * 1.7) * 1000;
+  }
+  return catIdleState;
+}
+
+function resolveCatPetState(state, mode, now) {
+  const nowMs = now.getTime();
+  const wasActive = lastPetTaskMode === "working" || lastPetTaskMode === "attention";
+  if (wasActive && mode === "idle") {
+    catTransientState = "success";
+    catTransientStateUntil = nowMs + 3200;
+  }
+  lastPetTaskMode = mode;
+
+  if (state.connection === "error") return "error";
+  if (catTransientState && nowMs < catTransientStateUntil) return catTransientState;
+  catTransientState = null;
+
+  if (mode === "attention") {
+    return String(state.task?.label || "").includes("授权")
+      ? "waiting_auth"
+      : "waiting";
+  }
+  if (mode === "working") {
+    const startedAt = Number(state.task?.startedAt) || nowMs;
+    const phase = Math.floor(Math.max(0, nowMs - startedAt) / 1000) % 13;
+    return phase >= 8 && phase <= 11 ? "thinking" : "running";
+  }
+  return nextCatIdleState(nowMs);
+}
+
+function petLocomotionCycleDuration(character) {
+  switch (character) {
+    case "dino": return 1.06;
+    case "bunny": return 1.38;
+    case "ghost": return 1.24;
+    case "robot": return 0.94;
+    case "fox": return 1.12;
+    case "black_hole": return 1.28;
+    case "cat":
+    default: return 1 / 1.12;
+  }
+}
+
+function petRoamingArcHeight(character) {
+  switch (character) {
+    case "dino": return 5;
+    case "bunny": return 10;
+    case "ghost": return 18;
+    case "robot": return 4;
+    case "fox": return 8;
+    case "black_hole": return 5;
+    case "cat":
+    default: return 7;
+  }
+}
+
+function petRoamIsEligible() {
+  if (!miniMode || miniTransitioning || expanded || conversationExpanded || miniConversationExpanded) return false;
+  const mode = currentState ? modeFor(currentState) : "offline";
+  return (mode === "idle" || mode === "offline") && !reduceMotion;
+}
+
+function cancelPetRoam({ reschedule = false } = {}) {
+  petRoamGeneration += 1;
+  clearTimeout(petRoamTimer);
+  petRoamTimer = null;
+  petRoamingState = null;
+  petRoamInFlight = false;
+  if (typeof window.pulse.cancelPetRoam === "function") window.pulse.cancelPetRoam();
+  if (currentState) proceduralCat.setState(resolveCatPetState(currentState, modeFor(currentState), new Date()));
+  if (reschedule) schedulePetRoam();
+}
+
+function schedulePetRoam(delay) {
+  if (!petRoamIsEligible() || petRoamTimer || petRoamInFlight) return;
+  const generation = petRoamGeneration;
+  const wait = Number.isFinite(delay)
+    ? delay
+    : petRoamHasInteracted
+    ? 4200 + Math.random() * 5200
+    : 1400 + Math.random() * 900;
+  petRoamTimer = setTimeout(() => {
+    petRoamTimer = null;
+    if (generation !== petRoamGeneration) return;
+    void runPetRoam();
+  }, wait);
+}
+
+async function holdPetRoamingState(nextState, duration, generation) {
+  if (generation !== petRoamGeneration || !petRoamIsEligible()) return false;
+  petRoamingState = nextState;
+  proceduralCat.setState(nextState);
+  await new Promise((resolve) => setTimeout(resolve, duration));
+  return generation === petRoamGeneration && petRoamIsEligible();
+}
+
+async function holdPetEncounter(kind, generation) {
+  const totalDuration = 5000 + Math.random() * 5000;
+  const stages = kind === "dock"
+    ? [
+        ["sniffing", totalDuration * 0.18],
+        ["pouncing", totalDuration * 0.50],
+        ["dock_play", totalDuration * 0.32]
+      ]
+    : [
+        ["sniffing", totalDuration * 0.18],
+        ["pawing", totalDuration * 0.64],
+        ["sniffing", totalDuration * 0.18]
+      ];
+  for (const [state, duration] of stages) {
+    if (!await holdPetRoamingState(state, duration, generation)) return false;
+  }
+  return true;
+}
+
+async function runPetRoam() {
+  if (!petRoamIsEligible() || petRoamInFlight) return;
+  petRoamInFlight = true;
+  const generation = petRoamGeneration;
+  try {
+    const plan = typeof window.pulse.planPetRoam === "function"
+      ? await window.pulse.planPetRoam({
+          forceInteraction: !petRoamHasInteracted
+        })
+      : null;
+    if (!plan || generation !== petRoamGeneration || !petRoamIsEligible()) return;
+    const distance = Math.max(1, Number(plan.distance) || 150);
+    const cycle = petLocomotionCycleDuration(petCharacterPreference);
+    const requestedDuration = Math.max(1.8, Math.min(8.5, distance / 88));
+    const fullCycles = Math.max(2, Math.round(requestedDuration / cycle));
+    const duration = fullCycles * cycle;
+    petRoamingState = plan.direction === "left" ? "walk_left" : "walk_right";
+    proceduralCat.setFacesLeft?.(plan.direction === "left");
+    proceduralCat.setState(petRoamingState);
+    let roamResult = { cancelled: false };
+    if (typeof window.pulse.runPetRoam === "function") {
+      roamResult = await window.pulse.runPetRoam({
+        ...plan,
+        duration,
+        arcHeight: petRoamingArcHeight(petCharacterPreference)
+      });
+    }
+    if (roamResult?.cancelled || generation !== petRoamGeneration) return;
+
+    if (plan.kind === "desktop" || plan.kind === "dock") {
+      if (Date.now() >= petInteractionCooldownUntil) {
+        if (!await holdPetEncounter(plan.kind, generation)) return;
+        petRoamHasInteracted = true;
+        petInteractionCooldownUntil = Date.now() + 15000 + Math.random() * 15000;
+      } else {
+        // The pet still walks past the target during cooldown, but does not
+        // immediately repeat the same trick on every encounter.
+        if (!await holdPetRoamingState("idle", 800 + Math.random() * 800, generation)) return;
+      }
+    } else {
+      await holdPetRoamingState("idle", 1800 + Math.random() * 2200, generation);
+    }
+  } catch {
+    // Roaming is decorative; native display changes or shutdown can cancel it.
+  } finally {
+    if (generation === petRoamGeneration) {
+      petRoamInFlight = false;
+      petRoamingState = null;
+      if (currentState) {
+        proceduralCat.setState(resolveCatPetState(currentState, modeFor(currentState), new Date()));
+      }
+      schedulePetRoam(3600 + Math.random() * 4800);
+    }
+  }
+}
+
+async function runManualPetDropInteraction(drop) {
+  if (!petRoamIsEligible()) return;
+  const wakesFromSleep = catIdleState === "sleeping" || petRoamingState === "sleeping";
+  cancelPetRoam();
+  const generation = petRoamGeneration;
+  petRoamInFlight = true;
+  catIdleSequence = [];
+  proceduralCat.setFacesLeft?.(drop?.direction === "left");
+  try {
+    if (wakesFromSleep) {
+      if (!await holdPetRoamingState("stretch", 2500, generation)) return;
+    }
+    if (Date.now() >= petInteractionCooldownUntil) {
+      if (!await holdPetEncounter(drop?.kind === "dock" ? "dock" : "desktop", generation)) return;
+      petRoamHasInteracted = true;
+      petInteractionCooldownUntil = Date.now() + 15000 + Math.random() * 15000;
+    }
+    catIdleState = "idle";
+    catIdleStateUntil = Date.now() + 7000 + Math.random() * 5000;
+  } finally {
+    if (generation === petRoamGeneration) {
+      petRoamInFlight = false;
+      petRoamingState = null;
+      if (currentState) {
+        proceduralCat.setState(resolveCatPetState(currentState, modeFor(currentState), new Date()));
+      }
+      schedulePetRoam(3500);
+    }
+  }
+}
+
+function wakeSleepingPetFromClick() {
+  if (!petRoamIsEligible()
+      || (catIdleState !== "sleeping" && petRoamingState !== "sleeping")) {
+    return false;
+  }
+  cancelPetRoam();
+  const generation = petRoamGeneration;
+  petRoamInFlight = true;
+  catIdleSequence = [];
+  petRoamingState = "stretch";
+  proceduralCat.setState("stretch");
+  setTimeout(() => {
+    if (generation !== petRoamGeneration || !petRoamIsEligible()) return;
+    catIdleState = "idle";
+    catIdleStateUntil = Date.now() + 7000 + Math.random() * 5000;
+    petRoamingState = null;
+    petRoamInFlight = false;
+    if (currentState) {
+      proceduralCat.setState(resolveCatPetState(currentState, modeFor(currentState), new Date()));
+    }
+    schedulePetRoam(3500);
+  }, 2500);
+  return true;
+}
+
+if (typeof window.pulse.onPetDrop === "function") {
+  window.pulse.onPetDrop((drop) => {
+    void runManualPetDropInteraction(drop);
+  });
+}
+
+function setPetVisual(path, alt) {
+  petFrontElement.alt = alt;
+  petBackElement.alt = alt;
+  if (petVisualSource === path) return;
+  petVisualSource = path;
+  petTransitionGeneration += 1;
+  const generation = petTransitionGeneration;
+  clearTimeout(petTransitionTimer);
+
+  if (!petFrontElement.getAttribute("src") || reduceMotion) {
+    petFrontElement.setAttribute("src", path);
+    petFrontElement.classList.remove("is-hidden");
+    petBackElement.classList.add("is-hidden");
+    petBackElement.removeAttribute("src");
+    return;
+  }
+
+  petBackElement.setAttribute("src", path);
+  petBackElement.classList.add("is-hidden");
+  petBackElement.style.zIndex = "2";
+  petFrontElement.style.zIndex = "1";
+  const decoded = typeof petBackElement.decode === "function"
+    ? petBackElement.decode().catch(() => undefined)
+    : Promise.resolve();
+  decoded.then(() => {
+    if (generation !== petTransitionGeneration) return;
+    requestAnimationFrame(() => {
+      if (generation !== petTransitionGeneration) return;
+      petBackElement.classList.remove("is-hidden");
+      petFrontElement.classList.add("is-hidden");
+      petTransitionTimer = setTimeout(() => {
+        if (generation !== petTransitionGeneration) return;
+        const oldFront = petFrontElement;
+        petFrontElement = petBackElement;
+        petBackElement = oldFront;
+        petFrontElement.style.zIndex = "2";
+        petBackElement.style.zIndex = "1";
+        petBackElement.classList.add("is-hidden");
+        petBackElement.removeAttribute("src");
+      }, 210);
+    });
+  });
+}
+
+function applyPetGrowth(state) {
+  const nextScale = window.CodexPetGrowth.scaleForTodayTokens(
+    state?.usage?.today
+  );
+  if (Math.abs(nextScale - petGrowthScale) < 0.001) return;
+  petGrowthScale = nextScale;
+  document.documentElement.style.setProperty(
+    "--pet-growth-scale",
+    nextScale.toFixed(1)
+  );
+
+  if (!miniMode || miniTransitioning) return;
+  const generation = ++petGrowthResizeGeneration;
+  void window.pulse.resize({
+    mode: "mini",
+    petScale: petGrowthScale,
+    petCharacter: petCharacterPreference,
+    conversationExpanded: miniConversationExpanded
+  }).then(() => {
+    if (generation === petGrowthResizeGeneration) void syncWindowShape(false);
+  });
+}
+
 function renderMini(state, now = new Date()) {
   if (!state) return;
+  applyPetGrowth(state);
   const miniStyle = effectiveMiniStyle(state);
   const primary = state.limits?.[0];
   const remaining = Number(primary?.remainingPercent);
@@ -674,17 +1076,29 @@ function renderMini(state, now = new Date()) {
   // 保留进度值供无障碍描述和旧结构兼容；宠物缩小态不再绘制圆环。
   const visualProgress = miniStyle === "quota" && progress >= 98 ? 100 : progress;
   const interactionPhase = Math.floor(now.getTime() / 1000) % 13;
-  const petState = mode === "attention"
-    ? "auth"
-    : mode === "working"
-    ? ((interactionPhase >= 9 && interactionPhase <= 11) ? "scratch" : "typing")
-    : "idle";
-  const petPath = `assets/pets-v2/codex_${petCharacterPreference}_v2_${petState}.gif`;
-  if (elements.petAnimation.getAttribute("src") !== petPath) {
-    elements.petAnimation.setAttribute("src", petPath);
+  const petState = petRoamingState || resolveCatPetState(state, mode, now);
+  const isBlackHolePet = petCharacterPreference === "black_hole";
+  void blackHolePet.setActive(miniMode && isBlackHolePet);
+  blackHolePet.setState(petState);
+  proceduralCat.setVisible(!isBlackHolePet);
+  if (!isBlackHolePet) {
+    proceduralCat.setCharacter(petCharacterPreference);
+    proceduralCat.setState(petState);
   }
-  elements.petAnimation.alt = `${petCharacterLabels[petCharacterPreference]} · ${mode === "attention" ? "等待授权" : mode === "working" ? "思考中" : mode === "idle" ? "空闲" : "未连接"}`;
+  petFrontElement.classList.add("is-hidden");
+  petBackElement.classList.add("is-hidden");
   elements.capsule.classList.toggle("pet-idle", mode === "idle" || mode === "offline");
+  const transientMonitorPet = petCharacterPreference === "cat"
+    || petCharacterPreference === "fox";
+  const quietPetState = mode === "idle" || mode === "offline";
+  elements.capsule.classList.toggle(
+    "pet-monitor-hidden",
+    isBlackHolePet || (
+      transientMonitorPet
+      && quietPetState
+      && Date.now() >= petMonitorVisibleUntil
+    )
+  );
   const rawStartedAt = Number(state.task?.startedAt);
   const taskStartedAt = Number.isFinite(rawStartedAt) && rawStartedAt > 0
     ? (rawStartedAt < 1_000_000_000_000 ? rawStartedAt * 1000 : rawStartedAt)
@@ -697,7 +1111,7 @@ function renderMini(state, now = new Date()) {
   const monitorValue = showsActiveQuota
     ? `额度${Math.round(Math.max(0, Math.min(100, remaining)))}%`
     : mode === "working"
-    ? (petState === "scratch" ? "想一下" : "思考中")
+    ? (petState === "thinking" || petState === "scratch" ? "想一下" : "工作中")
     : mode === "attention"
     ? "等待授权"
     : value;
@@ -714,13 +1128,16 @@ function renderMini(state, now = new Date()) {
   const interactionHelp = mode === "working" || mode === "attention"
     ? "单击展开或收起当前对话"
     : "单击切换显示内容";
-  elements.miniCapsule.title = `${petCharacterLabels[petCharacterPreference]} · ${title} · ${interactionHelp} · 双击恢复完整胶囊`;
+  const growthLabel = `成长 ${Math.round(petGrowthScale * 100)}%`;
+  elements.miniCapsule.title = `${petCharacterLabels[petCharacterPreference]} · ${growthLabel} · ${title} · ${interactionHelp} · 右键切换宠物 · 双击恢复完整胶囊`;
   if (miniMode) {
     elements.capsule.setAttribute(
       "aria-label",
-      `${petCharacterLabels[petCharacterPreference]}，${title}，${interactionHelp}，双击恢复完整胶囊`
+      `${petCharacterLabels[petCharacterPreference]}，${growthLabel}，${title}，${interactionHelp}，右键切换宠物，双击恢复完整胶囊`
     );
   }
+  if (petRoamIsEligible()) schedulePetRoam();
+  else if (petRoamTimer || petRoamInFlight) cancelPetRoam();
 }
 
 function renderInformationBar(info = {}) {
@@ -854,22 +1271,10 @@ function setConversationExpanded(nextExpanded) {
   elements.informationStrip.setAttribute("aria-expanded", String(next));
   const root = document.documentElement;
   if (next) {
-    const collapsedRect = elements.informationStrip.getBoundingClientRect();
-    elements.conversationDetail.style.setProperty(
-      "--conversation-origin-scale-x",
-      String(Math.max(0.05, collapsedRect.width / 342))
-    );
-    elements.conversationDetail.style.setProperty(
-      "--conversation-origin-scale-y",
-      String(Math.max(0.03, collapsedRect.height / 270))
-    );
     root.classList.remove("conversation-closing");
     root.classList.add("conversation-expanded");
     elements.conversationDetail.hidden = false;
     elements.conversationDetail.setAttribute("aria-hidden", "false");
-    // Commit the pill-sized start frame before adding `.open`. Without this
-    // read Chromium can coalesce both mutations and skip the outward morph.
-    elements.conversationDetail.getBoundingClientRect();
     requestAnimationFrame(() => {
       elements.conversationDetail.classList.add("open");
       scheduleWindowShapeSync();
@@ -893,28 +1298,28 @@ function setMiniConversationExpanded(nextExpanded, { immediate = false } = {}) {
   if (miniConversationExpanded === next
       && !(immediate && !next && !elements.conversationDetail.hidden)) return;
   miniConversationExpanded = next;
+  const transitionGeneration = ++miniConversationTransitionGeneration;
   clearTimeout(miniConversationCollapseTimer);
   const root = document.documentElement;
   const mode = currentState ? modeFor(currentState) : "idle";
   if (next) {
-    const monitor = elements.miniCapsule.querySelector(".pet-monitor-frame").getBoundingClientRect();
-    elements.conversationDetail.style.setProperty(
-      "--conversation-origin-scale-x",
-      String(Math.max(0.05, monitor.width / 342))
-    );
-    elements.conversationDetail.style.setProperty(
-      "--conversation-origin-scale-y",
-      String(Math.max(0.03, monitor.height / 246))
-    );
     root.classList.add("mini-conversation-expanded");
     root.classList.toggle("mini-conversation-attention", mode === "attention");
     if (conversationExpanded) setConversationExpanded(false);
     renderConversationMessages(visibleTaskConversation(currentState?.task), mode);
     elements.conversationDetail.hidden = false;
     elements.conversationDetail.setAttribute("aria-hidden", "false");
-    // Keep the pet fixed while the conversation surface grows from its monitor.
-    elements.conversationDetail.getBoundingClientRect();
-    requestAnimationFrame(() => {
+    // The production mini BrowserWindow is normally only the pet envelope.
+    // Grow the native transparent surface before revealing the conversation,
+    // otherwise DirectComposition clips everything below the header.
+    void window.pulse.resize({
+      mode: "mini",
+      petScale: petGrowthScale,
+      petCharacter: petCharacterPreference,
+      conversationExpanded: true
+    }).then(() => nextCompositeFrame()).then(() => {
+      if (transitionGeneration !== miniConversationTransitionGeneration
+          || !miniConversationExpanded) return;
       elements.conversationDetail.classList.add("open");
       scheduleWindowShapeSync();
     });
@@ -926,7 +1331,16 @@ function setMiniConversationExpanded(nextExpanded, { immediate = false } = {}) {
       elements.conversationDetail.hidden = true;
       root.classList.remove("mini-conversation-expanded");
       root.classList.remove("mini-conversation-attention");
-      scheduleWindowShapeSync();
+      void window.pulse.resize({
+        mode: "mini",
+        petScale: petGrowthScale,
+        petCharacter: petCharacterPreference,
+        conversationExpanded: false
+      }).then(() => {
+        if (transitionGeneration !== miniConversationTransitionGeneration
+            || miniConversationExpanded) return;
+        scheduleWindowShapeSync();
+      });
     };
     if (immediate || reduceMotion) finish();
     else miniConversationCollapseTimer = setTimeout(finish, 320);
@@ -962,7 +1376,11 @@ function renderTaskInformation(state, mode) {
   setText(elements.informationTaskSummary, nextSummary);
   elements.informationTaskSummary.title = summary;
   const motionNow = performance.now();
-  if (taskActive && summaryChanged && !reduceMotion && motionNow - lastTaskSummaryMotionAt >= 120) {
+  if (taskActive
+      && !conversationExpanded
+      && summaryChanged
+      && !reduceMotion
+      && motionNow - lastTaskSummaryMotionAt >= 120) {
     lastTaskSummaryMotionAt = motionNow;
     taskSummaryAnimation?.cancel();
     taskSummaryAnimation = elements.informationTaskSummary.animate([
@@ -973,10 +1391,12 @@ function renderTaskInformation(state, mode) {
       easing: "cubic-bezier(.16,1,.3,1)"
     });
   }
-  requestAnimationFrame(() => {
-    const summaryElement = elements.informationTaskSummary;
-    summaryElement.scrollLeft = summaryElement.scrollWidth;
-  });
+  if (!conversationExpanded) {
+    requestAnimationFrame(() => {
+      const summaryElement = elements.informationTaskSummary;
+      summaryElement.scrollLeft = summaryElement.scrollWidth;
+    });
+  }
   renderConversationMessages(messages, mode);
   if (!taskActive && conversationExpanded) setConversationExpanded(false);
   const miniTaskActive = miniMode && (mode === "working" || mode === "attention");
@@ -1604,6 +2024,7 @@ async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
   if (shouldMinimize) setConversationExpanded(false);
   else if (miniConversationExpanded) setMiniConversationExpanded(false, { immediate: true });
   miniTransitioning = true;
+  cancelPetRoam();
   clearTimeout(capsuleSingleClickTimer);
   clearTimeout(collapseTimer);
   const root = document.documentElement;
@@ -1641,7 +2062,12 @@ async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
         );
         if (currentState) renderMini(currentState);
       });
-      await window.pulse.resize("mini");
+      await window.pulse.resize({
+        mode: "mini",
+        petScale: petGrowthScale,
+        petCharacter: petCharacterPreference,
+        conversationExpanded: false
+      });
       await syncWindowShape(false);
     } else {
       if (expandAfterRestore) {
@@ -1657,6 +2083,7 @@ async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
       await nextCompositeFrame();
       await runCapsuleMorphTransition(() => {
         miniMode = false;
+        void blackHolePet.setActive(false);
         root.classList.remove("mini-mode");
         elements.miniCapsule.setAttribute("aria-hidden", "true");
         elements.capsule.setAttribute("aria-label", "Codex-Pulse 悬浮胶囊");
@@ -1687,6 +2114,7 @@ async function setMiniMode(nextMiniMode, { expandAfterRestore = false } = {}) {
     // when a click landed while the hover attraction was still displaced.
     resetMagnet(false);
     scheduleWindowShapeSync();
+    if (petRoamIsEligible()) schedulePetRoam(2600);
   }
 
   if (expandAfterRestore && !expanded) setExpanded(true);
@@ -1965,6 +2393,7 @@ elements.capsule.addEventListener("pointerleave", () => {
 
 elements.capsule.addEventListener("pointerdown", (event) => {
   if (event.button !== 0) return;
+  cancelPetRoam();
   capsulePointer = {
     id: event.pointerId,
     startX: event.screenX,
@@ -1973,6 +2402,20 @@ elements.capsule.addEventListener("pointerdown", (event) => {
   };
   elements.capsule.setPointerCapture(event.pointerId);
   window.pulse.beginDrag(event.screenX, event.screenY);
+});
+
+elements.capsule.addEventListener("contextmenu", async (event) => {
+  if (!miniMode || miniTransitioning || typeof window.pulse.showPetSwitchMenu !== "function") return;
+  event.preventDefault();
+  event.stopPropagation();
+  clearTimeout(capsuleSingleClickTimer);
+  cancelPetRoam();
+  try {
+    const selected = await window.pulse.showPetSwitchMenu(petCharacterPreference);
+    if (selected) selectPetCharacter(selected);
+  } finally {
+    if (petRoamIsEligible()) schedulePetRoam(1800);
+  }
 });
 
 elements.capsule.addEventListener("pointermove", (event) => {
@@ -2021,10 +2464,11 @@ elements.capsule.addEventListener("pointermove", (event) => {
 function finishCapsulePointer(event) {
   if (!capsulePointer || capsulePointer.id !== event.pointerId) return;
   const shouldToggle = !capsulePointer.moved;
+  const didMove = capsulePointer.moved;
   capsulePointer = null;
   pendingDrag = null;
   elements.capsule.classList.remove("dragging");
-  window.pulse.endDrag();
+  window.pulse.endDrag(event.screenX, event.screenY, didMove);
   if (elements.capsule.hasPointerCapture(event.pointerId)) {
     elements.capsule.releasePointerCapture(event.pointerId);
   }
@@ -2035,6 +2479,7 @@ function finishCapsulePointer(event) {
   }
   resetMagnet(false);
   if (shouldToggle) {
+    if (wakeSleepingPetFromClick()) return;
     clearTimeout(capsuleSingleClickTimer);
     capsuleSingleClickTimer = setTimeout(() => {
       if (miniMode) handleMiniSingleClick();
@@ -2056,7 +2501,7 @@ elements.capsule.addEventListener("pointercancel", (event) => {
   elements.capsule.classList.remove("dragging");
   elements.capsule.classList.remove("hovering");
   hoverGeometry = null;
-  window.pulse.endDrag();
+  window.pulse.endDrag(event.screenX, event.screenY, false);
   resetMagnet(true);
   if (elements.capsule.hasPointerCapture(event.pointerId)) {
     elements.capsule.releasePointerCapture(event.pointerId);
@@ -2135,8 +2580,7 @@ bindPreferencePicker({
   trigger: elements.petCharacter,
   menu: elements.petCharacterMenu,
   onSelect: (value) => {
-    petCharacterPreference = petCharacters.has(value) ? value : "dino";
-    applyPetPreference();
+    selectPetCharacter(value);
   }
 });
 bindPreferencePicker({
@@ -2286,6 +2730,53 @@ elements.chooseCodex.addEventListener("click", () => window.pulse.clearCodexPath
 elements.refresh.addEventListener("click", () => window.pulse.refresh());
 elements.quit.addEventListener("click", () => window.pulse.quit());
 
+let blackHoleDragDepth = 0;
+function setBlackHoleDropVisual(state) {
+  elements.capsule.classList.toggle("black-hole-drop-target", state === "targeting");
+  elements.capsule.classList.toggle("black-hole-absorbed", state === "absorbed");
+  blackHolePet.setDropState(state);
+}
+elements.petBlackHoleCanvas.addEventListener("dragenter", (event) => {
+  if (petCharacterPreference !== "black_hole") return;
+  event.preventDefault();
+  blackHoleDragDepth += 1;
+  setBlackHoleDropVisual("targeting");
+});
+elements.petBlackHoleCanvas.addEventListener("dragover", (event) => {
+  if (petCharacterPreference !== "black_hole") return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+});
+elements.petBlackHoleCanvas.addEventListener("dragleave", () => {
+  blackHoleDragDepth = Math.max(0, blackHoleDragDepth - 1);
+  if (blackHoleDragDepth === 0) setBlackHoleDropVisual("idle");
+});
+elements.petBlackHoleCanvas.addEventListener("drop", async (event) => {
+  if (petCharacterPreference !== "black_hole") return;
+  event.preventDefault();
+  blackHoleDragDepth = 0;
+  const files = Array.from(event.dataTransfer?.files || []);
+  if (!files.length) {
+    setBlackHoleDropVisual("idle");
+    return;
+  }
+  setBlackHoleDropVisual("targeting");
+  const result = await window.pulse.trashBlackHoleFiles(files);
+  if (result?.ok) {
+    setBlackHoleDropVisual("absorbed");
+    elements.miniCapsule.title = `事件视界 · 已将 ${result.trashed} 个项目移入回收站`;
+    setTimeout(() => {
+      elements.capsule.classList.remove("black-hole-absorbed");
+      blackHolePet.setDropState("idle");
+      if (currentState) renderMini(currentState);
+    }, 1550);
+  } else {
+    setBlackHoleDropVisual("failed");
+    elements.miniCapsule.title = `事件视界 · 移入回收站失败${result?.errors?.[0] ? `：${result.errors[0]}` : ""}`;
+    setTimeout(() => setBlackHoleDropVisual("idle"), 800);
+  }
+});
+
 // 展开后点击窗口内的透明留白区域也收起；详情卡和胶囊自身保持正常交互。
 document.addEventListener("pointerdown", (event) => {
   if (activePreferenceMenu && !activePreferenceMenu.picker.contains(event.target)) {
@@ -2330,5 +2821,18 @@ window.pulse.onExpand(() => {
   if (miniMode) void setMiniMode(false, { expandAfterRestore: true });
   else setExpanded(true);
 });
+if (typeof window.pulse.onSystemResume === "function") {
+  window.pulse.onSystemResume(() => {
+    void blackHolePet.resetAfterSystemResume();
+    if (miniMode) {
+      void window.pulse.resize({
+        mode: "mini",
+        petScale: petGrowthScale,
+        petCharacter: petCharacterPreference,
+        conversationExpanded: miniConversationExpanded
+      }).then(() => syncWindowShape(false));
+    }
+  });
+}
 window.addEventListener("online", () => window.pulse.notifyNetworkOnline());
 window.pulse.getState().then(render);
