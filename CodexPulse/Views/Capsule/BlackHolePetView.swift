@@ -352,6 +352,7 @@ private final class BlackHoleMetalRendererView:
     private var capturedDisplayID: CGDirectDisplayID?
     private var captureStarting = false
     private var captureDenied = false
+    private var didPresentCaptureGuidance = false
     private var captureGeneration = 0
     private var startTime = CACurrentMediaTime()
     private var reduceMotion = false
@@ -513,6 +514,7 @@ private final class BlackHoleMetalRendererView:
             captureDenied = true
             captureStarting = false
             PulseLog.write("black-hole capture permission denied; renderer is using local fallback")
+            presentCapturePermissionGuidance()
             return
         }
 
@@ -706,6 +708,43 @@ private final class BlackHoleMetalRendererView:
         ) { [weak self] _ in
             self?.restartAfterDisplayTopologyChange()
         })
+        applicationObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.retryCaptureAfterPermissionChange()
+        })
+    }
+
+    private func presentCapturePermissionGuidance() {
+        guard !didPresentCaptureGuidance else { return }
+        didPresentCaptureGuidance = true
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "允许屏幕录制以启用黑洞扭曲"
+            alert.informativeText = """
+            事件视界需要在“隐私与安全性 → 屏幕与系统音频录制”中允许 CodexPulse，才能实时扭曲黑洞后方的窗口。画面仅在本机 GPU 中处理，不会保存或上传。
+
+            如果刚更新了应用，macOS 可能会要求重新确认权限。授权后返回 CodexPulse，黑洞会自动重试；必要时请重新启动应用。
+            """
+            alert.addButton(withTitle: "打开系统设置")
+            alert.addButton(withTitle: "稍后")
+            guard alert.runModal() == .alertFirstButtonReturn,
+                  let settingsURL = URL(
+                    string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                  ) else { return }
+            NSWorkspace.shared.open(settingsURL)
+        }
+    }
+
+    private func retryCaptureAfterPermissionChange() {
+        guard captureDenied, CGPreflightScreenCaptureAccess() else { return }
+        captureDenied = false
+        didPresentCaptureGuidance = false
+        PulseLog.write("black-hole capture permission granted; retrying desktop lens")
+        configureCaptureIfNeeded()
     }
 
     private func handleSystemWillSleep() {

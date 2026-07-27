@@ -12,6 +12,7 @@ DERIVED_DATA="$BUILD_DIR/DerivedData"
 STAGE_DIR="$BUILD_DIR/dmg"
 APP_PATH="$DERIVED_DATA/Build/Products/Release/CodexPulse.app"
 DMG_PATH="$OUTPUT_DIR/CodexPulse-macOS-${VERSION}-universal.dmg"
+SIGNING_IDENTITY="${MACOS_SIGNING_IDENTITY:--}"
 
 command -v xcodegen >/dev/null || {
   echo "缺少 xcodegen，请先执行：brew install xcodegen" >&2
@@ -40,6 +41,12 @@ test -d "$APP_PATH" || {
   echo "打包失败：没有找到 $APP_PATH" >&2
   exit 1
 }
+
+if [[ "$SIGNING_IDENTITY" == "-" ]]; then
+  echo "未配置 Developer ID，使用完整 ad-hoc bundle 签名。应用更新后 macOS 可能要求重新确认屏幕录制权限。"
+fi
+
+"$ROOT_DIR/Scripts/sign-macos-app.sh" "$APP_PATH" "$SIGNING_IDENTITY"
 
 ditto "$APP_PATH" "$STAGE_DIR/CodexPulse.app"
 ln -s /Applications "$STAGE_DIR/Applications"

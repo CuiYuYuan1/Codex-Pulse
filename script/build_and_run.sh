@@ -9,6 +9,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DERIVED_DATA="$ROOT_DIR/build/local-debug/DerivedData"
 APP_BUNDLE="$DERIVED_DATA/Build/Products/Debug/$APP_NAME.app"
 APP_BINARY="$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+SIGNING_IDENTITY="${MACOS_SIGNING_IDENTITY:--}"
 
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 
@@ -19,6 +20,10 @@ xcodebuild \
   -derivedDataPath "$DERIVED_DATA" \
   CODE_SIGNING_ALLOWED=NO \
   build
+
+"$ROOT_DIR/Scripts/sign-macos-app.sh" "$APP_BUNDLE" "$SIGNING_IDENTITY"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+  -f -R -trusted "$APP_BUNDLE"
 
 open_app() {
   /usr/bin/open -n "$APP_BUNDLE"

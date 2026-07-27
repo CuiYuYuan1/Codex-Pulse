@@ -59,6 +59,15 @@ const macUpdateSupport = fs.readFileSync(path.join(root, "CodexPulse/Services/Ma
 const releaseWorkflow = fs
   .readFileSync(path.join(root, ".github/workflows/release.yml"), "utf8")
   .replace(/\r\n/g, "\n");
+const macPackageScript = fs
+  .readFileSync(path.join(root, "Scripts/package-macos.sh"), "utf8")
+  .replace(/\r\n/g, "\n");
+const macSignScript = fs
+  .readFileSync(path.join(root, "Scripts/sign-macos-app.sh"), "utf8")
+  .replace(/\r\n/g, "\n");
+const macBuildAndRunScript = fs
+  .readFileSync(path.join(root, "script/build_and_run.sh"), "utf8")
+  .replace(/\r\n/g, "\n");
 
 function includes(source, fragment, label) {
   const normalizedSource = source.replace(/\r\n/g, "\n");
@@ -118,6 +127,14 @@ includes(swift, "PetGrowth.scale(forTodayTokens: todayTokens)", "macOS live pet-
 includes(petSwift, "growthScale: CGFloat", "macOS grown pet scene");
 includes(petSwift, "CGSize(width: 216, height: 184)", "macOS black-hole scene has vertical disk clearance");
 includes(blackHoleSwift, "SCShareableContent.excludingDesktopWindows", "macOS ScreenCaptureKit desktop source");
+includes(blackHoleSwift, "Privacy_ScreenCapture", "macOS screen-capture permission settings guidance");
+includes(blackHoleSwift, "retryCaptureAfterPermissionChange()", "macOS screen-capture permission retry");
+includes(macPackageScript, "sign-macos-app.sh", "macOS release bundle signing");
+includes(macSignScript, "--identifier com.codexpulse.app", "macOS release bundle signing identity");
+includes(macSignScript, "CodexPulse/Resources/CodexPulse.entitlements", "macOS main-app entitlements");
+includes(macSignScript, "CodexPulseWidget/CodexPulseWidget.entitlements", "macOS widget entitlements");
+includes(macSignScript, "codesign --verify --deep --strict", "macOS release signature verification");
+includes(macBuildAndRunScript, "sign-macos-app.sh", "macOS local-run bundle signing");
 includes(blackHoleSwift, "excludingWindows: excludedWindow.map", "macOS capture excludes its own transparent pet window");
 includes(blackHoleSwift, "NSWorkspace.didWakeNotification", "macOS black-hole wake recovery observer");
 includes(blackHoleSwift, "captureGeneration &+= 1", "macOS invalidates stale pre-sleep capture tasks");
