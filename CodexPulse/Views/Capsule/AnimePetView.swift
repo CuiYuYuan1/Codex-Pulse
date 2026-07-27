@@ -130,6 +130,7 @@ struct AnimePetView: View {
         case .robot: base = 0.46
         case .cat: base = 0.60
         case .fox: base = 0.64
+        case .orb, .orb2, .orb3, .orb4: base = 0.52
         case .blackHole: base = 0.52
         }
         if from.isResting || to.isResting {
@@ -293,7 +294,7 @@ private enum AnimePetTransitionChoreography {
                 y: weightShift * 0.8,
                 rotation: weightShift * (enteringLocomotion ? -1.25 : 0.55)
             )
-        case .ghost, .blackHole:
+        case .ghost, .orb, .orb2, .orb3, .orb4, .blackHole:
             // A floating companion changes state through inertia rather than
             // planted feet: it glides past center and gently returns.
             return AnimePetTransitionMotion(
@@ -434,7 +435,7 @@ enum PetFootstepPainter {
 
     private static func groundY(for character: PetCharacter) -> CGFloat {
         switch character {
-        case .ghost, .blackHole: return 244
+        case .ghost, .orb, .orb2, .orb3, .orb4, .blackHole: return 244
         case .cat: return 249
         case .dino, .bunny, .robot, .fox: return 251
         }
@@ -550,7 +551,7 @@ enum PetFootstepPainter {
             }
             context.fill(toes, with: .color(fill))
             context.stroke(toes, with: .color(rim), lineWidth: 0.7)
-        case .ghost, .blackHole:
+        case .ghost, .orb, .orb2, .orb3, .orb4, .blackHole:
             let ripple = Path(ellipseIn: CGRect(
                 x: center.x - 18 * scale,
                 y: center.y - 3 * scale,
@@ -758,6 +759,7 @@ private enum AnimePetPainter {
         case .robot: return 0.94
         case .cat: return 0.89
         case .fox: return 1.12
+        case .orb, .orb2, .orb3, .orb4: return 1.0
         case .blackHole: return 1.28
         }
     }
@@ -800,6 +802,7 @@ private enum AnimePetPainter {
         case .robot: return 1.35
         case .cat: return 1.45
         case .fox: return 1.45
+        case .orb, .orb2, .orb3, .orb4: return 1.45
         case .blackHole: return 1.45
         }
     }
@@ -830,7 +833,7 @@ private enum AnimePetPainter {
             case .bunny:
                 y = -max(0, sin(phase)) * 3.4 + max(0, -sin(phase)) * 0.8
                 rotation = sin(phase - 0.35) * 0.55
-            case .ghost, .blackHole:
+            case .ghost, .orb, .orb2, .orb3, .orb4, .blackHole:
                 y = sin(phase) * 2.4
                 rotation = sin(phase - 0.55) * 1.1
                 scaleX = 1 + cos(phase) * 0.012
@@ -924,6 +927,9 @@ private enum AnimePetPainter {
         case .fox:
             keyX = (-39, 12)
             keyY = 74
+        case .orb, .orb2, .orb3, .orb4:
+            keyX = (-24, 24)
+            keyY = 66
         case .blackHole:
             keyX = (-24, 24)
             keyY = 66
@@ -959,6 +965,7 @@ private enum AnimePetPainter {
         case .robot: return 2.8
         case .cat: return 3.6
         case .fox: return 3.6
+        case .orb, .orb2, .orb3, .orb4: return 3.2
         case .blackHole: return 4.2
         }
     }
@@ -971,6 +978,7 @@ private enum AnimePetPainter {
         case .robot: return 0.35
         case .cat: return 0.8
         case .fox: return 0.8
+        case .orb, .orb2, .orb3, .orb4: return 1.0
         case .blackHole: return 1.0
         }
     }

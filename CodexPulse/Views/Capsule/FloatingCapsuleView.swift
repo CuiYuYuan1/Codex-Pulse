@@ -35,6 +35,7 @@ struct FloatingCapsuleView: View {
     @State private var catMonitorHideTask: Task<Void, Never>?
     @State private var catTransientAnimation: PetAnimationState?
     @State private var catTransientAnimationTask: Task<Void, Never>?
+    @AppStorage("pulse.orb.page") private var orbPageRawValue = OrbPetPage.quota.rawValue
 
     /// 面板本身透明，但 SwiftUI 光效仍会被 NSPanel 边界裁切。
     /// 这里需要同时容纳磁吸位移、悬停缩放和模糊描边。
@@ -124,7 +125,8 @@ struct FloatingCapsuleView: View {
     }
 
     private var petGrowthScale: CGFloat {
-        CGFloat(PetGrowth.scale(forTodayTokens: todayTokens))
+        guard !isOrbPet else { return 1 }
+        return CGFloat(PetGrowth.scale(forTodayTokens: todayTokens))
     }
 
     private var informationBarEnabled: Bool {
@@ -152,13 +154,26 @@ struct FloatingCapsuleView: View {
         switch store.settings.resolvedPetCharacter {
         case .cat, .fox:
             return true
-        case .dino, .bunny, .ghost, .robot, .blackHole:
+        case .dino, .bunny, .ghost, .robot, .orb, .orb2, .orb3, .orb4, .blackHole:
             return false
         }
     }
 
+    private var isOrbPet: Bool {
+        store.settings.resolvedPetCharacter.isOrb
+    }
+
+    private var resolvedOrbPage: OrbPetPage {
+        let stored = OrbPetPage(rawValue: orbPageRawValue) ?? .quota
+        if store.snapshot.account.authMode == .apiKey, stored == .quota {
+            return .tokens
+        }
+        return stored
+    }
+
     private var catRoamingEnabled: Bool {
         isMini
+            && !isOrbPet
             && (mode == .idle || mode == .offline)
             && !isMiniConversationExpanded
             && !reduceMotion
@@ -172,6 +187,7 @@ struct FloatingCapsuleView: View {
         case .ghost: return 1.24
         case .robot: return 0.94
         case .fox: return 1.12
+        case .orb, .orb2, .orb3, .orb4: return 1.0
         case .blackHole: return 1.28
         }
     }
@@ -184,6 +200,7 @@ struct FloatingCapsuleView: View {
         case .ghost: return 18
         case .robot: return 4
         case .fox: return 8
+        case .orb, .orb2, .orb3, .orb4: return 0
         case .blackHole: return 5
         }
     }
@@ -192,6 +209,7 @@ struct FloatingCapsuleView: View {
         switch store.settings.resolvedPetCharacter {
         case .ghost, .blackHole: return 90
         case .dino, .cat, .bunny, .robot, .fox: return 140
+        case .orb, .orb2, .orb3, .orb4: return 0
         }
     }
 
@@ -224,22 +242,37 @@ struct FloatingCapsuleView: View {
         guard weatherLocation != nil else { return false }
         return informationBarEnabled
             || (isMini && activeMiniCapsuleStyle == .weather)
+            || (
+                isMini
+                && isOrbPet
+                && (
+                    resolvedOrbPage == .weather
+                    || resolvedOrbPage == .temperature
+                )
+            )
     }
 
     private var weatherTaskID: String {
         guard needsWeatherData, let location = weatherLocation else { return "weather-off" }
-        return "weather-\(location.id)-\(activeMiniCapsuleStyle.rawValue)-\(isMini)"
+        let displayPage = isOrbPet
+            ? "orb-\(resolvedOrbPage.rawValue)"
+            : activeMiniCapsuleStyle.rawValue
+        return "weather-\(location.id)-\(displayPage)-\(isMini)"
     }
 
     private var miniCapsule: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            let presentation = miniPresentation(at: context.date)
+            let presentation = isOrbPet
+                ? orbPresentation(at: context.date)
+                : miniPresentation(at: context.date)
             let activeQuota = activePetQuotaPresentation(at: context.date)
             PetCapsuleView(
                 character: store.settings.resolvedPetCharacter,
                 animationState: petAnimationState(at: context.date),
                 idleStyle: activeMiniCapsuleStyle,
+                orbPage: resolvedOrbPage,
                 idleValue: presentation.value,
+                idleProgress: presentation.progress,
                 idleColor: presentation.color,
                 idleHelp: presentation.help,
                 showsIdleContent: mode == .idle || mode == .offline,
@@ -374,6 +407,85 @@ struct FloatingCapsuleView: View {
         }
     }
 
+    private func orbPresentation(at date: Date) -> MiniCapsulePresentation {
+        switch resolvedOrbPage {
+        case .quota:
+            let percent = min(100, max(0, remainingPercent ?? 0))
+            return MiniCapsulePresentation(
+                value: remainingPercent.map { String(format: "%.0f%%", $0) } ?? "—",
+                progress: percent / 100,
+                color: remainingPercent.map(orbQuotaColor) ?? PulseTheme.gray,
+                help: remainingPercent.map { "剩余额度 \(String(format: "%.0f%%", $0))" } ?? "额度暂不可用"
+            )
+
+        case .tokens:
+            let value = isRealtimeTokenMode
+                ? PulseFormatters.liveTokens(todayTokens)
+                : PulseFormatters.tokens(todayTokens)
+            return MiniCapsulePresentation(
+                value: value,
+                progress: todayTokens == nil ? 0 : 0.72,
+                color: PulseTheme.blue,
+                help: "今日 Token \(value)"
+            )
+
+        case .weather:
+            let value = weatherViewModel.snapshot?.condition.compactDisplayName ?? "—"
+            let description = weatherViewModel.snapshot.map {
+                "\($0.condition.displayName) \(String(format: "%.0f°C", $0.temperature))"
+            } ?? "天气暂不可用"
+            return MiniCapsulePresentation(
+                value: value,
+                progress: weatherViewModel.snapshot == nil ? 0 : 0.64,
+                color: weatherViewModel.snapshot?.isDay == false
+                    ? Color(hex: 0x9BBEFF)
+                    : Color(hex: 0x64C7FF),
+                help: description
+            )
+
+        case .temperature:
+            let value = weatherViewModel.snapshot.map {
+                String(format: "%.0f°", $0.temperature)
+            } ?? "—"
+            return MiniCapsulePresentation(
+                value: value,
+                progress: weatherViewModel.snapshot == nil ? 0 : 0.64,
+                color: weatherViewModel.snapshot?.isDay == false
+                    ? Color(hex: 0x9BBEFF)
+                    : PulseTheme.orange,
+                help: weatherViewModel.snapshot.map {
+                    "当前温度 \(String(format: "%.0f°C", $0.temperature))"
+                } ?? "温度暂不可用"
+            )
+
+        case .time:
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "zh_CN")
+            let timezone = weatherLocation.flatMap {
+                TimeZone(identifier: $0.timezone)
+            } ?? .current
+            formatter.timeZone = timezone
+            formatter.dateFormat = "HH:mm"
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = timezone
+            let minute = calendar.component(.minute, from: date)
+            let value = formatter.string(from: date)
+            return MiniCapsulePresentation(
+                value: value,
+                progress: Double(minute) / 60,
+                color: visualTheme.accent,
+                help: "当地时间 \(value)"
+            )
+        }
+    }
+
+    private func orbQuotaColor(_ remaining: Double) -> Color {
+        if remaining >= 80 { return PulseTheme.green }
+        if remaining >= 50 { return PulseTheme.blue }
+        if remaining >= 20 { return PulseTheme.orange }
+        return PulseTheme.red
+    }
+
     // MARK: - Body
 
     @ViewBuilder
@@ -487,8 +599,9 @@ struct FloatingCapsuleView: View {
         .onChange(of: catRoamingEnabled) { _, _ in
             synchronizeCatRoaming()
         }
-        .onChange(of: store.settings.resolvedPetCharacter) { _, _ in
+        .onChange(of: store.settings.resolvedPetCharacter) { _, character in
             synchronizeCatRoaming()
+            FloatingCapsuleController.shared.updateCompactHitRegion(for: character)
         }
         .onChange(of: isMini) { _, mini in
             guard mini, isCatPet else { return }
@@ -678,6 +791,11 @@ struct FloatingCapsuleView: View {
     }
 
     private func handleMiniSingleClick() {
+        if isOrbPet {
+            cycleOrbPage()
+            return
+        }
+
         if isMiniTaskConversationAvailable {
             withAnimation(.spring(response: 0.38, dampingFraction: 0.86)) {
                 isMiniConversationExpanded.toggle()
@@ -708,6 +826,17 @@ struct FloatingCapsuleView: View {
             revealCatMonitor(for: 3.4)
         }
         PulseLog.write("mini pet display cycled to \(next.rawValue)")
+    }
+
+    private func cycleOrbPage() {
+        let pages: [OrbPetPage] = store.snapshot.account.authMode == .apiKey
+            ? [.tokens, .weather, .temperature, .time]
+            : OrbPetPage.allCases
+        let current = resolvedOrbPage
+        let index = pages.firstIndex(of: current) ?? 0
+        let next = pages[(index + 1) % pages.count]
+        orbPageRawValue = next.rawValue
+        PulseLog.write("orb pet display cycled to \(next.rawValue)")
     }
 
     private func synchronizeCatRoaming() {

@@ -41,6 +41,7 @@ private final class InteractiveCapsulePanel: NSPanel {
     var onManualDragMoved: ((NSPoint) -> Void)?
     var onManualDragEnded: ((NSPoint) -> Void)?
     var usesCompactHitRegion = false
+    var usesOrbCircularHitRegion = false
     var compactHitRegionSize = CGSize(width: 240, height: 153.6)
     private var capsuleMouseDownScreenLocation: NSPoint?
     private var capsuleMouseDownFrameOrigin: NSPoint?
@@ -145,6 +146,10 @@ private final class InteractiveCapsulePanel: NSPanel {
         let point = contentView.convert(event.locationInWindow, from: nil)
         let bounds = contentView.bounds
         if isCompactInteractionActive {
+            if usesOrbCircularHitRegion {
+                let center = NSPoint(x: bounds.midX, y: bounds.midY)
+                return hypot(point.x - center.x, point.y - center.y) <= 31
+            }
             return bounds.insetBy(dx: 1, dy: 1).contains(point)
         }
         if isPetConversationLayout {
@@ -317,6 +322,7 @@ final class FloatingCapsuleController {
         panel.isMovableByWindowBackground = true
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
+        panel.usesOrbCircularHitRegion = store.settings.resolvedPetCharacter.isOrb
         panel.onCapsuleClick = { [weak self] in
             if self?.wakeSleepingPetFromClick() == true { return }
             self?.scheduleCatRoamingResume(after: 4)
@@ -365,6 +371,8 @@ final class FloatingCapsuleController {
         let targetUsesCompactHitRegion = isCompactPetSize(contentSize)
         if let interactivePanel = panel as? InteractiveCapsulePanel {
             interactivePanel.usesCompactHitRegion = targetUsesCompactHitRegion
+            interactivePanel.usesOrbCircularHitRegion =
+                activeStore?.settings.resolvedPetCharacter.isOrb == true
             let growthScale = CGFloat(PetGrowth.scale(
                 forTodayTokens: activeStore?.snapshot.usage.todayTokens
             ))
@@ -452,6 +460,10 @@ final class FloatingCapsuleController {
 
     func suppressNextCapsuleClick() {
         (panel as? InteractiveCapsulePanel)?.suppressNextCapsuleClick()
+    }
+
+    func updateCompactHitRegion(for character: PetCharacter) {
+        (panel as? InteractiveCapsulePanel)?.usesOrbCircularHitRegion = character.isOrb
     }
 
     func prepareForTermination() {

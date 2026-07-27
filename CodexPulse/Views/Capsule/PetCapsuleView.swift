@@ -107,7 +107,9 @@ struct PetCapsuleView: View {
     let character: PetCharacter
     let animationState: PetAnimationState
     let idleStyle: MiniCapsuleStyle
+    let orbPage: OrbPetPage
     let idleValue: String
+    let idleProgress: Double
     let idleColor: Color
     let idleHelp: String
     let showsIdleContent: Bool
@@ -144,6 +146,7 @@ struct PetCapsuleView: View {
         case .ghost: return CGRect(x: 125, y: 17, width: 79, height: 36)
         case .robot: return CGRect(x: 122, y: 21, width: 82, height: 34)
         case .fox: return CGRect(x: 124, y: 19, width: 80, height: 34)
+        case .orb, .orb2, .orb3, .orb4: return .zero
         case .blackHole: return .zero
         }
     }
@@ -266,6 +269,16 @@ struct PetCapsuleView: View {
                     roamingActivity: catRoamingActivity,
                     facesLeft: catFacesLeft
                 )
+            } else if character.isOrb {
+                OrbPetView(
+                    style: OrbPetStyle(rawValue: character.orbStyleIndex ?? 1) ?? .glassRing,
+                    animationState: animationState,
+                    page: orbPage,
+                    value: idleValue,
+                    progress: idleProgress,
+                    dataColor: idleColor,
+                    reduceMotion: reduceMotion
+                )
             } else if character == .cat {
                 ProceduralCatView(
                     animationState: animationState,
@@ -339,7 +352,7 @@ struct PetCapsuleView: View {
     }
 
     private var shouldShowMonitor: Bool {
-        guard character != .blackHole else { return false }
+        guard character != .blackHole, !character.isOrb else { return false }
         return (character != .cat && character != .fox)
             || !showsIdleContent
             || showsTransientMonitor
@@ -501,7 +514,7 @@ struct PetCapsuleView: View {
             }
             .monitorFrame(displayFrame)
 
-        case .blackHole:
+        case .orb, .orb2, .orb3, .orb4, .blackHole:
             EmptyView()
         }
     }

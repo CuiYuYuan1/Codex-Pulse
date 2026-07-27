@@ -23,6 +23,10 @@ const blackHoleSwift = fs.readFileSync(
   path.join(root, "CodexPulse/Views/Capsule/BlackHolePetView.swift"),
   "utf8"
 );
+const orbPetSwift = fs.readFileSync(
+  path.join(root, "CodexPulse/Views/Capsule/OrbPetView.swift"),
+  "utf8"
+);
 const blackHoleMetal = fs.readFileSync(
   path.join(root, "CodexPulse/Resources/BlackHolePetShader.metal.txt"),
   "utf8"
@@ -115,6 +119,58 @@ includes(petSwift, "ProceduralCatView(", "macOS procedural cat renderer");
 includes(petSwift, "AnimePetView(", "macOS anime renderer for the other four companions");
 includes(settingsStore, 'case blackHole = "black_hole"', "shared Event Horizon pet identity");
 includes(petSwift, "BlackHolePetView(", "macOS procedural Event Horizon pet renderer");
+includes(settingsStore, "case orb", "shared small-orb pet identity");
+includes(settingsStore, 'case orb2 = "orb_2"', "shared small-orb 2 identity");
+includes(settingsStore, 'case orb3 = "orb_3"', "shared small-orb 3 identity");
+includes(settingsStore, 'case orb4 = "orb_4"', "shared small-orb 4 identity");
+includes(settingsStore, 'case .orb: return "小圆球1"', "shared small-orb 1 label");
+includes(settingsStore, 'case .orb4: return "小圆球4"', "shared small-orb 4 label");
+includes(settingsStore, "var isOrb: Bool", "shared small-orb family behavior");
+includes(petSwift, "OrbPetView(", "macOS procedural small-orb pet renderer");
+includes(orbPetSwift, ".frame(width: 62, height: 62)", "macOS small-orb visual size");
+includes(orbPetSwift, ".fill(.ultraThinMaterial)", "macOS small-orb frosted glass center");
+includes(orbPetSwift, ".environment(\\.colorScheme, .light)", "macOS small-orb light frosted material");
+includes(orbPetSwift, "case glassRing = 1", "macOS small-orb continuous-ring style");
+includes(orbPetSwift, "case dashedRing = 2", "macOS small-orb dashed-ring style");
+includes(orbPetSwift, "case liquid = 3", "macOS small-orb liquid style");
+includes(orbPetSwift, "case darkDial = 4", "macOS small-orb dark-dial style");
+includes(orbPetSwift, "completeRing(opacity:", "macOS partial progress keeps a complete colored base ring");
+includes(orbPetSwift, "OrbWaveFill(", "macOS liquid small-orb renderer");
+includes(orbPetSwift, ".frame(width: 49, height: 62, alignment: .center)", "macOS small-orb centered content");
+includes(orbPetSwift, "if let tokenParts", "macOS small-orb splits Token number and unit");
+assert(!orbPetSwift.includes("rotationEffect(.degrees(-ringRotation))"), "macOS small-orb value must remain stationary while its ring rotates");
+assert(!css.includes("top: calc(var(--pet-display-top) + 19.5px)"), "Windows small-orb content must use the full circle flex center");
+assert(!orbPetSwift.includes("statusDotSize"), "macOS small-orb must not restore the redundant status dot");
+includes(swift, "if remaining >= 80 { return PulseTheme.green }", "macOS small-orb green quota threshold");
+includes(swift, "if remaining >= 50 { return PulseTheme.blue }", "macOS small-orb blue quota threshold");
+includes(swift, "if remaining >= 20 { return PulseTheme.orange }", "macOS small-orb orange quota threshold");
+includes(renderer, "if (remaining >= 80) return \"#30d158\";", "Windows small-orb green quota threshold");
+includes(renderer, "if (remaining >= 50) return \"#0a84ff\";", "Windows small-orb blue quota threshold");
+includes(renderer, "if (remaining >= 20) return \"#ff9f0a\";", "Windows small-orb orange quota threshold");
+includes(swift, "guard !isOrbPet else { return 1 }", "macOS small-orb ignores Token growth");
+includes(swift, "isMini\n            && !isOrbPet", "macOS small-orb stays where the user moves it");
+includes(swift, "if isOrbPet {\n            cycleOrbPage()", "macOS small-orb click cycles its own data");
+includes(capsuleController, "usesOrbCircularHitRegion", "macOS small-orb circular hit region");
+includes(capsuleController, "hypot(point.x - center.x, point.y - center.y) <= 31", "macOS small-orb exact circular hit test");
+includes(renderer, 'const orbPetCharacters = new Set(["orb", "orb_2", "orb_3", "orb_4"])', "Windows small-orb family identities");
+includes(renderer, "const nextScale = isOrbCharacter()", "Windows small-orb family ignores Token growth");
+includes(renderer, "if (isOrbCharacter()) return false;", "Windows small-orb family stays where the user moves it");
+includes(renderer, "if (isOrbCharacter()) {\n    cycleMiniDisplay();", "Windows small-orb family click cycles its own data");
+includes(renderer, "function isMiniOrbPointerHit(event)", "Windows small-orb circular hit region");
+includes(renderer, "Math.hypot(dx, dy) <= radius", "Windows small-orb exact circular hit test");
+includes(renderer, "splitCompactTokenUnit(monitorValue)", "Windows small-orb splits Token number and unit");
+includes(css, ".capsule[data-orb-style] .pet-orb", "Windows procedural small-orb renderer");
+includes(css, "content: attr(data-unit)", "Windows small-orb renders Token unit below its number");
+includes(css, '.capsule[data-orb-style="2"] .pet-orb::after', "Windows dashed small-orb renderer");
+includes(css, '.capsule[data-orb-style="3"] .pet-orb-liquid', "Windows liquid small-orb renderer");
+includes(css, '.capsule[data-orb-style="4"] .pet-orb', "Windows dark small-orb renderer");
+assert(!html.includes("petOrbStatus"), "Windows small-orb must not restore the redundant status dot");
+assert(!html.includes("petOrbLabel"), "Windows small-orb center must stay title-free");
+assert(!orbPetSwift.includes("shortPageLabel"), "macOS small-orb center must stay title-free");
+includes(html, 'data-value="orb"', "Windows small-orb pet picker option");
+includes(html, 'data-value="orb_2"', "Windows small-orb 2 picker option");
+includes(html, 'data-value="orb_3"', "Windows small-orb 3 picker option");
+includes(html, 'data-value="orb_4"', "Windows small-orb 4 picker option");
 includes(petGrowthSwift, "static let baseInterval: Int64 = 10_000_000", "macOS 10M pet-growth base interval");
 includes(petGrowthSwift, "static let maximumScale = 10.0", "macOS pet-growth 10x cap");
 includes(petGrowthWeb, "const BASE_INTERVAL = 10_000_000", "Windows 10M pet-growth base interval");
@@ -506,7 +562,7 @@ includes(renderer, 'localStorage.getItem(lastUsageModePreferenceKey) === "api"',
 includes(renderer, "function formatLiveUsageTokens(value)", "Windows live Token precision");
 includes(renderer, 'state.account?.auth !== "API Key"', "Windows active pet quota excludes API Key sessions");
 includes(renderer, "activeElapsed % 8 >= 5", "Windows active pet quota carousel cadence");
-includes(renderer, "function setMiniMonitorText(value, animated)", "Windows pet monitor upward page roll");
+includes(renderer, 'function setMiniMonitorText(value, animated, unit = "")', "Windows pet monitor upward page roll");
 includes(html, 'id="todayTokensPrevious"', "Windows compositor Token roll layer");
 includes(html, 'id="miniValuePrevious"', "Windows pet monitor compositor roll layer");
 includes(pulseStore, "mergeRealtimeThreadTokenTotal", "macOS real-time Token delta merge");

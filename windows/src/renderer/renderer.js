@@ -1,5 +1,5 @@
 const elements = Object.fromEntries([
-  "capsule", "detail", "miniCapsule", "miniRingProgress", "miniValue", "miniValuePrevious", "petAnimation", "petAnimationNext", "petCatCanvas", "petBlackHoleCanvas", "petBlackHoleCode", "weatherScene", "weatherAnimation", "weatherSpacer", "statusDot", "quotaRing", "quotaArc", "remaining", "todayTokens", "todayTokensPrevious", "chevron",
+  "capsule", "detail", "miniCapsule", "miniRingProgress", "miniValue", "miniValuePrevious", "petAnimation", "petAnimationNext", "petCatCanvas", "petBlackHoleCanvas", "petBlackHoleCode", "petOrbProgress", "weatherScene", "weatherAnimation", "weatherSpacer", "statusDot", "quotaRing", "quotaArc", "remaining", "todayTokens", "todayTokensPrevious", "chevron",
   "informationStrip", "informationWeatherContent", "informationTaskContent", "informationTaskStatus", "informationTaskSummary", "weatherMiniIcon", "weatherSummary", "informationLocation", "informationWeekday", "informationTime",
   "conversationDetail", "conversationMessages", "conversationLiveLabel", "conversationClose",
   "email", "plan", "taskBadge", "connectionMessage", "chooseCodex", "resetTime",
@@ -114,12 +114,21 @@ const miniStyleLabels = Object.freeze({
   tokens: "今日 Token",
   status: "任务状态",
   weather: "天气温度",
+  temperature: "温度",
   time: "当地时间"
 });
 let miniStylePreference = loadMiniStylePreference();
 let apiMiniStylePreference = loadAPIMiniStylePreference();
+const orbPagePreferenceKey = "codexPulse.orbPage";
+const orbPages = Object.freeze(["quota", "tokens", "weather", "temperature", "time"]);
+let orbPagePreference = loadOrbPagePreference();
 const petPreferenceKey = "codexPulse.petCharacter";
-const petCharacters = new Set(["dino", "cat", "bunny", "ghost", "robot", "fox", "black_hole"]);
+const orbPetCharacters = new Set(["orb", "orb_2", "orb_3", "orb_4"]);
+const petCharacters = new Set([
+  "dino", "cat", "bunny", "ghost", "robot", "fox",
+  ...orbPetCharacters,
+  "black_hole"
+]);
 const petCharacterLabels = Object.freeze({
   dino: "小恐龙",
   cat: "猫咪",
@@ -127,10 +136,26 @@ const petCharacterLabels = Object.freeze({
   ghost: "幽灵",
   robot: "机器人",
   fox: "九尾狐",
+  orb: "小圆球1",
+  orb_2: "小圆球2",
+  orb_3: "小圆球3",
+  orb_4: "小圆球4",
   black_hole: "事件视界"
 });
 let petCharacterPreference = loadPetPreference();
 let activePreferenceMenu = null;
+
+function isOrbCharacter(character = petCharacterPreference) {
+  return orbPetCharacters.has(character);
+}
+
+function orbStyleForCharacter(character = petCharacterPreference) {
+  if (!isOrbCharacter(character)) return "";
+  if (character === "orb_2") return "2";
+  if (character === "orb_3") return "3";
+  if (character === "orb_4") return "4";
+  return "1";
+}
 
 const weatherKinds = Object.freeze({
   clear: "晴",
@@ -325,6 +350,15 @@ function loadAPIMiniStylePreference() {
   }
 }
 
+function loadOrbPagePreference() {
+  try {
+    const saved = localStorage.getItem(orbPagePreferenceKey);
+    return orbPages.includes(saved) ? saved : "quota";
+  } catch {
+    return "quota";
+  }
+}
+
 function usesAPIMiniStyle(state = currentState) {
   const auth = String(state?.account?.auth || "");
   const recognizedAPI = auth === "API Key" || isCustomProviderState(state);
@@ -340,6 +374,11 @@ function usesAPIMiniStyle(state = currentState) {
 }
 
 function effectiveMiniStyle(state = currentState) {
+  if (isOrbCharacter()) {
+    return usesAPIMiniStyle(state) && orbPagePreference === "quota"
+      ? "tokens"
+      : orbPagePreference;
+  }
   return usesAPIMiniStyle(state) ? apiMiniStylePreference : miniStylePreference;
 }
 
@@ -350,6 +389,19 @@ function miniTaskConversationAvailable(state = currentState) {
 }
 
 function cycleMiniDisplay() {
+  if (isOrbCharacter()) {
+    const pages = usesAPIMiniStyle()
+      ? ["tokens", "weather", "temperature", "time"]
+      : orbPages;
+    const current = effectiveMiniStyle();
+    const currentIndex = pages.indexOf(current);
+    orbPagePreference = pages[(currentIndex >= 0 ? currentIndex + 1 : 0) % pages.length];
+    try {
+      localStorage.setItem(orbPagePreferenceKey, orbPagePreference);
+    } catch { /* 设置仍在本次运行内生效。 */ }
+    applyMiniStylePreference();
+    return;
+  }
   const apiMode = usesAPIMiniStyle();
   const styles = apiMode
     ? ["tokens", "weather", "time"]
@@ -400,6 +452,11 @@ function loadPetPreference() {
 
 function applyPetPreference() {
   elements.capsule.dataset.pet = petCharacterPreference;
+  if (isOrbCharacter()) {
+    elements.capsule.dataset.orbStyle = orbStyleForCharacter();
+  } else {
+    delete elements.capsule.dataset.orbStyle;
+  }
   syncPreferencePicker(
     elements.petCharacter,
     elements.petCharacterLabel,
@@ -410,6 +467,7 @@ function applyPetPreference() {
   try {
     localStorage.setItem(petPreferenceKey, petCharacterPreference);
   } catch { /* 设置仍在本次运行内生效。 */ }
+  applyMiniStylePreference({ rerender: false });
   void blackHolePet.setActive(miniMode && petCharacterPreference === "black_hole");
   if (currentState) renderMini(currentState);
   if (miniMode && !miniTransitioning) {
@@ -458,6 +516,14 @@ function formatTokens(value) {
 
 function formatUsageTokens(value) {
   return formatTokens(value);
+}
+
+function splitCompactTokenUnit(value) {
+  const text = String(value);
+  const match = text.match(/^(.+?)([KMB])$/);
+  return match
+    ? { number: match[1], unit: match[2] }
+    : { number: text, unit: "" };
 }
 
 function formatLiveUsageTokens(value) {
@@ -543,12 +609,14 @@ function setLiveTokenText(value, animated) {
   });
 }
 
-function setMiniMonitorText(value, animated) {
+function setMiniMonitorText(value, animated, unit = "") {
   const current = elements.miniValue;
   const previous = elements.miniValuePrevious;
   const nextText = String(value);
+  const nextUnit = String(unit);
   const oldText = current.textContent || "—";
-  if (oldText === nextText) return;
+  const oldUnit = current.dataset.unit || "";
+  if (oldText === nextText && oldUnit === nextUnit) return;
 
   miniMonitorRollGeneration += 1;
   const generation = miniMonitorRollGeneration;
@@ -558,14 +626,17 @@ function setMiniMonitorText(value, animated) {
   if (!animated || reduceMotion || oldText === "—" || nextText === "—") {
     previous.hidden = true;
     current.textContent = nextText;
+    current.dataset.unit = nextUnit;
     current.style.removeProperty("transform");
     current.style.removeProperty("opacity");
     return;
   }
 
   previous.textContent = oldText;
+  previous.dataset.unit = oldUnit;
   previous.hidden = false;
   current.textContent = nextText;
+  current.dataset.unit = nextUnit;
   const timing = { duration: 240, easing: "cubic-bezier(.2,.78,.3,1)", fill: "both" };
   const outgoing = previous.animate([
     { transform: "translateY(0)", opacity: 1 },
@@ -625,6 +696,14 @@ function usageColor(remaining) {
   if (remaining < 20) return "var(--red)";
   if (remaining < 60) return "var(--orange)";
   return "var(--green)";
+}
+
+function orbQuotaColor(remaining) {
+  if (!Number.isFinite(remaining)) return "#8e8e93";
+  if (remaining >= 80) return "#30d158";
+  if (remaining >= 50) return "#0a84ff";
+  if (remaining >= 20) return "#ff9f0a";
+  return "#ff453a";
 }
 
 function formatCountdown(timestamp) {
@@ -770,6 +849,7 @@ function petRoamingArcHeight(character) {
 }
 
 function petRoamIsEligible() {
+  if (isOrbCharacter()) return false;
   if (!miniMode || miniTransitioning || expanded || conversationExpanded || miniConversationExpanded) return false;
   const mode = currentState ? modeFor(currentState) : "offline";
   return (mode === "idle" || mode === "offline") && !reduceMotion;
@@ -991,9 +1071,9 @@ function setPetVisual(path, alt) {
 }
 
 function applyPetGrowth(state) {
-  const nextScale = window.CodexPetGrowth.scaleForTodayTokens(
-    state?.usage?.today
-  );
+  const nextScale = isOrbCharacter()
+    ? 1
+    : window.CodexPetGrowth.scaleForTodayTokens(state?.usage?.today);
   if (Math.abs(nextScale - petGrowthScale) < 0.001) return;
   petGrowthScale = nextScale;
   document.documentElement.style.setProperty(
@@ -1043,6 +1123,13 @@ function renderMini(state, now = new Date()) {
       title = mode === "attention" ? "等待授权" : mode === "working" ? "思考中" : mode === "idle" ? "空闲" : "未连接";
       break;
     case "weather": {
+      if (isOrbCharacter()) {
+        value = weatherLabel(weather?.code, weather?.isDay !== false);
+        progress = Number.isFinite(Number(weather?.code)) ? 64 : 0;
+        color = weather?.isDay === false ? "#8ebcff" : "#55b8ff";
+        title = value === weatherKinds.unknown ? "天气暂不可用" : `天气 · ${value}`;
+        break;
+      }
       const temperature = Number(weather?.temperature);
       value = Number.isFinite(temperature) ? `${Math.round(temperature)}°` : "—";
       progress = Number.isFinite(temperature) ? 64 : 0;
@@ -1050,6 +1137,16 @@ function renderMini(state, now = new Date()) {
       title = Number.isFinite(temperature)
         ? `${weatherLabel(weather.code, weather.isDay !== false)} ${Math.round(temperature)}${weather.unit || "°C"}`
         : "天气暂不可用";
+      break;
+    }
+    case "temperature": {
+      const temperature = Number(weather?.temperature);
+      value = Number.isFinite(temperature) ? `${Math.round(temperature)}°` : "—";
+      progress = Number.isFinite(temperature) ? 64 : 0;
+      color = weather?.isDay === false ? "#8ebcff" : "#55b8ff";
+      title = Number.isFinite(temperature)
+        ? `温度 · ${Math.round(temperature)}${weather.unit || "°C"}`
+        : "温度暂不可用";
       break;
     }
     case "time": {
@@ -1067,7 +1164,11 @@ function renderMini(state, now = new Date()) {
         && !primary;
       value = apiFallback ? "API" : Number.isFinite(remaining) ? `${Math.round(remaining)}%` : "—";
       progress = apiFallback ? 100 : Number.isFinite(remaining) ? Math.max(0, Math.min(100, remaining)) : 0;
-      color = apiFallback ? "var(--blue)" : usageColor(remaining);
+      color = apiFallback
+        ? "var(--blue)"
+        : isOrbCharacter()
+        ? orbQuotaColor(remaining)
+        : usageColor(remaining);
       title = apiFallback ? "API 按量计费" : Number.isFinite(remaining) ? `剩余额度 ${Math.round(remaining)}%` : "暂无额度";
       break;
     }
@@ -1078,10 +1179,16 @@ function renderMini(state, now = new Date()) {
   const interactionPhase = Math.floor(now.getTime() / 1000) % 13;
   const petState = petRoamingState || resolveCatPetState(state, mode, now);
   const isBlackHolePet = petCharacterPreference === "black_hole";
+  const isOrbPet = isOrbCharacter();
+  elements.capsule.dataset.petMode = mode;
+  elements.miniCapsule.style.setProperty(
+    "--orb-level",
+    `${Math.max(12, Math.min(92, visualProgress))}%`
+  );
   void blackHolePet.setActive(miniMode && isBlackHolePet);
   blackHolePet.setState(petState);
-  proceduralCat.setVisible(!isBlackHolePet);
-  if (!isBlackHolePet) {
+  proceduralCat.setVisible(!isBlackHolePet && !isOrbPet);
+  if (!isBlackHolePet && !isOrbPet) {
     proceduralCat.setCharacter(petCharacterPreference);
     proceduralCat.setState(petState);
   }
@@ -1108,27 +1215,34 @@ function renderMini(state, now = new Date()) {
   const showsActiveQuota = (mode === "working" || mode === "attention")
     && accountQuotaAvailable
     && activeElapsed % 8 >= 5;
-  const monitorValue = showsActiveQuota
+  const monitorValue = isOrbPet
+    ? value
+    : showsActiveQuota
     ? `额度${Math.round(Math.max(0, Math.min(100, remaining)))}%`
     : mode === "working"
     ? (petState === "thinking" || petState === "scratch" ? "想一下" : "工作中")
     : mode === "attention"
     ? "等待授权"
     : value;
-  const monitorColor = showsActiveQuota
+  const monitorColor = isOrbPet
+    ? color
+    : showsActiveQuota
     ? usageColor(remaining)
     : mode === "attention" ? "var(--red)" : mode === "working" ? "var(--orange)" : color;
-  elements.capsule.classList.toggle("pet-quota-page", showsActiveQuota);
-  setMiniMonitorText(monitorValue, miniMode);
+  elements.capsule.classList.toggle("pet-quota-page", !isOrbPet && showsActiveQuota);
+  const monitorParts = isOrbPet && miniStyle === "tokens"
+    ? splitCompactTokenUnit(monitorValue)
+    : { number: monitorValue, unit: "" };
+  setMiniMonitorText(monitorParts.number, miniMode, monitorParts.unit);
   elements.miniCapsule.style.setProperty("--mini-progress", `${visualProgress}`);
   elements.miniCapsule.style.setProperty("--mini-color", monitorColor);
   elements.miniRingProgress.style.setProperty("--mini-progress", `${visualProgress}`);
   elements.miniRingProgress.style.setProperty("--mini-color", color);
   elements.miniRingProgress.classList.toggle("is-complete", visualProgress >= 100);
-  const interactionHelp = mode === "working" || mode === "attention"
+  const interactionHelp = !isOrbPet && (mode === "working" || mode === "attention")
     ? "单击展开或收起当前对话"
     : "单击切换显示内容";
-  const growthLabel = `成长 ${Math.round(petGrowthScale * 100)}%`;
+  const growthLabel = isOrbPet ? "固定大小" : `成长 ${Math.round(petGrowthScale * 100)}%`;
   elements.miniCapsule.title = `${petCharacterLabels[petCharacterPreference]} · ${growthLabel} · ${title} · ${interactionHelp} · 右键切换宠物 · 双击恢复完整胶囊`;
   if (miniMode) {
     elements.capsule.setAttribute(
@@ -1350,11 +1464,24 @@ function setMiniConversationExpanded(nextExpanded, { immediate = false } = {}) {
 }
 
 function handleMiniSingleClick() {
-  if (miniTaskConversationAvailable()) {
+  if (isOrbCharacter()) {
+    cycleMiniDisplay();
+  } else if (miniTaskConversationAvailable()) {
     setMiniConversationExpanded(!miniConversationExpanded);
   } else {
     cycleMiniDisplay();
   }
+}
+
+function isMiniOrbPointerHit(event) {
+  if (!miniMode || !isOrbCharacter()) return true;
+  const orb = document.querySelector(".pet-orb");
+  if (!orb) return false;
+  const rect = orb.getBoundingClientRect();
+  const radius = Math.min(rect.width, rect.height) / 2;
+  const dx = event.clientX - (rect.left + rect.width / 2);
+  const dy = event.clientY - (rect.top + rect.height / 2);
+  return Math.hypot(dx, dy) <= radius;
 }
 
 function renderTaskInformation(state, mode) {
@@ -2393,6 +2520,7 @@ elements.capsule.addEventListener("pointerleave", () => {
 
 elements.capsule.addEventListener("pointerdown", (event) => {
   if (event.button !== 0) return;
+  if (!isMiniOrbPointerHit(event)) return;
   cancelPetRoam();
   capsulePointer = {
     id: event.pointerId,
@@ -2406,6 +2534,7 @@ elements.capsule.addEventListener("pointerdown", (event) => {
 
 elements.capsule.addEventListener("contextmenu", async (event) => {
   if (!miniMode || miniTransitioning || typeof window.pulse.showPetSwitchMenu !== "function") return;
+  if (!isMiniOrbPointerHit(event)) return;
   event.preventDefault();
   event.stopPropagation();
   clearTimeout(capsuleSingleClickTimer);
@@ -2463,7 +2592,7 @@ elements.capsule.addEventListener("pointermove", (event) => {
 
 function finishCapsulePointer(event) {
   if (!capsulePointer || capsulePointer.id !== event.pointerId) return;
-  const shouldToggle = !capsulePointer.moved;
+  const shouldToggle = !capsulePointer.moved && isMiniOrbPointerHit(event);
   const didMove = capsulePointer.moved;
   capsulePointer = null;
   pendingDrag = null;
@@ -2491,6 +2620,7 @@ function finishCapsulePointer(event) {
 elements.capsule.addEventListener("pointerup", finishCapsulePointer);
 elements.capsule.addEventListener("dblclick", (event) => {
   if (event.button !== 0) return;
+  if (!isMiniOrbPointerHit(event)) return;
   event.preventDefault();
   clearTimeout(capsuleSingleClickTimer);
   void setMiniMode(!miniMode);
@@ -2588,7 +2718,12 @@ bindPreferencePicker({
   trigger: elements.miniStyle,
   menu: elements.miniStyleMenu,
   onSelect: (value) => {
-    if (usesAPIMiniStyle()) {
+    if (isOrbCharacter() && orbPages.includes(value)) {
+      orbPagePreference = value;
+      try {
+        localStorage.setItem(orbPagePreferenceKey, orbPagePreference);
+      } catch { /* 设置仍在本次运行内生效。 */ }
+    } else if (usesAPIMiniStyle()) {
       apiMiniStylePreference = apiMiniStyles.has(value) ? value : "time";
     } else {
       miniStylePreference = miniStyles.has(value) ? value : "quota";

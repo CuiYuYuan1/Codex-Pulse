@@ -585,6 +585,7 @@ html[data-theme] .capsule::after {
 .pet-cat-canvas,
 .pet-black-hole-canvas,
 .pet-black-hole-code,
+.pet-orb,
 .pet-monitor-frame { display: none; }
 html.mini-mode .stage { padding: 12px; align-items: flex-end; }
 html.mini-mode.mini-transition-layout .stage {
@@ -1096,7 +1097,241 @@ html.mini-mode .capsule.pet-idle[data-mini-style="time"] .mini-value { font-size
 html.mini-mode .capsule.task-active .mini-value { font-size: 11px; }
 html.mini-mode .capsule.task-attention .mini-value { font-size: 9.5px; }
 html.mini-mode .capsule.pet-quota-page .mini-value { font-size: 10.5px; }
+
+/* 小圆球 1–4 共享 62px 场景、固定大小和圆形点击区域；
+   data-orb-style 只负责切换视觉语言，不改变交互。 */
+html.mini-mode .capsule[data-orb-style] {
+  --orb-green: #30d158;
+  --orb-blue: #0a84ff;
+  --orb-orange: #ff9f0a;
+  --orb-red: #ff453a;
+  --orb-state-color: var(--mini-color, var(--orb-blue));
+  --pet-display-left: 77px;
+  --pet-display-top: 33.8px;
+  --pet-display-width: 62px;
+  --pet-display-height: 62px;
+}
+html.mini-mode .capsule[data-orb-style][data-pet-mode="working"] {
+  --orb-state-color: var(--orb-orange);
+}
+html.mini-mode .capsule[data-orb-style][data-pet-mode="attention"],
+html.mini-mode .capsule[data-orb-style][data-pet-mode="error"] {
+  --orb-state-color: var(--orb-red);
+}
+html.mini-mode .capsule[data-orb-style][data-pet-mode="success"] {
+  --orb-state-color: var(--orb-green);
+}
+html.mini-mode .capsule[data-orb-style] .pet-cat-canvas,
+html.mini-mode .capsule[data-orb-style] .pet-animation,
+html.mini-mode .capsule[data-orb-style] .pet-monitor-frame {
+  display: none;
+}
+html.mini-mode .capsule[data-orb-style] .pet-orb {
+  position: absolute;
+  z-index: 2;
+  left: var(--pet-display-left);
+  top: var(--pet-display-top);
+  width: var(--pet-display-width);
+  height: var(--pet-display-height);
+  display: block;
+  box-sizing: border-box;
+  border: 0;
+  border-radius: 50%;
+  overflow: visible;
+  background-color: rgba(244,249,253,.84);
+  background-image:
+    radial-gradient(circle at 27% 19%, rgba(255,255,255,.78), rgba(255,255,255,.14) 25%, transparent 51%),
+    linear-gradient(145deg, rgba(255,255,255,.44), rgba(129,190,226,.18));
+  -webkit-backdrop-filter: blur(18px) saturate(138%) brightness(1.08);
+  backdrop-filter: blur(18px) saturate(138%) brightness(1.08);
+  box-shadow:
+    0 4px 10px rgba(0,0,0,.18),
+    0 1px 2px rgba(0,0,0,.12);
+  pointer-events: none;
+  animation: orb-pet-light-breathe 3.2s ease-in-out infinite;
+}
+html.mini-mode .capsule[data-orb-style] .pet-orb::after,
+html.mini-mode .capsule[data-orb-style] .pet-orb-progress {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  box-sizing: border-box;
+}
+html.mini-mode .capsule[data-orb-style] .pet-orb::after {
+  border: 2.6px solid color-mix(in srgb, var(--orb-state-color) 32%, transparent);
+  filter: drop-shadow(0 0 1.2px color-mix(in srgb, var(--orb-state-color) 24%, transparent));
+}
+html.mini-mode .capsule[data-orb-style] .pet-orb-progress {
+  background: conic-gradient(
+    from -90deg,
+    color-mix(in srgb, var(--orb-state-color) 84%, white)
+      calc(var(--mini-progress, 0) * 1%),
+    transparent 0
+  );
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 0);
+  mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 0);
+  filter: drop-shadow(0 0 1.5px color-mix(in srgb, var(--orb-state-color) 34%, transparent));
+}
+html.mini-mode .capsule[data-orb-style][data-pet-mode="working"] .pet-orb {
+  animation-duration: 1.55s;
+}
+html.mini-mode .capsule[data-orb-style][data-pet-mode="working"] .pet-orb-progress {
+  animation: orb-pet-progress-orbit 2.1s linear infinite;
+}
+html.mini-mode .capsule[data-orb-style][data-pet-mode="attention"] .pet-orb,
+html.mini-mode .capsule[data-orb-style][data-pet-mode="error"] .pet-orb {
+  animation-duration: 1.05s;
+}
+
+/* 小圆球2：玻璃球心 + 完整虚线状态环。 */
+html.mini-mode .capsule[data-orb-style="2"] .pet-orb::after {
+  border: 0;
+  background: repeating-conic-gradient(
+    from -4deg,
+    var(--orb-state-color) 0deg 4deg,
+    transparent 4deg 9deg
+  );
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.8px), #000 0);
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2.8px), #000 0);
+  opacity: .82;
+}
+html.mini-mode .capsule[data-orb-style="2"] .pet-orb-progress {
+  display: none;
+}
+html.mini-mode .capsule[data-orb-style="2"][data-pet-mode="working"] .pet-orb::after {
+  animation: orb-pet-progress-orbit 2.1s linear infinite;
+}
+
+/* 小圆球3：内容仍固定居中，数据以柔和液面高度呈现。 */
+html.mini-mode .capsule[data-orb-style="3"] .pet-orb {
+  overflow: hidden;
+  background-color: rgba(244,249,253,.92);
+}
+html.mini-mode .capsule[data-orb-style="3"] .pet-orb::after {
+  z-index: 3;
+  border-width: 1.4px;
+  opacity: .78;
+}
+html.mini-mode .capsule[data-orb-style="3"] .pet-orb-progress {
+  display: none;
+}
+html.mini-mode .capsule[data-orb-style="3"] .pet-orb-liquid {
+  position: absolute;
+  z-index: 1;
+  left: -12%;
+  right: -12%;
+  bottom: -2px;
+  height: var(--orb-level, 50%);
+  display: block;
+  background:
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--orb-state-color) 42%, white),
+      color-mix(in srgb, var(--orb-state-color) 86%, transparent)
+    );
+  transition: height .32s cubic-bezier(.16,1,.3,1), background .22s ease;
+}
+html.mini-mode .capsule[data-orb-style="3"] .pet-orb-liquid::before,
+html.mini-mode .capsule[data-orb-style="3"] .pet-orb-liquid::after {
+  content: "";
+  position: absolute;
+  left: -8%;
+  top: -7px;
+  width: 116%;
+  height: 14px;
+  border-radius: 48%;
+  background: color-mix(in srgb, var(--orb-state-color) 34%, white);
+  transform: rotate(-3deg);
+  animation: orb-pet-liquid-wave 2.8s ease-in-out infinite alternate;
+}
+html.mini-mode .capsule[data-orb-style="3"] .pet-orb-liquid::after {
+  top: -4px;
+  opacity: .42;
+  transform: rotate(4deg);
+  animation-direction: alternate-reverse;
+  animation-duration: 2.2s;
+}
+html.mini-mode .capsule[data-orb-style="3"][data-pet-mode="working"] .pet-orb-liquid::before {
+  animation-duration: 1.35s;
+}
+html.mini-mode .capsule[data-orb-style="3"][data-pet-mode="working"] .pet-orb-liquid::after {
+  animation-duration: 1.05s;
+}
+
+/* 小圆球4：深色仪表盘，保留完整底环并突出数据进度。 */
+html.mini-mode .capsule[data-orb-style="4"] .pet-orb {
+  background-color: #09111f;
+  background-image:
+    radial-gradient(circle at 30% 24%, rgba(93,126,170,.34), transparent 38%),
+    radial-gradient(circle at center, #18263b, #080f1b 74%);
+  -webkit-backdrop-filter: blur(16px) saturate(132%);
+  backdrop-filter: blur(16px) saturate(132%);
+  box-shadow:
+    inset 0 0 0 1px rgba(255,255,255,.06),
+    0 5px 12px rgba(0,0,0,.34);
+}
+html.mini-mode .capsule[data-orb-style="4"] .pet-orb::after,
+html.mini-mode .capsule[data-orb-style="4"] .pet-orb-progress {
+  inset: 4px;
+}
+html.mini-mode .capsule[data-orb-style] .mini-value {
+  z-index: 4;
+  color: rgba(12,20,31,.94);
+  text-shadow: 0 1px 1px rgba(255,255,255,.62);
+}
+html.mini-mode .capsule[data-orb-style="4"] .mini-value {
+  color: rgba(255,255,255,.96);
+  text-shadow: 0 1px 2px rgba(0,0,0,.72);
+}
+html.mini-mode .capsule[data-orb-style][data-mini-style="quota"] .mini-value {
+  font-size: 14px;
+}
+html.mini-mode .capsule[data-orb-style][data-mini-style="tokens"] .mini-value {
+  flex-direction: column;
+  gap: 0;
+  font-size: 12.5px;
+  line-height: .88;
+}
+html.mini-mode .capsule[data-orb-style][data-mini-style="tokens"] .mini-value::after {
+  content: attr(data-unit);
+  min-height: 6px;
+  margin-top: 2px;
+  font-size: 6.5px;
+  font-weight: 750;
+  line-height: 1;
+  letter-spacing: 0;
+  opacity: .72;
+}
+html.mini-mode .capsule[data-orb-style][data-mini-style="weather"] .mini-value,
+html.mini-mode .capsule[data-orb-style][data-mini-style="temperature"] .mini-value {
+  font-size: 12.5px;
+}
+html.mini-mode .capsule[data-orb-style][data-mini-style="time"] .mini-value {
+  font-size: 10.5px;
+  letter-spacing: -.045em;
+}
 @keyframes mini-ring-orbit { to { transform: rotate(360deg); } }
+@keyframes orb-pet-light-breathe {
+  0%, 100% { filter: brightness(.988); }
+  50% { filter: brightness(1.024); }
+}
+@keyframes orb-pet-progress-orbit {
+  to { transform: rotate(360deg); }
+}
+@keyframes orb-pet-liquid-wave {
+  from { transform: translateX(-3px) rotate(-4deg); }
+  to { transform: translateX(3px) rotate(4deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  html.mini-mode .capsule[data-orb-style] .pet-orb,
+  html.mini-mode .capsule[data-orb-style] .pet-orb-progress,
+  html.mini-mode .capsule[data-orb-style] .pet-orb::after,
+  html.mini-mode .capsule[data-orb-style] .pet-orb-liquid::before,
+  html.mini-mode .capsule[data-orb-style] .pet-orb-liquid::after {
+    animation: none;
+  }
+}
 @keyframes mini-attention-breathe {
   0%, 100% { opacity: .48; transform: scale(.96); }
   50% { opacity: 1; transform: scale(1.045); }

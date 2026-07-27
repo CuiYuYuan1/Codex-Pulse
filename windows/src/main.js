@@ -48,6 +48,10 @@ const PET_SWITCH_ITEMS = Object.freeze([
   { id: "ghost", label: "幽灵" },
   { id: "robot", label: "机器人" },
   { id: "fox", label: "九尾狐" },
+  { id: "orb", label: "小圆球1" },
+  { id: "orb_2", label: "小圆球2" },
+  { id: "orb_3", label: "小圆球3" },
+  { id: "orb_4", label: "小圆球4" },
   { id: "black_hole", label: "事件视界" }
 ]);
 

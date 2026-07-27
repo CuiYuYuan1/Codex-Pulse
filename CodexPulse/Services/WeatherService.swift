@@ -42,6 +42,18 @@ enum WeatherCondition: String, Codable, Equatable, Sendable {
         }
     }
 
+    var compactDisplayName: String {
+        switch self {
+        case .clear: return "晴"
+        case .partlyCloudy: return "多云"
+        case .cloudy: return "阴"
+        case .fog: return "雾"
+        case .drizzle, .rain, .showers: return "雨"
+        case .snow: return "雪"
+        case .thunderstorm: return "雷雨"
+        }
+    }
+
     var symbolName: String {
         switch self {
         case .clear: return "sun.max.fill"

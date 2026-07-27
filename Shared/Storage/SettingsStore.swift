@@ -64,6 +64,10 @@ enum PetCharacter: String, Codable, CaseIterable, Identifiable, Sendable {
     case ghost
     case robot
     case fox
+    case orb
+    case orb2 = "orb_2"
+    case orb3 = "orb_3"
+    case orb4 = "orb_4"
     case blackHole = "black_hole"
 
     var id: String { rawValue }
@@ -76,7 +80,31 @@ enum PetCharacter: String, Codable, CaseIterable, Identifiable, Sendable {
         case .ghost: return "幽灵"
         case .robot: return "机器人"
         case .fox: return "九尾狐"
+        case .orb: return "小圆球1"
+        case .orb2: return "小圆球2"
+        case .orb3: return "小圆球3"
+        case .orb4: return "小圆球4"
         case .blackHole: return "事件视界"
+        }
+    }
+
+    var isOrb: Bool {
+        switch self {
+        case .orb, .orb2, .orb3, .orb4:
+            return true
+        case .dino, .cat, .bunny, .ghost, .robot, .fox, .blackHole:
+            return false
+        }
+    }
+
+    var orbStyleIndex: Int? {
+        switch self {
+        case .orb: return 1
+        case .orb2: return 2
+        case .orb3: return 3
+        case .orb4: return 4
+        case .dino, .cat, .bunny, .ghost, .robot, .fox, .blackHole:
+            return nil
         }
     }
 }

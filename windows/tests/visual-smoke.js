@@ -481,6 +481,247 @@ async function captureMini(style, taskMode = null, activityStyle = null, theme =
   }
 }
 
+async function assertOrbPet() {
+  const window = new BrowserWindow({
+    width: 390,
+    height: 810,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    resizable: false,
+    webPreferences: {
+      preload: path.join(__dirname, "visual-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      additionalArguments: ["--fixture=large-token"]
+    }
+  });
+  captureWindows.push(window);
+  await window.loadFile(path.resolve(__dirname, "../src/renderer/index.html"));
+  await wait(300);
+  await window.webContents.executeJavaScript(`
+    document.querySelector('#petCharacterMenu [data-value="orb"]').click();
+    document.querySelector('#miniStyleMenu [data-value="quota"]').click();
+    document.getElementById("capsule").dispatchEvent(
+      new MouseEvent("dblclick", { button: 0, bubbles: true })
+    );
+  `, true);
+  await wait(700);
+
+  const result = await window.webContents.executeJavaScript(`(() => {
+    const capsule = document.getElementById("miniCapsule").getBoundingClientRect();
+    const orb = document.querySelector(".pet-orb");
+    const orbRect = orb.getBoundingClientRect();
+    const orbStyle = getComputedStyle(orb);
+    const orbCenterHit = isMiniOrbPointerHit({
+      clientX: orbRect.left + orbRect.width / 2,
+      clientY: orbRect.top + orbRect.height / 2
+    });
+    const transparentCanvasHit = isMiniOrbPointerHit({
+      clientX: capsule.left + 3,
+      clientY: capsule.top + 3
+    });
+    const pages = [];
+    const values = [];
+    for (let index = 0; index < 5; index += 1) {
+      pages.push(document.getElementById("capsule").dataset.miniStyle);
+      values.push(document.getElementById("miniValue").textContent);
+      if (index < 4) cycleMiniDisplay();
+    }
+    render({
+      ...currentState,
+      task: { state: "working", label: "思考中", startedAt: Date.now() }
+    });
+    const activePage = document.getElementById("capsule").dataset.miniStyle;
+    handleMiniSingleClick();
+    return {
+      display: getComputedStyle(orb).display,
+      width: parseFloat(orbStyle.width),
+      height: parseFloat(orbStyle.height),
+      x: parseFloat(orbStyle.left),
+      y: parseFloat(orbStyle.top),
+      renderedWidth: orbRect.width,
+      renderedX: orbRect.left - capsule.left,
+      centerBackground: orbStyle.backgroundColor,
+      orbStyle: document.getElementById("capsule").dataset.orbStyle,
+      borderWidth: orbStyle.borderWidth,
+      statusPresent: document.getElementById("petOrbStatus") !== null,
+      orbCenterHit,
+      transparentCanvasHit,
+      growthScale: getComputedStyle(document.documentElement)
+        .getPropertyValue("--pet-growth-scale").trim(),
+      pages,
+      values,
+      activePage,
+      activePageAfterClick: document.getElementById("capsule").dataset.miniStyle,
+      conversationExpanded: document.documentElement.classList.contains("mini-conversation-expanded"),
+      roamEligible: petRoamIsEligible()
+    };
+  })()`, true);
+
+  if (result.display === "none"
+      || Math.abs(result.width - 62) > 0.25
+      || Math.abs(result.height - 62) > 0.25
+      || Math.abs(result.x - 77) > 0.25
+      || Math.abs(result.y - 33.8) > 0.25
+      || result.orbStyle !== "1"
+      || result.borderWidth !== "0px"
+      || result.statusPresent
+      || !result.orbCenterHit
+      || result.transparentCanvasHit
+      || Number(result.growthScale) !== 1
+      || JSON.stringify(result.pages) !== JSON.stringify(["quota", "tokens", "weather", "temperature", "time"])
+      || result.activePage === result.activePageAfterClick
+      || result.conversationExpanded
+      || result.roamEligible) {
+    throw new Error(`small orb behavior or layout drifted: ${JSON.stringify(result)}`);
+  }
+
+  await window.webContents.executeJavaScript(
+    `document.body.style.background = "#f6f8fb"`,
+    true
+  );
+  const orbVariants = ["orb", "orb_2", "orb_3", "orb_4"];
+  for (let index = 0; index < orbVariants.length; index += 1) {
+    const character = orbVariants[index];
+    const style = String(index + 1);
+    const variant = await window.webContents.executeJavaScript(`(() => {
+      selectPetCharacter("${character}");
+      render({
+        ...currentState,
+        task: { state: "idle", label: "空闲", startedAt: Date.now() }
+      });
+      const orb = document.querySelector(".pet-orb");
+      const rect = orb.getBoundingClientRect();
+      return {
+        pet: document.getElementById("capsule").dataset.pet,
+        style: document.getElementById("capsule").dataset.orbStyle,
+        width: rect.width,
+        height: rect.height,
+        growthScale: getComputedStyle(document.documentElement)
+          .getPropertyValue("--pet-growth-scale").trim(),
+        roamEligible: petRoamIsEligible(),
+        centerHit: isMiniOrbPointerHit({
+          clientX: rect.left + rect.width / 2,
+          clientY: rect.top + rect.height / 2
+        })
+      };
+    })()`, true);
+    if (variant.pet !== character
+        || variant.style !== style
+        || Math.abs(variant.width - 62) > 0.25
+        || Math.abs(variant.height - 62) > 0.25
+        || Number(variant.growthScale) !== 1
+        || variant.roamEligible
+        || !variant.centerHit) {
+      throw new Error(`small orb ${style} drifted: ${JSON.stringify(variant)}`);
+    }
+    await wait(220);
+    const variantImage = await window.webContents.capturePage();
+    fs.writeFileSync(
+      path.join(outputDirectory, `mini-orb-style-${style}@2x.png`),
+      variantImage.toPNG()
+    );
+  }
+
+  await window.webContents.executeJavaScript(`selectPetCharacter("orb")`, true);
+  await wait(120);
+  const tokenLayout = await window.webContents.executeJavaScript(`(() => {
+    orbPagePreference = "tokens";
+    applyMiniStylePreference();
+    render({
+      ...currentState,
+      task: { state: "idle", label: "空闲", startedAt: Date.now() }
+    });
+    const value = document.getElementById("miniValue");
+    return {
+      number: value.textContent,
+      unit: value.dataset.unit || "",
+      fontSize: parseFloat(getComputedStyle(value).fontSize)
+    };
+  })()`, true);
+  if (/[KMB]$/.test(tokenLayout.number)
+      || !/^[KMB]$/.test(tokenLayout.unit)
+      || tokenLayout.fontSize < 12) {
+    throw new Error(`small orb token unit layout drifted: ${JSON.stringify(tokenLayout)}`);
+  }
+  await wait(360);
+  const tokenImage = await window.webContents.capturePage();
+  fs.writeFileSync(
+    path.join(outputDirectory, "mini-orb-token-unit@2x.png"),
+    tokenImage.toPNG()
+  );
+  await window.webContents.executeJavaScript(`(() => {
+    orbPagePreference = "quota";
+    applyMiniStylePreference();
+    render({
+      ...currentState,
+      task: { state: "idle", label: "空闲", startedAt: Date.now() }
+    });
+  })()`, true);
+
+  for (const mode of ["idle", "working", "attention"]) {
+    await window.webContents.executeJavaScript(`
+      render({
+        ...currentState,
+        task: {
+          state: "${mode}",
+          label: "${mode === "attention" ? "等待授权" : mode === "working" ? "思考中" : "空闲"}",
+          startedAt: Date.now()
+        }
+      });
+    `, true);
+    await wait(260);
+    const image = await window.webContents.capturePage();
+    fs.writeFileSync(
+      path.join(outputDirectory, `mini-orb-${mode}@2x.png`),
+      image.toPNG()
+    );
+  }
+  await window.webContents.executeJavaScript(`
+    render({
+      ...currentState,
+      task: { state: "idle", label: "空闲", startedAt: Date.now() }
+    });
+  `, true);
+  await window.webContents.executeJavaScript(
+    `document.body.style.background = "#f6f8fb"`,
+    true
+  );
+  await wait(80);
+  const lightImage = await window.webContents.capturePage();
+  fs.writeFileSync(
+    path.join(outputDirectory, "mini-orb-light-desktop@2x.png"),
+    lightImage.toPNG()
+  );
+  await window.webContents.executeJavaScript(
+    `document.body.style.background = "linear-gradient(135deg, #d9f3f5 0%, #72cbd6 48%, #dceeff 100%)"`,
+    true
+  );
+  await wait(80);
+  const colorDesktopImage = await window.webContents.capturePage();
+  fs.writeFileSync(
+    path.join(outputDirectory, "mini-orb-color-desktop@2x.png"),
+    colorDesktopImage.toPNG()
+  );
+  await window.webContents.executeJavaScript(`
+    render({
+      ...currentState,
+      limits: (currentState.limits || []).map((limit, index) => (
+        index === 0 ? { ...limit, remainingPercent: 33 } : limit
+      )),
+      task: { state: "idle", label: "空闲", startedAt: Date.now() }
+    });
+  `, true);
+  await wait(420);
+  const lowQuotaImage = await window.webContents.capturePage();
+  fs.writeFileSync(
+    path.join(outputDirectory, "mini-orb-low-quota@2x.png"),
+    lowQuotaImage.toPNG()
+  );
+}
+
 async function assertPetDesktopInteraction() {
   const window = new BrowserWindow({
     width: 390,
@@ -1636,6 +1877,12 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
+  if (process.argv.includes("--orb-only")) {
+    await assertOrbPet();
+    captureWindows.forEach((window) => { if (!window.isDestroyed()) window.destroy(); });
+    app.quit();
+    return;
+  }
   for (const fixture of fixtures) await captureFixture(fixture);
   if ((collapsedWidths.get("large-token") || 0) < (collapsedWidths.get("zero") || 0)) {
     throw new Error(`Token width made the information capsule shrink: ${JSON.stringify(Object.fromEntries(collapsedWidths))}`);
@@ -1665,6 +1912,7 @@ app.whenReady().then(async () => {
     await captureMini("quota", "working", null, null, pet);
     await captureMini("quota", "attention", null, null, pet);
   }
+  await assertOrbPet();
   await assertPetDesktopInteraction();
   await assertFootstepImpactEffect();
   await captureMini("quota", "working");
