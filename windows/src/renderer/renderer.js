@@ -1,4 +1,5 @@
 const elements = Object.fromEntries([
+  "codexDock", "codexDockQuota", "codexDockTokens", "codexDockReset", "codexDockWeather", "codexDockTime",
   "capsule", "detail", "miniCapsule", "miniRingProgress", "miniValue", "miniValuePrevious", "petAnimation", "petAnimationNext", "petCatCanvas", "petBlackHoleCanvas", "petBlackHoleCode", "petOrbProgress", "weatherScene", "weatherAnimation", "weatherSpacer", "statusDot", "quotaRing", "quotaArc", "remaining", "todayTokens", "todayTokensPrevious", "chevron",
   "informationStrip", "informationWeatherContent", "informationTaskContent", "informationTaskStatus", "informationTaskSummary", "weatherMiniIcon", "weatherSummary", "informationLocation", "informationWeekday", "informationTime",
   "conversationDetail", "conversationMessages", "conversationLiveLabel", "conversationClose",
@@ -11,6 +12,7 @@ const elements = Object.fromEntries([
   "miniStylePicker", "miniStyle", "miniStyleLabel", "miniStyleMenu",
   "petPicker", "petCharacter", "petCharacterLabel", "petCharacterMenu",
   "moreSettingsToggle", "appearanceSettings",
+  "followCodexLaunchToggle",
   "informationBarToggle", "informationLocationButton", "informationLocationLabel", "locationChooser", "locationChooserClose", "locationSearch",
   "locationSearchStatus", "locationResults",
   "updateIndicator", "updateDetail", "updateVersionRoute", "updateReleaseTitle", "updateReleaseNotes", "updateProgress", "updateProgressStatus", "updateProgressLabel", "updateProgressFill", "updateProgressSize", "skipUpdateButton", "installUpdateButton"
@@ -70,6 +72,11 @@ let petRoamHasInteracted = false;
 let petInteractionCooldownUntil = 0;
 let petMonitorVisibleUntil = 0;
 let petMonitorHideTimer;
+let codexDockAttached = false;
+let codexDockEdge = "bottom";
+let codexDockPointer = null;
+let codexDockRestoreTimer;
+const codexDockInteraction = window.CodexDockInteraction;
 
 const exactNumber = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 });
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -144,6 +151,34 @@ const petCharacterLabels = Object.freeze({
 });
 let petCharacterPreference = loadPetPreference();
 let activePreferenceMenu = null;
+const codexDockOrderKey = "codexPulse.codexDockOrder";
+const codexDockMetricIds = Object.freeze(["quota", "tokens", "reset", "weather", "time"]);
+let codexDockOrder = loadCodexDockOrder();
+
+function loadCodexDockOrder() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(codexDockOrderKey) || "[]");
+    const valid = Array.isArray(saved)
+      ? saved.filter((item, index) => codexDockMetricIds.includes(item) && saved.indexOf(item) === index)
+      : [];
+    return [...valid, ...codexDockMetricIds.filter((item) => !valid.includes(item))];
+  } catch {
+    return [...codexDockMetricIds];
+  }
+}
+
+function applyCodexDockOrder() {
+  for (const metric of codexDockOrder) {
+    const item = elements.codexDock.querySelector(`[data-metric="${metric}"]`);
+    if (item) elements.codexDock.appendChild(item);
+  }
+  const hint = elements.codexDock.querySelector(".codex-dock-detach-hint");
+  if (hint) elements.codexDock.appendChild(hint);
+}
+
+function saveCodexDockOrder() {
+  localStorage.setItem(codexDockOrderKey, JSON.stringify(codexDockOrder));
+}
 
 function isOrbCharacter(character = petCharacterPreference) {
   return orbPetCharacters.has(character);
@@ -743,6 +778,30 @@ function updateInformationClock() {
   const parts = informationDateParts(info);
   setText(elements.informationWeekday, parts.weekday);
   setText(elements.informationTime, parts.time);
+}
+
+function renderCodexDock(state, now = new Date()) {
+  if (!state || !elements.codexDock) return;
+  const primary = state.limits?.[0];
+  const remaining = Number(primary?.remainingPercent);
+  const weather = state.informationBar?.weather;
+  const temperature = Number(weather?.temperature);
+  const dateParts = informationDateParts(state.informationBar, now);
+  const quota = Number.isFinite(remaining) ? `${Math.round(remaining)}%` : "—";
+  const tokens = state.connection === "connected"
+    ? formatUsageTokens(state.usage?.today)
+    : "—";
+  const reset = primary?.resetsAt ? formatCountdown(primary.resetsAt).replace(" 后重置", "") : "—";
+  const weatherValue = Number.isFinite(temperature)
+    ? `${weatherLabel(weather?.code, weather?.isDay !== false)} ${Math.round(temperature)}${weather?.unit || "°C"}`
+    : "—";
+  setText(elements.codexDockQuota, quota);
+  setText(elements.codexDockTokens, tokens);
+  setText(elements.codexDockReset, reset);
+  setText(elements.codexDockWeather, weatherValue);
+  setText(elements.codexDockTime, dateParts.time || "--:--");
+  const quotaItem = elements.codexDock.querySelector('[data-metric="quota"]');
+  if (quotaItem) quotaItem.style.setProperty("--dock-quota-color", usageColor(remaining));
 }
 
 function nextCatIdleState(nowMs) {
@@ -1545,7 +1604,7 @@ function scheduleCollapsedWindowWidthSync(syncAfterRingTransition = true) {
   }
   collapsedWidthFrame = requestAnimationFrame(() => {
     collapsedWidthFrame = undefined;
-    if (expanded || miniMode || miniTransitioning) return;
+    if (expanded || miniMode || miniTransitioning || codexDockAttached) return;
     const stage = document.querySelector(".stage");
     const stageStyle = getComputedStyle(stage);
     const horizontalPadding = parseFloat(stageStyle.paddingLeft) + parseFloat(stageStyle.paddingRight);
@@ -1597,6 +1656,13 @@ function paddedShapeRect(element, horizontalPadding, verticalPadding = horizonta
 }
 
 function currentWindowShape(expandedState = expanded) {
+  // The attached renderer hides every floating surface. A later quota/task
+  // refresh still schedules a shape sync, so measuring the now-hidden capsule
+  // would otherwise produce an empty shape and make the dock disappear about
+  // one refresh tick after attachment.
+  if (codexDockAttached) {
+    return [{ x: 0, y: 0, width: innerWidth, height: innerHeight }];
+  }
   if (miniMode) {
     const rects = [paddedShapeRect(elements.capsule, 12, 12)];
     if (!elements.conversationDetail.hidden) {
@@ -1776,8 +1842,13 @@ function updateTaskTunnel(mode) {
 
 function render(state) {
   currentState = state;
+  elements.followCodexLaunchToggle.setAttribute(
+    "aria-pressed",
+    String(state.followCodexLaunch === true)
+  );
   applyMiniStylePreference({ rerender: false });
   const mode = modeFor(state);
+  renderCodexDock(state);
   renderInformationBar(state.informationBar || {});
   renderTaskInformation(state, mode);
   const primary = state.limits?.[0];
@@ -2595,6 +2666,10 @@ function finishCapsulePointer(event) {
   const shouldToggle = !capsulePointer.moved && isMiniOrbPointerHit(event);
   const didMove = capsulePointer.moved;
   capsulePointer = null;
+  // Flush the release point before drag-end. The last pointermove may still
+  // be waiting in requestAnimationFrame, which previously caused a fast drop
+  // inside the 30px dock zone to be evaluated at the preceding position.
+  if (didMove) window.pulse.dragTo(event.screenX, event.screenY);
   pendingDrag = null;
   elements.capsule.classList.remove("dragging");
   window.pulse.endDrag(event.screenX, event.screenY, didMove);
@@ -2831,6 +2906,15 @@ elements.informationBarToggle.addEventListener("click", async () => {
     elements.informationBarToggle.disabled = false;
   }
 });
+elements.followCodexLaunchToggle.addEventListener("click", async () => {
+  const enabled = currentState?.followCodexLaunch === true;
+  elements.followCodexLaunchToggle.disabled = true;
+  try {
+    render(await window.pulse.setFollowCodexLaunch(!enabled));
+  } finally {
+    elements.followCodexLaunchToggle.disabled = false;
+  }
+});
 elements.informationLocationButton.addEventListener("click", () => {
   if (!elements.informationLocationButton.disabled) openLocationChooser();
 });
@@ -2912,6 +2996,186 @@ elements.petBlackHoleCanvas.addEventListener("drop", async (event) => {
   }
 });
 
+function setCodexDockDetachmentProgress(progress, immediate = false, direction = 1) {
+  const normalized = Math.max(0, Math.min(1, Number(progress) || 0));
+  const offset = codexDockInteraction.detachmentOffset(
+    codexDockEdge,
+    direction,
+    normalized * 4
+  );
+  const metricOffset = codexDockInteraction.detachmentOffset(
+    codexDockEdge,
+    direction,
+    normalized * 5
+  );
+  elements.codexDock.style.setProperty("--dock-detach-progress", normalized.toFixed(3));
+  elements.codexDock.style.setProperty("--dock-detach-x", `${offset.x.toFixed(2)}px`);
+  elements.codexDock.style.setProperty("--dock-detach-y", `${offset.y.toFixed(2)}px`);
+  elements.codexDock.style.setProperty("--dock-detach-metric-x", `${metricOffset.x.toFixed(2)}px`);
+  elements.codexDock.style.setProperty("--dock-detach-metric-y", `${metricOffset.y.toFixed(2)}px`);
+  elements.codexDock.style.transitionDuration = immediate ? "0ms" : "";
+  if (!immediate) {
+    requestAnimationFrame(() => elements.codexDock.style.removeProperty("transition-duration"));
+  }
+}
+
+function codexDockIsVertical() {
+  return codexDockInteraction.isVertical(codexDockEdge);
+}
+
+function reorderCodexDockMetric(metric, coordinate) {
+  const dragged = elements.codexDock.querySelector(`[data-metric="${metric}"]`);
+  if (!dragged) return;
+  const siblings = [...elements.codexDock.querySelectorAll(".codex-dock-metric")]
+    .filter((item) => item !== dragged);
+  const before = siblings.find((item) => {
+    const bounds = item.getBoundingClientRect();
+    return coordinate < (codexDockIsVertical()
+      ? bounds.top + bounds.height / 2
+      : bounds.left + bounds.width / 2);
+  });
+  elements.codexDock.insertBefore(dragged, before || elements.codexDock.querySelector(".codex-dock-detach-hint"));
+  codexDockOrder = [...elements.codexDock.querySelectorAll(".codex-dock-metric")]
+    .map((item) => item.dataset.metric)
+    .filter(Boolean);
+}
+
+elements.codexDock.addEventListener("pointerdown", (event) => {
+  if (!codexDockAttached || event.button !== 0) return;
+  const metric = event.target.closest(".codex-dock-metric");
+  if (!metric) return;
+  event.preventDefault();
+  codexDockPointer = {
+    id: event.pointerId,
+    metric: metric.dataset.metric,
+    startX: event.screenX,
+    startY: event.screenY,
+    axis: null,
+    progress: 0,
+    direction: 1
+  };
+  metric.classList.add("dragging");
+  elements.codexDock.setPointerCapture(event.pointerId);
+});
+
+elements.codexDock.addEventListener("pointermove", (event) => {
+  if (!codexDockPointer || codexDockPointer.id !== event.pointerId) return;
+  const dx = event.screenX - codexDockPointer.startX;
+  const dy = event.screenY - codexDockPointer.startY;
+  if (!codexDockPointer.axis) {
+    codexDockPointer.axis = codexDockInteraction.dragAxis(codexDockEdge, dx, dy);
+    if (!codexDockPointer.axis) return;
+  }
+  if (codexDockPointer.axis === "reorder") {
+    reorderCodexDockMetric(
+      codexDockPointer.metric,
+      codexDockIsVertical() ? event.clientY : event.clientX
+    );
+    return;
+  }
+  if (codexDockPointer.axis === "detach") {
+    codexDockPointer.direction = codexDockInteraction.detachDirection(
+      codexDockEdge,
+      dx,
+      dy
+    );
+    codexDockPointer.progress = codexDockInteraction.detachProgress(
+      codexDockEdge,
+      dx,
+      dy
+    );
+    setCodexDockDetachmentProgress(
+      codexDockPointer.progress,
+      true,
+      codexDockPointer.direction
+    );
+    if (codexDockPointer.progress >= 1) {
+      const pointer = codexDockPointer;
+      codexDockPointer = null;
+      elements.codexDock.querySelectorAll(".dragging").forEach((item) => item.classList.remove("dragging"));
+      if (elements.codexDock.hasPointerCapture(pointer.id)) {
+        elements.codexDock.releasePointerCapture(pointer.id);
+      }
+      document.documentElement.classList.add("codex-dock-detaching");
+      void window.pulse.detachCodexDock(event.screenX, event.screenY);
+    }
+  }
+});
+
+function finishCodexDockPointer(event, cancelled = false) {
+  if (!codexDockPointer || codexDockPointer.id !== event.pointerId) return;
+  const pointer = codexDockPointer;
+  codexDockPointer = null;
+  elements.codexDock.querySelectorAll(".dragging").forEach((item) => item.classList.remove("dragging"));
+  if (elements.codexDock.hasPointerCapture(event.pointerId)) {
+    elements.codexDock.releasePointerCapture(event.pointerId);
+  }
+  if (pointer.axis === "reorder") {
+    saveCodexDockOrder();
+    return;
+  }
+  setCodexDockDetachmentProgress(0, false, pointer.direction);
+}
+
+elements.codexDock.addEventListener("pointerup", (event) => finishCodexDockPointer(event));
+elements.codexDock.addEventListener("pointercancel", (event) => finishCodexDockPointer(event, true));
+
+if (typeof window.pulse.onCodexDockTransition === "function") {
+  window.pulse.onCodexDockTransition((transition = {}) => {
+    const root = document.documentElement;
+    if (transition.phase === "attaching") {
+      codexDockEdge = ["top", "bottom", "left", "right"].includes(transition.edge)
+        ? transition.edge
+        : "bottom";
+      root.dataset.codexDockEdge = codexDockEdge;
+      root.classList.remove("codex-dock-restored", "codex-dock-detaching");
+      root.classList.add("codex-dock-attaching");
+      return;
+    }
+    if (transition.phase === "attached") {
+      clearTimeout(codexDockRestoreTimer);
+      codexDockAttached = true;
+      codexDockEdge = ["top", "bottom", "left", "right"].includes(transition.edge)
+        ? transition.edge
+        : codexDockEdge;
+      root.dataset.codexDockEdge = codexDockEdge;
+      applyCodexDockOrder();
+      setCodexDockDetachmentProgress(0, true);
+      elements.codexDock.hidden = false;
+      root.classList.remove("codex-dock-attaching", "codex-dock-detaching", "codex-dock-restored");
+      root.classList.add("codex-dock-attached");
+      if (currentState) renderCodexDock(currentState);
+      return;
+    }
+    if (transition.phase === "detaching") {
+      codexDockAttached = false;
+      codexDockPointer = null;
+      root.classList.remove("codex-dock-attached", "codex-dock-attaching");
+      root.classList.add("codex-dock-detaching", "codex-dock-restored");
+      elements.codexDock.hidden = true;
+      setCodexDockDetachmentProgress(0, true);
+      requestAnimationFrame(() => scheduleWindowShapeSync());
+      return;
+    }
+    if (transition.phase === "detached") {
+      codexDockAttached = false;
+      delete root.dataset.codexDockEdge;
+      codexDockPointer = null;
+      root.classList.remove("codex-dock-attached", "codex-dock-attaching", "codex-dock-detaching");
+      root.classList.add("codex-dock-restored");
+      elements.codexDock.hidden = true;
+      setCodexDockDetachmentProgress(0, true);
+      requestAnimationFrame(() => {
+        scheduleCollapsedWindowWidthSync(false);
+        scheduleWindowShapeSync();
+        setTimeout(scheduleWindowShapeSync, 80);
+      });
+      clearTimeout(codexDockRestoreTimer);
+      codexDockRestoreTimer = setTimeout(() => root.classList.remove("codex-dock-restored"), 300);
+    }
+  });
+}
+
 // 展开后点击窗口内的透明留白区域也收起；详情卡和胶囊自身保持正常交互。
 document.addEventListener("pointerdown", (event) => {
   if (activePreferenceMenu && !activePreferenceMenu.picker.contains(event.target)) {
@@ -2937,6 +3201,7 @@ setInterval(() => {
   if (currentState) {
     updateTaskMetric(currentState);
     updateInformationClock();
+    renderCodexDock(currentState);
     const primary = currentState.limits?.[0];
     const apiUsageFallback = usesLocalUsageState(currentState)
       && (!primary || isCustomProviderState(currentState));

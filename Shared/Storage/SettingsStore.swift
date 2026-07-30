@@ -202,6 +202,8 @@ struct PulseSettings: Codable, Equatable, Sendable {
     var apiMiniCapsuleStyle: MiniCapsuleStyle?
     /// 缩小态桌面宠物；旧配置默认迁移为小恐龙。
     var petCharacter: PetCharacter?
+    /// Codex 桌面端启动时自动显示悬浮工具；默认关闭，避免改变旧用户的窗口习惯。
+    var followCodexLaunch: Bool?
     /// 信息任务栏（天气 · 地区 · 星期 · 当前时间）；默认关闭，兼容旧配置。
     var informationBarEnabled: Bool?
     /// 信息任务栏使用的地区及天气请求坐标；默认不选择地区。
@@ -230,6 +232,7 @@ struct PulseSettings: Codable, Equatable, Sendable {
         miniCapsuleStyle: .quota,
         apiMiniCapsuleStyle: .time,
         petCharacter: .dino,
+        followCodexLaunch: false,
         informationBarEnabled: false,
         weatherLocation: nil
     )
@@ -302,6 +305,11 @@ struct PulseSettings: Codable, Equatable, Sendable {
     var resolvedPetCharacter: PetCharacter {
         get { petCharacter ?? .dino }
         set { petCharacter = newValue }
+    }
+
+    var resolvedFollowCodexLaunch: Bool {
+        get { followCodexLaunch ?? false }
+        set { followCodexLaunch = newValue }
     }
 
     var resolvedInformationBarEnabled: Bool {

@@ -15,56 +15,65 @@ struct MenuBarPanelView: View {
     @State private var isShowingWeatherLocationPicker = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            if let guideKind = OnboardingGuideView.kind(for: store) {
-                hairline
-                OnboardingGuideView(kind: guideKind)
-                if let err = store.lastError {
-                    Text(err)
-                        .font(.caption)
-                        .foregroundStyle(PulseTheme.red)
-                        .padding(.top, 8)
-                }
-            } else {
-                hairline
-                accountRow
-                hairline
-                rateLimitSection
-                if AppConstants.showsResetPredictionPanels {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 0) {
+                header
+                if let guideKind = OnboardingGuideView.kind(for: store) {
                     hairline
-                    resetPredictionSection
+                    OnboardingGuideView(kind: guideKind)
+                    if let err = store.lastError {
+                        Text(err)
+                            .font(.caption)
+                            .foregroundStyle(PulseTheme.red)
+                            .padding(.top, 8)
+                    }
+                } else {
+                    hairline
+                    accountRow
+                    hairline
+                    rateLimitSection
+                    if AppConstants.showsResetPredictionPanels {
+                        hairline
+                        resetPredictionSection
+                    }
+                    hairline
+                    tokenRow
+                    hairline
+                    openAIModelIQSection
+                    hairline
+                    tokenTrendSection
+                    hairline
+                    taskSection
+                    if let err = store.lastError {
+                        Text(err)
+                            .font(.caption)
+                            .foregroundStyle(PulseTheme.red)
+                            .padding(.top, 8)
+                    }
                 }
                 hairline
-                tokenRow
+                themeControls
                 hairline
-                openAIModelIQSection
+                activityBandControls
                 hairline
-                tokenTrendSection
+                miniCapsuleControls
                 hairline
-                taskSection
-                if let err = store.lastError {
-                    Text(err)
-                        .font(.caption)
-                        .foregroundStyle(PulseTheme.red)
-                        .padding(.top, 8)
-                }
+                petControls
+                hairline
+                informationBarControls
+                #if os(macOS)
+                hairline
+                followCodexLaunchControls
+                #endif
+                hairline
+                actions
             }
-            hairline
-            themeControls
-            hairline
-            activityBandControls
-            hairline
-            miniCapsuleControls
-            hairline
-            petControls
-            hairline
-            informationBarControls
-            hairline
-            actions
+            .padding(14)
         }
-        .padding(14)
-        .frame(width: 332)
+        // MenuBarExtra 会跟随内容高度重建原生弹窗。重置卡收起时若弹窗
+        // 同时缩短，AppKit 可能把本次点击判定为关闭面板。固定外壳高度，
+        // 只让内部内容滚动，可以保证展开/收起不会关闭整个工具。
+        .frame(width: 332, height: menuPanelHeight)
         .background {
             GlassPanelBackground()
         }
@@ -82,6 +91,16 @@ struct MenuBarPanelView: View {
                 isShowingWeatherLocationPicker = false
             }
         }
+    }
+
+    private var menuPanelHeight: CGFloat {
+        #if os(macOS)
+        let availableHeight = (NSScreen.main?.visibleFrame.height ?? 900) - 12
+        let preferredHeight: CGFloat = OnboardingGuideView.kind(for: store) == nil ? 1_040 : 520
+        return min(preferredHeight, max(480, availableHeight))
+        #else
+        return 720
+        #endif
     }
 
     private var hairline: some View {
@@ -167,9 +186,7 @@ struct MenuBarPanelView: View {
             .sorted { ($0.expiresAt ?? .distantFuture) < ($1.expiresAt ?? .distantFuture) }
         return VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                    isResetCardsExpanded.toggle()
-                }
+                isResetCardsExpanded.toggle()
             } label: {
                 HStack {
                     Text("重置卡 ×\(limits.availableResetCardCount)")
@@ -180,6 +197,7 @@ struct MenuBarPanelView: View {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 8, weight: .semibold))
                         .rotationEffect(.degrees(isResetCardsExpanded ? 90 : 0))
+                        .animation(.easeOut(duration: 0.16), value: isResetCardsExpanded)
                 }
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
@@ -222,7 +240,6 @@ struct MenuBarPanelView: View {
                         )
                     }
                 }
-                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
     }
@@ -518,13 +535,16 @@ struct MenuBarPanelView: View {
     }
 
     private var actions: some View {
-        HStack(spacing: 8) {
-            Button("刷新") {
+        HStack(spacing: 5) {
+            Button {
                 Task { await store.refreshAll(forceRemote: true) }
+            } label: {
+                toolbarTextLabel("刷新", systemImage: "arrow.clockwise")
             }
-            .buttonStyle(GlassButtonStyle())
+            .buttonStyle(MenuBarToolbarPressStyle())
+            .help("刷新数据")
 
-            Button("看板") {
+            Button {
                 #if os(macOS)
                 if let win = NSApp.windows.first(where: { $0.title == "Codex-Pulse" }) {
                     win.makeKeyAndOrderFront(nil)
@@ -535,23 +555,31 @@ struct MenuBarPanelView: View {
                 #else
                 openWindow(id: "dashboard")
                 #endif
+            } label: {
+                toolbarTextLabel("看板", systemImage: "rectangle.grid.2x2")
             }
-            .buttonStyle(GlassButtonStyle())
+            .buttonStyle(MenuBarToolbarPressStyle())
+            .help("打开 CodexPulse 看板")
 
-            Button("重连") {
+            Button {
                 Task { await store.reconnect() }
+            } label: {
+                toolbarTextLabel("重连", systemImage: "arrow.triangle.2.circlepath")
             }
-            .buttonStyle(GlassButtonStyle())
+            .buttonStyle(MenuBarToolbarPressStyle())
+            .help("重新连接 Codex")
 
             #if os(macOS)
             Button {
                 FloatingCapsuleController.shared.toggle(store: store)
                 isCapsuleVisible = FloatingCapsuleController.shared.isVisible
             } label: {
-                Image(systemName: isCapsuleVisible ? "capsule.fill" : "capsule")
-                    .font(.system(size: 12))
+                toolbarIconLabel(
+                    isCapsuleVisible ? "capsule.fill" : "capsule",
+                    tint: isCapsuleVisible ? PulseTheme.blue : .secondary
+                )
             }
-            .buttonStyle(GlassButtonStyle())
+            .buttonStyle(MenuBarToolbarPressStyle())
             .help(isCapsuleVisible ? "隐藏悬浮胶囊" : "显示悬浮胶囊")
             .onAppear {
                 isCapsuleVisible = FloatingCapsuleController.shared.isVisible
@@ -596,24 +624,103 @@ struct MenuBarPanelView: View {
                     #endif
                 }
             } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.system(size: 14))
+                toolbarIconLabel("ellipsis", tint: PulseTheme.blue)
             }
             .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("更多操作")
 
             #if os(macOS)
             Button {
                 CodexPulseLifecycle.quit(store: store)
             } label: {
-                Image(systemName: "power")
-                    .font(.system(size: 13, weight: .semibold))
+                toolbarIconLabel("power", tint: PulseTheme.red, destructive: true)
             }
-            .buttonStyle(GlassButtonStyle())
+            .buttonStyle(MenuBarToolbarPressStyle())
             .help("退出 CodexPulse")
             .accessibilityLabel("退出 CodexPulse")
             #endif
         }
+        .padding(5)
+        .background {
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(Color.primary.opacity(0.035))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.7)
+        }
     }
+
+    private func toolbarTextLabel(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .labelStyle(.titleAndIcon)
+            .font(.system(size: 10, weight: .semibold))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(width: 52, height: 30)
+            .foregroundStyle(Color.primary.opacity(0.82))
+            .background {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Color.primary.opacity(0.055))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.6)
+            }
+    }
+
+    private func toolbarIconLabel(
+        _ systemImage: String,
+        tint: Color,
+        destructive: Bool = false
+    ) -> some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(tint)
+            .frame(width: 30, height: 30)
+            .background {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(
+                        destructive
+                            ? PulseTheme.red.opacity(0.09)
+                            : Color.primary.opacity(0.055)
+                    )
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(
+                        destructive
+                            ? PulseTheme.red.opacity(0.22)
+                            : Color.white.opacity(0.18),
+                        lineWidth: 0.6
+                    )
+            }
+    }
+
+    #if os(macOS)
+    private var followCodexLaunchControls: some View {
+        Toggle(
+            "随 Codex 启动",
+            isOn: Binding(
+                get: { store.settings.resolvedFollowCodexLaunch },
+                set: { enabled in
+                    store.settings.resolvedFollowCodexLaunch = enabled
+                    store.saveSettings()
+                    FloatingCapsuleController.shared.setFollowCodexLaunch(
+                        enabled,
+                        store: store
+                    )
+                }
+            )
+        )
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .font(.system(size: 11, weight: .medium))
+        .help("检测到 Codex 打开时自动显示 CodexPulse")
+    }
+    #endif
 
     private var activityBandControls: some View {
         HStack(spacing: 10) {
@@ -828,6 +935,15 @@ private struct OpenAIModelIQRow: View {
 }
 
 // MARK: - Glass button
+
+private struct MenuBarToolbarPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.72 : 1)
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
 
 struct GlassButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {

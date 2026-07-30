@@ -9,6 +9,35 @@
 </head>
 <body>
   <main class="stage">
+    <section id="codexDock" class="codex-dock" hidden aria-label="CodexPulse Codex 吸附信息栏">
+      <button class="codex-dock-metric" type="button" data-metric="quota" aria-label="可用额度">
+        <span class="codex-dock-icon quota" aria-hidden="true"></span>
+        <span id="codexDockQuota" class="codex-dock-value">—</span>
+        <small>可用额度</small>
+      </button>
+      <button class="codex-dock-metric" type="button" data-metric="tokens" aria-label="已使用 Token">
+        <span class="codex-dock-icon tokens" aria-hidden="true"></span>
+        <span id="codexDockTokens" class="codex-dock-value">—</span>
+        <small>已使用 Token</small>
+      </button>
+      <button class="codex-dock-metric" type="button" data-metric="reset" aria-label="重置时间">
+        <span class="codex-dock-icon reset" aria-hidden="true"></span>
+        <span id="codexDockReset" class="codex-dock-value">—</span>
+        <small>重置时间</small>
+      </button>
+      <button class="codex-dock-metric" type="button" data-metric="weather" aria-label="天气">
+        <span class="codex-dock-icon weather" aria-hidden="true"></span>
+        <span id="codexDockWeather" class="codex-dock-value">—</span>
+        <small>天气</small>
+      </button>
+      <button class="codex-dock-metric" type="button" data-metric="time" aria-label="当前时间">
+        <span class="codex-dock-icon time" aria-hidden="true"></span>
+        <span id="codexDockTime" class="codex-dock-value">--:--</span>
+        <small>当前时间</small>
+      </button>
+      <span class="codex-dock-detach-hint" aria-hidden="true">上下拖出</span>
+    </section>
+
     <div id="capsule" class="capsule" role="button" tabindex="0" aria-expanded="false" aria-label="Codex-Pulse 悬浮胶囊">
       <span id="miniCapsule" class="mini-capsule" aria-hidden="true">
         <img id="petAnimation" class="pet-animation" alt="" draggable="false">
@@ -207,6 +236,13 @@
           </button>
           <button id="informationLocationButton" class="preference-trigger information-location-trigger" type="button" aria-label="选择信息任务栏地区" disabled><span id="informationLocationLabel">选择地区</span><span class="preference-chevron"></span></button>
         </div>
+        <div class="preference-row follow-codex-preference-row">
+          <button id="followCodexLaunchToggle" class="activity-toggle" type="button" aria-pressed="false">
+            <span class="activity-toggle-dot"></span>
+            <span>随 Codex 启动</span>
+          </button>
+          <small>检测到 Codex 打开时显示工具</small>
+        </div>
         <div class="information-source-attribution">
           <a href="https://open-meteo.com/" data-external-link>Weather: Open-Meteo</a>
           <span aria-hidden="true">·</span>
@@ -310,6 +346,7 @@
   <script src="pet-growth.js"></script>
   <script src="cat-rig.js"></script>
   <script src="black-hole-pet.js"></script>
+  <script src="dock-interaction.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

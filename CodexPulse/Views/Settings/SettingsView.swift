@@ -189,6 +189,19 @@ struct SettingsView: View {
             }
 
             Section("系统") {
+                Toggle("随 Codex 启动", isOn: $store.settings.resolvedFollowCodexLaunch)
+                    .onChange(of: store.settings.resolvedFollowCodexLaunch) { _, enabled in
+                        store.saveSettings()
+                        FloatingCapsuleController.shared.setFollowCodexLaunch(
+                            enabled,
+                            store: store
+                        )
+                    }
+
+                Text("开启后，CodexPulse 在后台检测到 Codex 打开时会自动显示悬浮工具。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 Toggle("登录时自动启动", isOn: Binding(
                     get: { store.settings.launchAtLogin },
                     set: updateLaunchAtLogin

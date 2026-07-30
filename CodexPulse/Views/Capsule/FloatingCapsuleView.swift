@@ -2,6 +2,95 @@ import SwiftUI
 import Charts
 import WebKit
 
+enum CodexDockEdge: String, CaseIterable {
+    case top
+    case bottom
+    case left
+    case right
+
+    var isVertical: Bool {
+        self == .left || self == .right
+    }
+}
+
+/// 吸附面隐藏到 Codex 窗口背后，外露的两个角保留连续圆角。
+struct CodexDockExtensionShape: Shape {
+    let edge: CodexDockEdge
+    private let outerRadius: CGFloat = 14
+
+    func path(in rect: CGRect) -> Path {
+        let radius = min(outerRadius, min(rect.width, rect.height) * 0.5)
+
+        var path = Path()
+        switch edge {
+        case .bottom:
+            path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - radius))
+            path.addQuadCurve(
+                to: CGPoint(x: rect.maxX - radius, y: rect.maxY),
+                control: CGPoint(x: rect.maxX, y: rect.maxY)
+            )
+            path.addLine(to: CGPoint(x: rect.minX + radius, y: rect.maxY))
+            path.addQuadCurve(
+                to: CGPoint(x: rect.minX, y: rect.maxY - radius),
+                control: CGPoint(x: rect.minX, y: rect.maxY)
+            )
+        case .top:
+            path.move(to: CGPoint(x: rect.minX, y: rect.maxY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + radius))
+            path.addQuadCurve(
+                to: CGPoint(x: rect.maxX - radius, y: rect.minY),
+                control: CGPoint(x: rect.maxX, y: rect.minY)
+            )
+            path.addLine(to: CGPoint(x: rect.minX + radius, y: rect.minY))
+            path.addQuadCurve(
+                to: CGPoint(x: rect.minX, y: rect.minY + radius),
+                control: CGPoint(x: rect.minX, y: rect.minY)
+            )
+        case .left:
+            path.move(to: CGPoint(x: rect.maxX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.minX + radius, y: rect.minY))
+            path.addQuadCurve(
+                to: CGPoint(x: rect.minX, y: rect.minY + radius),
+                control: CGPoint(x: rect.minX, y: rect.minY)
+            )
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY - radius))
+            path.addQuadCurve(
+                to: CGPoint(x: rect.minX + radius, y: rect.maxY),
+                control: CGPoint(x: rect.minX, y: rect.maxY)
+            )
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        case .right:
+            path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX - radius, y: rect.minY))
+            path.addQuadCurve(
+                to: CGPoint(x: rect.maxX, y: rect.minY + radius),
+                control: CGPoint(x: rect.maxX, y: rect.minY)
+            )
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - radius))
+            path.addQuadCurve(
+                to: CGPoint(x: rect.maxX - radius, y: rect.maxY),
+                control: CGPoint(x: rect.maxX, y: rect.maxY)
+            )
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        }
+        path.closeSubpath()
+        return path
+    }
+}
+
+private enum CodexDockMetric: String, CaseIterable, Identifiable {
+    case quota
+    case tokens
+    case reset
+    case weather
+    case time
+
+    var id: String { rawValue }
+}
+
 /// 悬浮胶囊 — 玻璃拟态,置顶悬浮。
 /// 收起态:呼吸状态灯 · 环形剩余额度 · 今日 Token
 /// 点击展开:账号 / 额度窗口 / 任务 / Token 明细卡片
@@ -35,6 +124,16 @@ struct FloatingCapsuleView: View {
     @State private var catMonitorHideTask: Task<Void, Never>?
     @State private var catTransientAnimation: PetAnimationState?
     @State private var catTransientAnimationTask: Task<Void, Never>?
+    @State private var codexDockContentVisible = false
+    @State private var codexDockDetachmentProgress: CGFloat = 0
+    @State private var codexDockDraggedMetric: CodexDockMetric?
+    @AppStorage("pulse.codexDock.attached") private var isCodexDockAttached = false
+    @AppStorage("pulse.codexDock.width") private var codexDockWidth = 720.0
+    @AppStorage("pulse.codexDock.height") private var codexDockHeight = 60.0
+    @AppStorage("pulse.codexDock.edge") private var codexDockEdgeRaw =
+        CodexDockEdge.bottom.rawValue
+    @AppStorage("pulse.codexDock.order") private var codexDockOrderRaw =
+        CodexDockMetric.allCases.map(\.rawValue).joined(separator: ",")
     @AppStorage("pulse.orb.page") private var orbPageRawValue = OrbPetPage.quota.rawValue
 
     /// 面板本身透明，但 SwiftUI 光效仍会被 NSPanel 边界裁切。
@@ -45,6 +144,11 @@ struct FloatingCapsuleView: View {
     private let informationCapsuleWidth: CGFloat = 275
     private let compactCapsuleMinimumWidth: CGFloat = 235
     private let updateIndicatorWidth: CGFloat = 28
+    private let codexDockSeamOverlap: CGFloat = 16
+
+    private var codexDockEdge: CodexDockEdge {
+        CodexDockEdge(rawValue: codexDockEdgeRaw) ?? .bottom
+    }
 
     private var hasAvailableUpdate: Bool {
         appUpdates.availableRelease != nil
@@ -172,7 +276,8 @@ struct FloatingCapsuleView: View {
     }
 
     private var catRoamingEnabled: Bool {
-        isMini
+        !isCodexDockAttached
+            && isMini
             && !isOrbPet
             && (mode == .idle || mode == .offline)
             && !isMiniConversationExpanded
@@ -240,7 +345,8 @@ struct FloatingCapsuleView: View {
 
     private var needsWeatherData: Bool {
         guard weatherLocation != nil else { return false }
-        return informationBarEnabled
+        return isCodexDockAttached
+            || informationBarEnabled
             || (isMini && activeMiniCapsuleStyle == .weather)
             || (
                 isMini
@@ -651,7 +757,70 @@ struct FloatingCapsuleView: View {
     }
 
     var body: some View {
-        activityObservedCapsuleScene
+        Group {
+            if isCodexDockAttached {
+                codexAttachedDock
+                    .transition(.opacity)
+            } else {
+                activityObservedCapsuleScene
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: reduceMotion ? 0.01 : 0.26), value: isCodexDockAttached)
+        .onReceive(NotificationCenter.default.publisher(for: .pulseCodexDockReorder)) { note in
+            guard let update = note.object as? CodexDockReorderUpdate else { return }
+            reorderCodexDock(using: update)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .pulseCodexDockDetachmentProgress)
+        ) { note in
+            let progress: CGFloat
+            if let value = note.object as? CGFloat {
+                progress = value
+            } else if let value = note.object as? NSNumber {
+                progress = CGFloat(value.doubleValue)
+            } else {
+                return
+            }
+            let resolved = min(1, max(0, progress))
+            if resolved == 0 {
+                withAnimation(.spring(response: reduceMotion ? 0.01 : 0.24, dampingFraction: 0.84)) {
+                    codexDockDetachmentProgress = resolved
+                }
+            } else {
+                // Live drag feedback must follow the pointer exactly. Repeated
+                // 120ms animations made the surface visibly lag behind.
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    codexDockDetachmentProgress = resolved
+                }
+            }
+        }
+        .onChange(of: isCodexDockAttached) { _, attached in
+            if attached {
+                codexDockContentVisible = false
+                FloatingCapsuleController.shared.setCatRoamingEnabled(false)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) {
+                    withAnimation(.easeOut(duration: reduceMotion ? 0.01 : 0.20)) {
+                        codexDockContentVisible = true
+                    }
+                }
+            } else {
+                codexDockContentVisible = false
+                codexDockDraggedMetric = nil
+                codexDockDetachmentProgress = 0
+                synchronizeCatRoaming()
+            }
+        }
+        .onAppear {
+            guard isCodexDockAttached else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                withAnimation(.easeOut(duration: reduceMotion ? 0.01 : 0.30)) {
+                    codexDockContentVisible = true
+                }
+            }
+        }
         .onChange(of: appUpdates.availableRelease) { _, release in
             guard release == nil, isShowingUpdateDetails else { return }
             withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
@@ -683,6 +852,298 @@ struct FloatingCapsuleView: View {
                 return
             }
             await weatherViewModel.monitor(location: location)
+        }
+    }
+
+    // MARK: - Codex attached dock
+
+    private var resolvedCodexDockOrder: [CodexDockMetric] {
+        var seen: Set<CodexDockMetric> = []
+        let stored = codexDockOrderRaw
+            .split(separator: ",")
+            .compactMap { CodexDockMetric(rawValue: String($0)) }
+            .filter { seen.insert($0).inserted }
+        return stored + CodexDockMetric.allCases.filter { seen.insert($0).inserted }
+    }
+
+    private var codexAttachedDock: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            codexAttachedDockContent(at: context.date)
+        }
+    }
+
+    private func codexAttachedDockContent(at date: Date) -> some View {
+        Group {
+            if codexDockEdge.isVertical {
+                HStack(spacing: 0) {
+                    if codexDockEdge == .right {
+                        Color.clear.frame(width: codexDockSeamOverlap)
+                    }
+                    VStack(spacing: 0) {
+                        codexDockItems(at: date, vertical: true)
+                    }
+                    if codexDockEdge == .left {
+                        Color.clear.frame(width: codexDockSeamOverlap)
+                    }
+                }
+            } else {
+                VStack(spacing: 0) {
+                    if codexDockEdge == .bottom {
+                        Color.clear.frame(height: codexDockSeamOverlap)
+                    }
+                    HStack(spacing: 0) {
+                        codexDockItems(at: date, vertical: false)
+                    }
+                    if codexDockEdge == .top {
+                        Color.clear.frame(height: codexDockSeamOverlap)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, codexDockEdge.isVertical ? 5 : 14)
+        .padding(.vertical, codexDockEdge.isVertical ? 10 : 0)
+        .frame(
+            width: codexDockEdge.isVertical
+                ? max(50, codexDockWidth)
+                : max(420, codexDockWidth),
+            height: codexDockEdge.isVertical
+                ? max(320, codexDockHeight)
+                : max(44 + codexDockSeamOverlap, codexDockHeight)
+        )
+        .background(codexDockGlassBackground)
+        .overlay(alignment: .bottom) {
+            Text(codexDockEdge.isVertical ? "" : "上下拖出")
+                .font(.system(size: 8, weight: .semibold, design: .rounded))
+                .foregroundStyle(.primary.opacity(0.72))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 1)
+                .background(.thinMaterial, in: Capsule())
+                .opacity(
+                    codexDockEdge.isVertical ? 0 :
+                    max(
+                        0,
+                        min(1, Double(codexDockDetachmentProgress) * 2 - 0.25)
+                    )
+                )
+                .allowsHitTesting(false)
+        }
+        .clipShape(CodexDockExtensionShape(edge: codexDockEdge))
+        .scaleEffect(
+            x: codexDockEdge.isVertical
+                ? 1
+                : CGFloat(1) - codexDockDetachmentProgress * CGFloat(0.08),
+            y: codexDockEdge.isVertical
+                ? CGFloat(1) - codexDockDetachmentProgress * CGFloat(0.08)
+                : 1,
+            anchor: .center
+        )
+        .animation(.spring(response: 0.25, dampingFraction: 0.86), value: codexDockOrderRaw)
+        .accessibilityLabel("CodexPulse Codex 吸附信息栏")
+    }
+
+    @ViewBuilder
+    private func codexDockItems(at date: Date, vertical: Bool) -> some View {
+        let order = resolvedCodexDockOrder
+        ForEach(Array(order.enumerated()), id: \.element.id) { index, metric in
+            codexDockItem(metric, index: index, at: date, vertical: vertical)
+            if index < order.count - 1 {
+                Rectangle()
+                    .fill(Color.primary.opacity(0.10))
+                    .frame(
+                        width: vertical ? 28 : 1,
+                        height: vertical ? 1 : 18
+                    )
+                    .opacity(1 - Double(codexDockDetachmentProgress))
+            }
+        }
+    }
+
+    private func codexDockItem(
+        _ metric: CodexDockMetric,
+        index: Int,
+        at date: Date,
+        vertical: Bool
+    ) -> some View {
+        codexDockMetric(metric, at: date, vertical: vertical)
+            .frame(
+                maxWidth: .infinity,
+                maxHeight: vertical ? .infinity : nil
+            )
+            .opacity(
+                codexDockContentVisible
+                    ? 1 - Double(codexDockDetachmentProgress) * 0.92
+                    : 0
+            )
+            .offset(y: codexDockContentVisible ? 0 : 5)
+            .scaleEffect(codexDockDraggedMetric == metric ? 1.035 : 1)
+            .background(codexDockDraggedBackground(for: metric))
+            .animation(
+                .easeOut(duration: reduceMotion ? 0.01 : 0.22)
+                    .delay(reduceMotion ? 0 : Double(index) * 0.045),
+                value: codexDockContentVisible
+            )
+    }
+
+    @ViewBuilder
+    private func codexDockDraggedBackground(for metric: CodexDockMetric) -> some View {
+        if codexDockDraggedMetric == metric {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color.white.opacity(0.30))
+                .shadow(color: Color.black.opacity(0.10), radius: 7, y: 3)
+        }
+    }
+
+    private var codexDockGlassBackground: some View {
+        ZStack {
+            Rectangle()
+                .fill(.ultraThinMaterial)
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(colorScheme == .dark ? 0.10 : 0.38),
+                    visualTheme.accent.opacity(0.07),
+                    Color.purple.opacity(0.05)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            Rectangle()
+                .fill(Color.white.opacity(colorScheme == .dark ? 0.05 : 0.16))
+                .blendMode(.plusLighter)
+        }
+        .shadow(color: Color.black.opacity(0.12), radius: 9, y: 5)
+    }
+
+    @ViewBuilder
+    private func codexDockMetric(
+        _ metric: CodexDockMetric,
+        at date: Date,
+        vertical: Bool
+    ) -> some View {
+        let presentation = codexDockMetricPresentation(metric, at: date)
+        Group {
+            if vertical {
+                VStack(spacing: 4) {
+                    Image(systemName: presentation.symbol)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(presentation.tint)
+                        .symbolRenderingMode(.hierarchical)
+                    Text(presentation.value)
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.primary)
+                }
+            } else {
+                HStack(spacing: 6) {
+                    Image(systemName: presentation.symbol)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(presentation.tint)
+                        .symbolRenderingMode(.hierarchical)
+                    Text(presentation.label)
+                        .foregroundStyle(.secondary)
+                    Text(presentation.value)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.primary)
+                }
+            }
+        }
+        .font(.system(size: 12, weight: .medium, design: .rounded))
+        .lineLimit(1)
+        .minimumScaleFactor(0.76)
+        .padding(.horizontal, vertical ? 2 : 8)
+        .frame(height: vertical ? nil : 34)
+        .contentShape(Rectangle())
+    }
+
+    private func codexDockMetricPresentation(
+        _ metric: CodexDockMetric,
+        at date: Date
+    ) -> (symbol: String, label: String, value: String, tint: Color) {
+        switch metric {
+        case .quota:
+            let remaining = remainingPercent ?? 0
+            return (
+                "circle",
+                "可用额度",
+                remainingPercent.map { PulseFormatters.percent($0) } ?? "—",
+                orbQuotaColor(remaining)
+            )
+        case .tokens:
+            return ("cylinder.split.1x2.fill", "已用 Token", PulseFormatters.tokens(todayTokens), PulseTheme.blue)
+        case .reset:
+            return (
+                "arrow.clockwise",
+                "重置时间",
+                codexDockResetText(at: date),
+                PulseTheme.orange
+            )
+        case .weather:
+            let weather = weatherViewModel.snapshot
+            let value = weather.map {
+                "\($0.condition.compactDisplayName) \(String(format: "%.0f°C", $0.temperature))"
+            } ?? "—"
+            return (
+                weather?.condition.symbolName ?? "cloud.sun.fill",
+                "",
+                value,
+                weather?.isDay == false ? Color(hex: 0x9BBEFF) : Color(hex: 0x64C7FF)
+            )
+        case .time:
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "zh_CN")
+            formatter.timeZone = weatherLocation.flatMap { TimeZone(identifier: $0.timezone) } ?? .current
+            formatter.dateFormat = "HH:mm"
+            return ("clock", "当前时间", formatter.string(from: date), Color.purple)
+        }
+    }
+
+    private func codexDockResetText(at date: Date) -> String {
+        guard let reset = store.snapshot.rateLimits.primaryBucket?.resetsAt else { return "—" }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = .current
+        if Calendar.current.isDate(reset, inSameDayAs: date) {
+            formatter.dateFormat = "HH:mm"
+        } else {
+            formatter.dateFormat = "M月d日"
+        }
+        return formatter.string(from: reset)
+    }
+
+    private func reorderCodexDock(using update: CodexDockReorderUpdate) {
+        var order = resolvedCodexDockOrder
+        guard !order.isEmpty else { return }
+        let extent = max(
+            1,
+            codexDockEdge.isVertical
+                ? CGFloat(codexDockHeight)
+                : CGFloat(codexDockWidth)
+        )
+        let itemWidth = extent / CGFloat(order.count)
+
+        if codexDockDraggedMetric == nil {
+            let startIndex = min(
+                order.count - 1,
+                max(0, Int(floor(update.startX / itemWidth)))
+            )
+            codexDockDraggedMetric = order[startIndex]
+        }
+        guard let dragged = codexDockDraggedMetric,
+              let currentIndex = order.firstIndex(of: dragged) else { return }
+        let targetIndex = min(
+            order.count - 1,
+            max(0, Int(floor(update.currentX / itemWidth)))
+        )
+        if targetIndex != currentIndex {
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.84)) {
+                order.move(
+                    fromOffsets: IndexSet(integer: currentIndex),
+                    toOffset: targetIndex > currentIndex ? targetIndex + 1 : targetIndex
+                )
+                codexDockOrderRaw = order.map(\.rawValue).joined(separator: ",")
+            }
+        }
+        if update.ended {
+            codexDockDraggedMetric = nil
+            PulseLog.write("Codex dock order saved: \(codexDockOrderRaw)")
         }
     }
 

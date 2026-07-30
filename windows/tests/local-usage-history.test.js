@@ -6,6 +6,7 @@ const vm = require("vm");
 
 function loadUsageFunctions() {
   const mainPath = path.join(__dirname, "..", "src", "main.js");
+  const mainRequire = Module.createRequire(mainPath);
   const source = fs.readFileSync(mainPath, "utf8");
   const lifecycle = source.indexOf("app.whenReady().then(");
   assert(lifecycle > 0, "main lifecycle marker is missing");
@@ -30,6 +31,7 @@ function loadUsageFunctions() {
       normalizedSHA256Digest,
       isPathInsideDirectory,
       safeReleaseURL,
+      mediaSourceIdForWindowHandle,
       setAccount(auth, email = null) { state.account = { auth, email }; },
       setProvider(modelProvider) { state.modelProvider = modelProvider; }
     };
@@ -53,7 +55,7 @@ function loadUsageFunctions() {
     const context = {
       module: { exports: {} },
       exports: {},
-      require,
+      require: mainRequire,
       __dirname: path.dirname(mainPath),
       process,
       Buffer,
@@ -106,6 +108,11 @@ assert.strictEqual(usage.normalizedSHA256Digest(`sha256:${"A".repeat(64)}`), "a"
 assert.strictEqual(usage.normalizedSHA256Digest("not-a-digest"), null);
 assert.strictEqual(usage.isPathInsideDirectory("/tmp/codexpulse/update.exe", "/tmp/codexpulse"), true);
 assert.strictEqual(usage.isPathInsideDirectory("/tmp/escaped.exe", "/tmp/codexpulse"), false);
+assert.strictEqual(
+  usage.mediaSourceIdForWindowHandle("4660"),
+  "window:4660:0",
+  "Windows HWND must map to Electron's relative z-order source id without precision loss"
+);
 const start = localTime(2026, 7, 12);
 const end = localTime(2026, 7, 15);
 const fixture = [

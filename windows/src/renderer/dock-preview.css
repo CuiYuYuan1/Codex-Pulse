@@ -1,0 +1,113 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI Variable", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+.dock-preview {
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  padding-top: 16px;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid rgba(140, 215, 255, .34);
+  border-top-color: rgba(204, 239, 255, .7);
+  border-radius: 0 0 14px 14px;
+  background:
+    linear-gradient(180deg, rgba(221, 245, 255, .14), transparent 46%),
+    rgba(20, 31, 48, .54);
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, .18),
+    0 10px 30px rgba(0, 24, 55, .2);
+  animation: preview-in 180ms cubic-bezier(.2, .78, .3, 1) both;
+  backdrop-filter: blur(22px) saturate(145%);
+}
+
+html[data-edge="top"] .dock-preview {
+  padding-top: 0;
+  padding-bottom: 16px;
+  border-radius: 14px 14px 0 0;
+}
+
+html[data-edge="left"] .dock-preview,
+html[data-edge="right"] .dock-preview {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+html[data-edge="left"] .dock-preview {
+  padding-right: 16px;
+  border-right-color: transparent;
+  border-radius: 14px 0 0 14px;
+}
+
+html[data-edge="right"] .dock-preview {
+  padding-left: 16px;
+  border-left-color: transparent;
+  border-radius: 0 14px 14px 0;
+}
+
+.dock-preview-glow {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  width: min(34%, 220px);
+  height: 2px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, transparent, #58d8ff, #a77cff, transparent);
+  box-shadow: 0 0 14px rgba(90, 210, 255, .58);
+}
+
+html[data-edge="left"] .dock-preview-glow,
+html[data-edge="right"] .dock-preview-glow {
+  top: 33%;
+  bottom: 33%;
+  width: 2px;
+  height: auto;
+}
+
+html[data-edge="left"] .dock-preview-glow {
+  left: 0;
+  right: auto;
+}
+html[data-edge="right"] .dock-preview-glow {
+  left: auto;
+  right: 0;
+}
+
+.dock-preview-label {
+  position: relative;
+  z-index: 1;
+  color: rgba(235, 247, 255, .86);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+}
+
+html[data-edge="left"] .dock-preview-label,
+html[data-edge="right"] .dock-preview-label {
+  display: none;
+}
+
+@keyframes preview-in {
+  from { opacity: 0; transform: translateY(-7px) scaleX(.96); }
+  to { opacity: 1; transform: translateY(0) scaleX(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dock-preview { animation: none; }
+}

@@ -51,6 +51,7 @@ final class PulseStore {
     private var client: (any CodexAppServerClient)?
     private var eventTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
+    private var rateLimitMonitorTask: Task<Void, Never>?
     private var dayRolloverTask: Task<Void, Never>?
     private var liveTaskStatusTask: Task<Void, Never>?
     private var persistTask: Task<Void, Never>?
@@ -92,6 +93,13 @@ final class PulseStore {
     private let activePollingInterval: TimeInterval = 5
     private let idlePollingInterval: TimeInterval = 15
     private let idleFollowUpPollCount = 3
+    /// 任务轮询可以在空闲后静默，但额度必须持续更新。Windows 端空闲时为 8 秒，
+    /// macOS 使用相同周期，避免小圆球长期停留在重置前的百分比。
+    private let idleRateLimitPollingInterval: TimeInterval = 8
+    /// 官方额度后端可能在重置边界后短暂返回旧窗口；到点后缩短重试周期，
+    /// 直到响应带回新的 resetsAt 为止。
+    private let dueRateLimitRetryInterval: TimeInterval = 3
+    private let rateLimitResetGraceInterval: TimeInterval = 0.75
     /// 仅检查本地已知会话文件，不经过额度/Token RPC；0.5 秒足以接近即时反馈。
     private let liveTaskStatusInterval: TimeInterval = 0.5
     private var consecutiveLiveIdlePolls = 0
@@ -139,6 +147,7 @@ final class PulseStore {
         flushPersist()
         eventTask?.cancel()
         pollTask?.cancel()
+        rateLimitMonitorTask?.cancel()
         dayRolloverTask?.cancel()
         liveTaskStatusTask?.cancel()
         postTurnRefreshTask?.cancel()
@@ -151,6 +160,7 @@ final class PulseStore {
         unhealthyRecoveryTask?.cancel()
         eventTask = nil
         pollTask = nil
+        rateLimitMonitorTask = nil
         dayRolloverTask = nil
         liveTaskStatusTask = nil
         reconnectTask = nil
@@ -177,6 +187,8 @@ final class PulseStore {
         cancelUnhealthyConnectionRecovery()
         eventTask?.cancel()
         pollTask?.cancel()
+        rateLimitMonitorTask?.cancel()
+        rateLimitMonitorTask = nil
         liveTaskStatusTask?.cancel()
         liveTaskStatusTask = nil
         localUsageRefreshTask?.cancel()
@@ -249,6 +261,7 @@ final class PulseStore {
         listenEvents()
         startLiveTaskStatusMonitoring()
         startPolling()
+        startRateLimitMonitoring()
         await refreshAll(forceRemote: true)
         scheduleStartupDataRecoveryIfNeeded()
         if needsRealRecovery {
@@ -1580,6 +1593,8 @@ final class PulseStore {
             lastError = msg
             connectionDetail = "连接断开"
             pollTask?.cancel()
+            rateLimitMonitorTask?.cancel()
+            rateLimitMonitorTask = nil
             cancelUnhealthyConnectionRecovery()
             scheduleRealConnectionRecovery()
 
@@ -1824,6 +1839,8 @@ final class PulseStore {
         cancelUnhealthyConnectionRecovery()
         eventTask?.cancel()
         pollTask?.cancel()
+        rateLimitMonitorTask?.cancel()
+        rateLimitMonitorTask = nil
         client = candidate
         isUsingMock = false
         cliPath = try? StdioCodexAppServerClient.findCodexCLI()
@@ -1839,6 +1856,7 @@ final class PulseStore {
         listenEvents()
         startLiveTaskStatusMonitoring()
         startPolling()
+        startRateLimitMonitoring()
 
         // 若旧客户端还有刷新在收尾，等待其退出后再用新客户端拉取，避免跳过首次真实数据。
         Task { [weak self] in
@@ -1909,6 +1927,103 @@ final class PulseStore {
             idleFollowUpPollsRemaining = max(0, idleFollowUpPollsRemaining - 1)
         }
         scheduleNextPoll()
+    }
+
+    // MARK: - Persistent rate-limit monitoring
+
+    /// 额度刷新不能跟随任务轮询进入 silent mode。小圆球、菜单栏和 Widget 都直接读取
+    /// `snapshot.rateLimits`，因此这里持续做一条只请求额度的轻量通道。
+    private func startRateLimitMonitoring() {
+        rateLimitMonitorTask?.cancel()
+        rateLimitMonitorTask = nil
+        guard didStart, !isUsingMock, client?.isConnected == true else { return }
+
+        rateLimitMonitorTask = Task { [weak self] in
+            guard let self else { return }
+            while self.didStart, !Task.isCancelled {
+                let delay = self.nextRateLimitMonitorDelay(reference: Date())
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                } catch {
+                    break
+                }
+                guard self.didStart, !Task.isCancelled else { break }
+                let forceRemote = self.hasDueRateLimitReset(reference: Date())
+                await self.refreshRateLimitsOnly(forceRemote: forceRemote)
+            }
+            if !self.didStart || Task.isCancelled {
+                self.rateLimitMonitorTask = nil
+            }
+        }
+    }
+
+    /// 在额度重置时间附近精确唤醒；如果服务端仍返回旧窗口，则每 3 秒强刷一次。
+    private func nextRateLimitMonitorDelay(reference: Date) -> TimeInterval {
+        let resetDates = snapshot.rateLimits.buckets.compactMap(\.resetsAt)
+        guard let nearestReset = resetDates.min() else {
+            return idleRateLimitPollingInterval
+        }
+        if nearestReset <= reference {
+            return dueRateLimitRetryInterval
+        }
+        let untilReset = nearestReset.timeIntervalSince(reference) + rateLimitResetGraceInterval
+        return min(idleRateLimitPollingInterval, max(0.25, untilReset))
+    }
+
+    private func hasDueRateLimitReset(reference: Date) -> Bool {
+        snapshot.rateLimits.buckets.contains {
+            guard let resetsAt = $0.resetsAt else { return false }
+            return resetsAt.addingTimeInterval(rateLimitResetGraceInterval) <= reference
+        }
+    }
+
+    /// 与完整 profile 刷新解耦，避免为了更新一个百分比同时拉取账号、线程和 Token。
+    /// 完整刷新正在执行时直接让路；持久监控会在下一周期补上。
+    private func refreshRateLimitsOnly(forceRemote: Bool) async {
+        guard didStart,
+              !isRefreshing,
+              !isAccountTransitioning,
+              let monitoredClient = client,
+              monitoredClient.isConnected else { return }
+
+        let revision = accountRevision
+        do {
+            let limits = try await monitoredClient.readRateLimits(forceRefresh: forceRemote)
+            guard didStart,
+                  revision == accountRevision,
+                  isCurrentClient(monitoredClient),
+                  !limits.buckets.isEmpty else { return }
+
+            await updateRateLimitForecastOffMain(from: limits)
+            guard didStart,
+                  revision == accountRevision,
+                  isCurrentClient(monitoredClient) else { return }
+
+            let previous = snapshot
+            var next = previous
+            next.rateLimits = limits
+            next.primaryRateLimitForecast = settings.resolvedRateLimitForecastEnabled
+                ? primaryRateLimitForecast
+                : nil
+            recordSyncSuccess(.rateLimits)
+            next.connectionState = connectedStateForSyncHealth()
+            next.updatedAt = Date()
+            apply(next)
+            evaluateAlerts(previous: previous, current: next)
+
+            if forceRemote {
+                let remaining = limits.primaryBucket.map {
+                    String(format: "%.0f%%", $0.remainingPercent)
+                } ?? "—"
+                PulseLog.write("rate-limit reset boundary refresh: remaining=\(remaining)")
+            }
+        } catch {
+            if case CodexServerError.requestDeferred = error {
+                return
+            }
+            recordSyncFailure(.rateLimits, message: error.localizedDescription)
+            PulseLog.write("rate-limit monitor refresh failed: \(error.localizedDescription)")
+        }
     }
 
     /// 兼容旧设置调用：重新启动自适应轮询。

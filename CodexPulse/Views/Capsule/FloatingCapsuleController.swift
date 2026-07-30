@@ -7,11 +7,224 @@ extension Notification.Name {
     static let pulseCapsuleToggleDetails = Notification.Name("com.codexpulse.capsule.toggle-details")
     static let pulseCapsuleToggleMini = Notification.Name("com.codexpulse.capsule.toggle-mini")
     static let pulseCatRoamingActivityChanged = Notification.Name("com.codexpulse.cat-roaming.activity")
+    static let pulseCodexDockReorder = Notification.Name("com.codexpulse.codex-dock.reorder")
+    static let pulseCodexDockDetachmentProgress = Notification.Name("com.codexpulse.codex-dock.detachment-progress")
 }
 
 private let compactPetSceneSize = CGSize(width: 216, height: 129.6)
 private let compactBlackHoleSceneSize = CGSize(width: 216, height: 184)
 private let compactPetPadding: CGFloat = 12
+
+struct CodexDockReorderUpdate: Sendable {
+    let startX: CGFloat
+    let currentX: CGFloat
+    let ended: Bool
+}
+
+private struct CodexDesktopWindow {
+    let id: CGWindowID
+    let ownerPID: pid_t
+    let frame: NSRect
+}
+
+private struct CodexDockTarget {
+    let edge: CodexDockEdge
+    let frame: NSRect
+}
+
+private enum CodexDesktopWindowLocator {
+    static func isCodexApplication(_ application: NSRunningApplication) -> Bool {
+        let bundle = application.bundleIdentifier?.lowercased() ?? ""
+        let name = application.localizedName?.lowercased() ?? ""
+        return application.processIdentifier != ProcessInfo.processInfo.processIdentifier
+            && (bundle.contains("openai.codex")
+                || bundle.hasSuffix(".codex")
+                || name == "codex")
+    }
+
+    static func windows() -> [CodexDesktopWindow] {
+        let applications = NSWorkspace.shared.runningApplications.filter(isCodexApplication)
+        let pids = Set(applications.map(\.processIdentifier))
+        guard !pids.isEmpty,
+              let windowInfo = CGWindowListCopyWindowInfo(
+                [.optionOnScreenOnly, .excludeDesktopElements],
+                kCGNullWindowID
+              ) as? [[String: Any]] else {
+            return []
+        }
+
+        return windowInfo.compactMap { info in
+            guard let ownerPID = info[kCGWindowOwnerPID as String] as? NSNumber,
+                  pids.contains(pid_t(ownerPID.int32Value)) else {
+                return nil
+            }
+            return window(from: info, expectedPID: pid_t(ownerPID.int32Value))
+        }
+    }
+
+    /// Once attached, reading only the bound WindowServer record is cheap enough
+    /// to follow a ProMotion drag without rescanning every visible application.
+    static func window(id: CGWindowID, ownerPID: pid_t) -> CodexDesktopWindow? {
+        guard let info = (
+            CGWindowListCopyWindowInfo([.optionIncludingWindow], id)
+                as? [[String: Any]]
+        )?.first else {
+            return nil
+        }
+        return window(from: info, expectedPID: ownerPID)
+    }
+
+    private static func window(
+        from info: [String: Any],
+        expectedPID: pid_t
+    ) -> CodexDesktopWindow? {
+        guard let ownerPID = info[kCGWindowOwnerPID as String] as? NSNumber,
+              pid_t(ownerPID.int32Value) == expectedPID,
+              let windowNumber = info[kCGWindowNumber as String] as? NSNumber,
+              (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+              (info[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue != false,
+              let bounds = info[kCGWindowBounds as String] as? [String: Any],
+              let x = (bounds["X"] as? NSNumber)?.doubleValue,
+              let y = (bounds["Y"] as? NSNumber)?.doubleValue,
+              let width = (bounds["Width"] as? NSNumber)?.doubleValue,
+              let height = (bounds["Height"] as? NSNumber)?.doubleValue,
+              width >= 420,
+              height >= 280 else {
+            return nil
+        }
+        let primaryTop = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.maxY
+            ?? NSScreen.main?.frame.maxY
+            ?? 0
+        return CodexDesktopWindow(
+            id: CGWindowID(windowNumber.uint32Value),
+            ownerPID: expectedPID,
+            frame: NSRect(
+                x: x,
+                y: Double(primaryTop) - y - height,
+                width: width,
+                height: height
+            )
+        )
+    }
+}
+
+private struct CodexDockAttachmentPreviewView: View {
+    let edge: CodexDockEdge
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(.ultraThinMaterial)
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.48),
+                    Color.cyan.opacity(0.10),
+                    Color.purple.opacity(0.08)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            HStack(spacing: 6) {
+                Image(systemName: "link")
+                Text("松开以吸附")
+            }
+            .font(.system(size: 11, weight: .semibold, design: .rounded))
+            .foregroundStyle(.primary.opacity(0.72))
+        }
+        .overlay(alignment: .top) {
+            LinearGradient(
+                colors: [.clear, Color.cyan.opacity(0.75), Color.purple.opacity(0.55), .clear],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+            .frame(height: 1.5)
+        }
+        .clipShape(CodexDockExtensionShape(edge: edge))
+    }
+}
+
+/// 信息栏保持在 Codex 下层；这条不可交互的独立光带位于真实接缝上层，
+/// 避免被 Codex 的窗口阴影遮住，同时不改变主面板的导航层级。
+private struct CodexDockSeamOverlayView: View {
+    let edge: CodexDockEdge
+
+    private var gradient: Gradient {
+        Gradient(stops: [
+            .init(color: .clear, location: 0),
+            .init(color: Color(red: 0.06, green: 0.94, blue: 0.94), location: 0.025),
+            .init(color: Color(red: 0.03, green: 0.72, blue: 1.00), location: 0.22),
+            .init(color: Color(red: 0.35, green: 0.34, blue: 1.00), location: 0.43),
+            .init(color: Color(red: 0.82, green: 0.16, blue: 1.00), location: 0.62),
+            .init(color: Color(red: 1.00, green: 0.20, blue: 0.68), location: 0.78),
+            .init(color: Color(red: 0.08, green: 0.92, blue: 1.00), location: 0.975),
+            .init(color: .clear, location: 1)
+        ])
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            if edge.isVertical {
+                auroraBand(
+                    length: max(0, proxy.size.height - 24),
+                    vertical: true
+                )
+                    .position(x: proxy.size.width * 0.5, y: proxy.size.height * 0.5)
+            } else {
+                auroraBand(
+                    length: max(0, proxy.size.width - 24),
+                    vertical: false
+                )
+                    .position(x: proxy.size.width * 0.5, y: proxy.size.height * 0.5)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func auroraBand(length: CGFloat, vertical: Bool) -> some View {
+        let start: UnitPoint = vertical ? .top : .leading
+        let end: UnitPoint = vertical ? .bottom : .trailing
+        let glowWidth = vertical ? 3.6 : length
+        let glowHeight = vertical ? length : 3.6
+        let coreWidth = vertical ? 1.45 : length
+        let coreHeight = vertical ? length : 1.45
+        let highlightWidth = vertical ? 0.28 : length
+        let highlightHeight = vertical ? length : 0.28
+
+        return ZStack {
+            LinearGradient(gradient: gradient, startPoint: start, endPoint: end)
+                .frame(width: glowWidth, height: glowHeight)
+                .blur(radius: 1.25)
+                .opacity(0.62)
+            LinearGradient(gradient: gradient, startPoint: start, endPoint: end)
+                .frame(
+                    width: vertical ? 2.0 : length,
+                    height: vertical ? length : 2.0
+                )
+                .blur(radius: 0.32)
+                .opacity(0.92)
+            LinearGradient(gradient: gradient, startPoint: start, endPoint: end)
+                .frame(width: coreWidth, height: coreHeight)
+                .shadow(color: Color.cyan.opacity(0.52), radius: 0.9)
+                .shadow(color: Color.purple.opacity(0.45), radius: 1.25)
+            LinearGradient(
+                colors: [
+                    .clear,
+                    Color.white.opacity(0.12),
+                    Color.white.opacity(0.70),
+                    Color.white.opacity(0.16),
+                    Color.white.opacity(0.62),
+                    .clear
+                ],
+                startPoint: start,
+                endPoint: end
+            )
+            .frame(width: highlightWidth, height: highlightHeight)
+            .blendMode(.screen)
+        }
+        .compositingGroup()
+    }
+}
 
 private func compactPetGrowthScale(for size: CGSize) -> CGFloat? {
     for sceneSize in [compactPetSceneSize, compactBlackHoleSceneSize] {
@@ -40,14 +253,23 @@ private final class InteractiveCapsulePanel: NSPanel {
     var onManualInteraction: (() -> Void)?
     var onManualDragMoved: ((NSPoint) -> Void)?
     var onManualDragEnded: ((NSPoint) -> Void)?
+    var onCodexDockReorder: ((_ startX: CGFloat, _ currentX: CGFloat, _ ended: Bool) -> Void)?
+    var onCodexDockDetach: ((_ pointer: NSPoint, _ translation: CGSize, _ ended: Bool) -> Void)?
     var usesCompactHitRegion = false
     var usesOrbCircularHitRegion = false
+    var usesCodexDockInteraction = false
+    var codexDockIsVertical = false
     var compactHitRegionSize = CGSize(width: 240, height: 153.6)
     private var capsuleMouseDownScreenLocation: NSPoint?
     private var capsuleMouseDownFrameOrigin: NSPoint?
     private var capsuleMouseDownAt: TimeInterval?
     private var pendingSingleClick: DispatchWorkItem?
     private var suppressNextSingleClick = false
+    private enum CodexDockDragAxis {
+        case reorder
+        case detach
+    }
+    private var codexDockDragAxis: CodexDockDragAxis?
 
     func suppressNextCapsuleClick() {
         suppressNextSingleClick = true
@@ -58,7 +280,18 @@ private final class InteractiveCapsulePanel: NSPanel {
         }
     }
 
+    func beginRebasedCompactDrag(at pointer: NSPoint) {
+        capsuleMouseDownScreenLocation = pointer
+        capsuleMouseDownFrameOrigin = frame.origin
+        capsuleMouseDownAt = ProcessInfo.processInfo.systemUptime
+        codexDockDragAxis = nil
+    }
+
     override func sendEvent(_ event: NSEvent) {
+        if usesCodexDockInteraction {
+            handleCodexDockEvent(event)
+            return
+        }
         let compactInteractionActive = isCompactInteractionActive
         let ownsPetPointerTracking = compactInteractionActive || isPetConversationLayout
         switch event.type {
@@ -89,12 +322,21 @@ private final class InteractiveCapsulePanel: NSPanel {
                     y: currentLocation.y - startLocation.y
                 )
                 if hypot(delta.x, delta.y) > 2 {
-                    onManualDragMoved?(currentLocation)
                     setFrameOrigin(clampedCompactOrigin(NSPoint(
                         x: startOrigin.x + delta.x,
                         y: startOrigin.y + delta.y
                     ), pointer: currentLocation))
+                    // Publish after the panel has moved so attachment geometry
+                    // never trails the pointer by one drag event.
+                    onManualDragMoved?(currentLocation)
                 }
+                return
+            }
+            if capsuleMouseDownScreenLocation != nil {
+                // 普通胶囊由 AppKit 的 isMovableByWindowBackground 负责实际移动，
+                // 先让 AppKit 更新窗口位置，再计算吸附距离，避免预览慢一帧。
+                super.sendEvent(event)
+                onManualDragMoved?(NSEvent.mouseLocation)
                 return
             }
         case .leftMouseUp:
@@ -141,10 +383,87 @@ private final class InteractiveCapsulePanel: NSPanel {
         super.sendEvent(event)
     }
 
+    private func handleCodexDockEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            guard isInsideCapsule(event) else {
+                super.sendEvent(event)
+                return
+            }
+            capsuleMouseDownScreenLocation = NSEvent.mouseLocation
+            capsuleMouseDownFrameOrigin = frame.origin
+            capsuleMouseDownAt = event.timestamp
+            codexDockDragAxis = nil
+
+        case .leftMouseDragged:
+            guard let start = capsuleMouseDownScreenLocation else { return }
+            let pointer = NSEvent.mouseLocation
+            let delta = CGSize(
+                width: pointer.x - start.x,
+                height: pointer.y - start.y
+            )
+            guard hypot(delta.width, delta.height) > 3 else { return }
+            if codexDockDragAxis == nil {
+                if codexDockIsVertical {
+                    codexDockDragAxis = abs(delta.width) > abs(delta.height) * 1.05
+                        ? .detach
+                        : .reorder
+                } else {
+                    codexDockDragAxis = abs(delta.height) > abs(delta.width) * 1.05
+                        ? .detach
+                        : .reorder
+                }
+            }
+            switch codexDockDragAxis {
+            case .reorder:
+                onCodexDockReorder?(
+                    codexDockIsVertical ? frame.maxY - start.y : start.x - frame.minX,
+                    codexDockIsVertical ? frame.maxY - pointer.y : pointer.x - frame.minX,
+                    false
+                )
+            case .detach:
+                onCodexDockDetach?(pointer, delta, false)
+            case nil:
+                break
+            }
+
+        case .leftMouseUp:
+            guard let start = capsuleMouseDownScreenLocation else {
+                super.sendEvent(event)
+                return
+            }
+            let pointer = NSEvent.mouseLocation
+            let delta = CGSize(
+                width: pointer.x - start.x,
+                height: pointer.y - start.y
+            )
+            switch codexDockDragAxis {
+            case .reorder:
+                onCodexDockReorder?(
+                    codexDockIsVertical ? frame.maxY - start.y : start.x - frame.minX,
+                    codexDockIsVertical ? frame.maxY - pointer.y : pointer.x - frame.minX,
+                    true
+                )
+            case .detach:
+                onCodexDockDetach?(pointer, delta, true)
+            case nil:
+                break
+            }
+            codexDockDragAxis = nil
+            clearCapsuleClickCandidate()
+
+        default:
+            super.sendEvent(event)
+        }
+    }
+
     private func isInsideCapsule(_ event: NSEvent) -> Bool {
         guard let contentView else { return false }
         let point = contentView.convert(event.locationInWindow, from: nil)
         let bounds = contentView.bounds
+        if usesCodexDockInteraction {
+            return bounds.insetBy(dx: 1, dy: 1).contains(point)
+        }
         if isCompactInteractionActive {
             if usesOrbCircularHitRegion {
                 let center = NSPoint(x: bounds.midX, y: bounds.midY)
@@ -251,6 +570,29 @@ final class FloatingCapsuleController {
     private weak var activeStore: PulseStore?
     private let frameKey = "pulse.capsule.frame"
     private let visibleKey = "pulse.capsule.visible"
+    private let codexDockAttachedKey = "pulse.codexDock.attached"
+    private let codexDockWidthKey = "pulse.codexDock.width"
+    private let codexDockHeightKey = "pulse.codexDock.height"
+    private let codexDockEdgeKey = "pulse.codexDock.edge"
+    private let codexDockHorizontalThickness: CGFloat = 44
+    private let codexDockVerticalThickness: CGFloat = 54
+    private let codexDockOverlap: CGFloat = 16
+    private let codexDockSeamSurfaceThickness: CGFloat = 8
+    private let codexDockProximity: CGFloat = 30
+    private var codexDockPreviewPanel: NSPanel?
+    private var codexDockSeamPanel: NSPanel?
+    private var codexDockSeamActivationObserver: NSObjectProtocol?
+    private var codexDockCandidateFrame: NSRect?
+    private var codexDockCandidateEdge: CodexDockEdge?
+    private var codexDockCandidateWindow: CodexDesktopWindow?
+    private var attachedCodexWindow: CodexDesktopWindow?
+    private var codexDockTrackingTask: Task<Void, Never>?
+    private var codexLaunchObserver: NSObjectProtocol?
+    private var codexDockPreviousContentSize: CGSize?
+    private var isCodexDockTransitioning = false
+    private var cachedCodexWindows: [CodexDesktopWindow] = []
+    private var lastCodexWindowFrameRefreshAt = Date.distantPast
+    private let codexWindowFrameRefreshInterval: TimeInterval = 0.12
     private var catRoamingEnabled = false
     private var catRoamingCycleDuration: TimeInterval = 1.0 / 1.12
     private var catRoamingArcHeight: CGFloat = 7
@@ -287,7 +629,17 @@ final class FloatingCapsuleController {
 
     func show(store: PulseStore) {
         if let panel {
-            panel.orderFrontRegardless()
+            if UserDefaults.standard.bool(forKey: codexDockAttachedKey),
+               let window = attachedCodexWindow {
+                let edge = CodexDockEdge(
+                    rawValue: UserDefaults.standard.string(forKey: codexDockEdgeKey) ?? ""
+                ) ?? .bottom
+                showCodexDockSeam(for: window, edge: edge, animated: false)
+                configureAttachedWindowLevel(panel, above: window)
+            } else {
+                panel.level = .statusBar
+                panel.orderFrontRegardless()
+            }
             return
         }
 
@@ -334,12 +686,39 @@ final class FloatingCapsuleController {
         }
         panel.onManualInteraction = { [weak self] in
             self?.pauseCatRoamingForManualInteraction()
+            // WindowServer enumeration is relatively expensive. Prime the
+            // target list once at drag start, then reuse it between refreshes.
+            _ = self?.codexWindows(forceRefresh: true)
         }
         panel.onManualDragMoved = { [weak self] pointer in
             self?.rememberManualPetEncounter(at: pointer)
+            self?.updateCodexDockPreview()
         }
         panel.onManualDragEnded = { [weak self] pointer in
-            self?.handleManualPetDrop(at: pointer)
+            guard let self else { return }
+            // Native AppKit window dragging can deliver its final frame only
+            // immediately before mouse-up. Re-evaluate once with that final
+            // geometry so a valid release can never miss the attachment.
+            self.updateCodexDockPreview(forceRefresh: true)
+            if self.attachToPreviewedCodexWindow() { return }
+            self.handleManualPetDrop(at: pointer)
+        }
+        panel.onCodexDockReorder = { startX, currentX, ended in
+            NotificationCenter.default.post(
+                name: .pulseCodexDockReorder,
+                object: CodexDockReorderUpdate(
+                    startX: startX,
+                    currentX: currentX,
+                    ended: ended
+                )
+            )
+        }
+        panel.onCodexDockDetach = { [weak self] pointer, translation, ended in
+            self?.handleCodexDockDetach(
+                pointer: pointer,
+                translation: translation,
+                ended: ended
+            )
         }
         panel.contentView = hosting
         let initialContentSize = hosting.fittingSize
@@ -358,6 +737,36 @@ final class FloatingCapsuleController {
         installSystemWakeObserverIfNeeded()
         panel.orderFrontRegardless()
         UserDefaults.standard.set(true, forKey: visibleKey)
+        restoreCodexDockAttachmentIfPossible()
+    }
+
+    func setFollowCodexLaunch(_ enabled: Bool, store: PulseStore) {
+        activeStore = store
+        if !enabled {
+            if let codexLaunchObserver {
+                NSWorkspace.shared.notificationCenter.removeObserver(codexLaunchObserver)
+                self.codexLaunchObserver = nil
+            }
+            return
+        }
+        guard codexLaunchObserver == nil else { return }
+        codexLaunchObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self, weak store] notification in
+            guard let application = notification.userInfo?[
+                NSWorkspace.applicationUserInfoKey
+            ] as? NSRunningApplication,
+            CodexDesktopWindowLocator.isCodexApplication(application) else {
+                return
+            }
+            Task { @MainActor [weak self, weak store] in
+                guard let self, let store else { return }
+                self.show(store: store)
+                PulseLog.write("Codex launched; showing CodexPulse follower")
+            }
+        }
     }
 
     /// SwiftUI 展开/收起时同步调整无边框面板尺寸，并固定右上角，避免详情卡被旧窗口裁掉。
@@ -366,6 +775,10 @@ final class FloatingCapsuleController {
               contentSize.width > 1,
               contentSize.height > 1 else { return }
         lastContentSize = contentSize
+        if UserDefaults.standard.bool(forKey: codexDockAttachedKey)
+            || isCodexDockTransitioning {
+            return
+        }
 
         let oldFrame = panel.frame
         let targetUsesCompactHitRegion = isCompactPetSize(contentSize)
@@ -447,6 +860,9 @@ final class FloatingCapsuleController {
 
     func hide() {
         stopCatRoaming()
+        stopCodexDockTracking()
+        hideCodexDockPreview()
+        hideCodexDockSeam(immediately: true)
         framePersistenceTask?.cancel()
         framePersistenceTask = nil
         removeSystemWakeObserver()
@@ -468,6 +884,13 @@ final class FloatingCapsuleController {
 
     func prepareForTermination() {
         stopCatRoaming()
+        stopCodexDockTracking()
+        hideCodexDockPreview()
+        hideCodexDockSeam(immediately: true)
+        if let codexLaunchObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(codexLaunchObserver)
+            self.codexLaunchObserver = nil
+        }
         framePersistenceTask?.cancel()
         framePersistenceTask = nil
         removeSystemWakeObserver()
@@ -1064,11 +1487,650 @@ final class FloatingCapsuleController {
         )
     }
 
+    // MARK: - Codex window attachment
+
+    private func codexWindows(forceRefresh: Bool = false) -> [CodexDesktopWindow] {
+        let now = Date()
+        if forceRefresh
+            || now.timeIntervalSince(lastCodexWindowFrameRefreshAt)
+                >= codexWindowFrameRefreshInterval {
+            cachedCodexWindows = CodexDesktopWindowLocator.windows()
+            lastCodexWindowFrameRefreshAt = now
+        }
+        return cachedCodexWindows
+    }
+
+    private func updateCodexDockPreview(forceRefresh: Bool = false) {
+        guard !UserDefaults.standard.bool(forKey: codexDockAttachedKey),
+              !isCodexDockTransitioning,
+              let panel else {
+            hideCodexDockPreview()
+            return
+        }
+        let candidates = codexWindows(forceRefresh: forceRefresh)
+            .flatMap { window in
+                codexDockTargets(for: window.frame).map {
+                    (window: window, target: $0)
+                }
+            }
+        guard let closest = candidates.min(by: {
+            rectDistance(panel.frame, $0.target.frame)
+                < rectDistance(panel.frame, $1.target.frame)
+        }),
+        rectDistance(panel.frame, closest.target.frame) <= codexDockProximity else {
+            hideCodexDockPreview()
+            return
+        }
+        codexDockCandidateWindow = closest.window
+        codexDockCandidateFrame = closest.target.frame
+        codexDockCandidateEdge = closest.target.edge
+        showCodexDockPreview(target: closest.target)
+    }
+
+    private func showCodexDockPreview(target: CodexDockTarget) {
+        let frame = target.frame
+        if let preview = codexDockPreviewPanel {
+            if abs(preview.frame.minX - frame.minX) > 0.5
+                || abs(preview.frame.minY - frame.minY) > 0.5
+                || abs(preview.frame.width - frame.width) > 0.5
+                || abs(preview.frame.height - frame.height) > 0.5 {
+                preview.setFrame(frame, display: true)
+            }
+            preview.contentView = NSHostingView(
+                rootView: CodexDockAttachmentPreviewView(edge: target.edge)
+            )
+            if preview.alphaValue < 1 {
+                preview.animator().alphaValue = 1
+            }
+            return
+        }
+        let preview = NSPanel(
+            contentRect: frame,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        preview.isOpaque = false
+        preview.backgroundColor = .clear
+        preview.hasShadow = false
+        preview.level = .statusBar
+        preview.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        preview.ignoresMouseEvents = true
+        preview.hidesOnDeactivate = false
+        preview.contentView = NSHostingView(
+            rootView: CodexDockAttachmentPreviewView(edge: target.edge)
+        )
+        preview.alphaValue = 0
+        preview.orderFrontRegardless()
+        codexDockPreviewPanel = preview
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            preview.animator().alphaValue = 1
+        }
+    }
+
+    private func hideCodexDockPreview(immediately: Bool = false) {
+        codexDockCandidateFrame = nil
+        codexDockCandidateEdge = nil
+        codexDockCandidateWindow = nil
+        guard let preview = codexDockPreviewPanel else { return }
+        codexDockPreviewPanel = nil
+        if immediately {
+            preview.orderOut(nil)
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            preview.animator().alphaValue = 0
+        } completionHandler: {
+            preview.orderOut(nil)
+        }
+    }
+
+    @discardableResult
+    private func attachToPreviewedCodexWindow() -> Bool {
+        guard let dockFrame = codexDockCandidateFrame,
+              let edge = codexDockCandidateEdge,
+              let window = codexDockCandidateWindow,
+              let panel,
+              !isCodexDockTransitioning else {
+            hideCodexDockPreview()
+            return false
+        }
+
+        persistFrame()
+        codexDockPreviousContentSize = lastContentSize ?? panel.frame.size
+        stopCatRoaming()
+        isCodexDockTransitioning = true
+        codexDockCandidateFrame = nil
+        codexDockCandidateEdge = nil
+        codexDockCandidateWindow = nil
+        attachedCodexWindow = window
+        // Remove the guide before the real surface starts morphing; keeping both
+        // panels visible created the "two stacked capsules" freeze.
+        hideCodexDockPreview(immediately: true)
+        UserDefaults.standard.set(dockFrame.width, forKey: codexDockWidthKey)
+        UserDefaults.standard.set(dockFrame.height, forKey: codexDockHeightKey)
+        UserDefaults.standard.set(edge.rawValue, forKey: codexDockEdgeKey)
+        UserDefaults.standard.set(true, forKey: codexDockAttachedKey)
+        showCodexDockSeam(for: window, edge: edge)
+        configureAttachedWindowLevel(panel, above: window)
+        panel.isMovableByWindowBackground = false
+        if let interactive = panel as? InteractiveCapsulePanel {
+            interactive.usesCodexDockInteraction = true
+            interactive.codexDockIsVertical = edge.isVertical
+            interactive.usesCompactHitRegion = false
+        }
+        panel.contentView?.layoutSubtreeIfNeeded()
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                ? 0.01
+                : 0.27
+            context.timingFunction = CAMediaTimingFunction(
+                controlPoints: 0.20,
+                0.82,
+                0.24,
+                1
+            )
+            // A single uninterrupted envelope expansion lets the dock read as
+            // growing out of the capsule instead of swapping between windows.
+            panel.animator().setFrame(dockFrame, display: true)
+        } completionHandler: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.isCodexDockTransitioning = false
+                self?.startCodexDockTracking()
+            }
+        }
+        return true
+    }
+
+    private func restoreCodexDockAttachmentIfPossible() {
+        guard UserDefaults.standard.bool(forKey: codexDockAttachedKey),
+              let panel else { return }
+        let candidates = codexWindows(forceRefresh: true)
+        guard let window = candidates.first else {
+            UserDefaults.standard.set(false, forKey: codexDockAttachedKey)
+            return
+        }
+        attachedCodexWindow = window
+        let savedEdge = CodexDockEdge(
+            rawValue: UserDefaults.standard.string(forKey: codexDockEdgeKey) ?? ""
+        ) ?? .bottom
+        let availableTargets = codexDockTargets(for: window.frame)
+        guard let target = availableTargets.first(where: { $0.edge == savedEdge })
+            ?? availableTargets.first else {
+            UserDefaults.standard.set(false, forKey: codexDockAttachedKey)
+            return
+        }
+        let dockFrame = target.frame
+        UserDefaults.standard.set(dockFrame.width, forKey: codexDockWidthKey)
+        UserDefaults.standard.set(dockFrame.height, forKey: codexDockHeightKey)
+        UserDefaults.standard.set(target.edge.rawValue, forKey: codexDockEdgeKey)
+        showCodexDockSeam(for: window, edge: target.edge, animated: false)
+        configureAttachedWindowLevel(panel, above: window)
+        panel.isMovableByWindowBackground = false
+        if let interactive = panel as? InteractiveCapsulePanel {
+            interactive.usesCodexDockInteraction = true
+            interactive.codexDockIsVertical = target.edge.isVertical
+            interactive.usesCompactHitRegion = false
+        }
+        panel.setFrame(dockFrame, display: true)
+        startCodexDockTracking()
+    }
+
+    private func startCodexDockTracking() {
+        stopCodexDockTracking()
+        codexDockTrackingTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var missingFrames = 0
+            var lastOrderingRefresh = CACurrentMediaTime()
+            while !Task.isCancelled,
+                  UserDefaults.standard.bool(forKey: self.codexDockAttachedKey),
+                  let panel = self.panel {
+                let current = panel.frame
+                let edge = CodexDockEdge(
+                    rawValue: UserDefaults.standard.string(
+                        forKey: self.codexDockEdgeKey
+                    ) ?? ""
+                ) ?? .bottom
+                let trackedWindow: CodexDesktopWindow?
+                if let attached = self.attachedCodexWindow {
+                    trackedWindow = CodexDesktopWindowLocator.window(
+                        id: attached.id,
+                        ownerPID: attached.ownerPID
+                    )
+                } else {
+                    trackedWindow = self.codexWindows(forceRefresh: true).min(by: {
+                        self.rectDistance(
+                            current,
+                            self.codexDockFrame($0.frame, edge: edge)
+                        ) < self.rectDistance(
+                            current,
+                            self.codexDockFrame($1.frame, edge: edge)
+                        )
+                    })
+                }
+                if let window = trackedWindow {
+                    self.attachedCodexWindow = window
+                    if !self.isCodexDockAvailable(window.frame, edge: edge) {
+                        self.detachCodexDock(
+                            at: NSPoint(x: current.midX, y: current.midY),
+                            restoreSavedPosition: true
+                        )
+                        return
+                    }
+                    missingFrames = 0
+                    let target = self.codexDockFrame(window.frame, edge: edge)
+                    self.updateCodexDockSeamFrame(window.frame, edge: edge)
+                    let now = CACurrentMediaTime()
+                    if now - lastOrderingRefresh >= 0.25 {
+                        self.configureAttachedWindowLevel(panel, above: window)
+                        lastOrderingRefresh = now
+                    }
+                    if abs(target.minX - current.minX) > 0.5
+                        || abs(target.minY - current.minY) > 0.5
+                        || abs(target.width - current.width) > 0.5
+                        || abs(target.height - current.height) > 0.5 {
+                        if abs(target.width - current.width) > 0.5 {
+                            UserDefaults.standard.set(
+                                target.width,
+                                forKey: self.codexDockWidthKey
+                            )
+                        }
+                        if abs(target.height - current.height) > 0.5 {
+                            UserDefaults.standard.set(
+                                target.height,
+                                forKey: self.codexDockHeightKey
+                            )
+                        }
+                        // Direct frame assignment at display cadence avoids the
+                        // delayed staircase created by overlapping animations.
+                        panel.setFrame(target, display: true)
+                    }
+                } else {
+                    missingFrames += 1
+                    if missingFrames >= 12 {
+                        self.detachCodexDock(
+                            at: NSPoint(x: current.midX, y: current.midY),
+                            restoreSavedPosition: true
+                        )
+                        return
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 8_333_333)
+            }
+        }
+    }
+
+    private func configureAttachedWindowLevel(
+        _ panel: NSPanel,
+        above window: CodexDesktopWindow
+    ) {
+        if panel.level != .normal {
+            panel.level = .normal
+        }
+        // The attachment surface extends behind Codex. Ordering it underneath
+        // lets the real Codex corner mask the overlap and removes the two
+        // transparent shoulder wedges without painting over the host window.
+        panel.order(.below, relativeTo: Int(window.id))
+        updateCodexDockSeamVisibility(for: window)
+    }
+
+    private func showCodexDockSeam(
+        for window: CodexDesktopWindow,
+        edge: CodexDockEdge,
+        animated: Bool = true
+    ) {
+        installCodexDockSeamActivationObserverIfNeeded()
+        let frame = codexDockSeamFrame(window.frame, edge: edge)
+        if let seam = codexDockSeamPanel {
+            seam.contentView = transparentHostingView(
+                rootView: CodexDockSeamOverlayView(edge: edge)
+            )
+            seam.setFrame(frame, display: true)
+            seam.level = .floating
+            updateCodexDockSeamVisibility(for: window)
+            if seam.isVisible, seam.alphaValue < 1 {
+                seam.animator().alphaValue = 1
+            }
+            return
+        }
+
+        let seam = NSPanel(
+            contentRect: frame,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        seam.isOpaque = false
+        seam.backgroundColor = .clear
+        seam.hasShadow = false
+        seam.level = .floating
+        seam.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        seam.ignoresMouseEvents = true
+        seam.hidesOnDeactivate = false
+        seam.contentView = transparentHostingView(
+            rootView: CodexDockSeamOverlayView(edge: edge)
+        )
+        seam.alphaValue = animated ? 0 : 1
+        codexDockSeamPanel = seam
+        updateCodexDockSeamVisibility(for: window)
+
+        guard animated, seam.isVisible else { return }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                ? 0.01
+                : 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            seam.animator().alphaValue = 1
+        }
+    }
+
+    private func installCodexDockSeamActivationObserverIfNeeded() {
+        guard codexDockSeamActivationObserver == nil else { return }
+        codexDockSeamActivationObserver =
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, let window = self.attachedCodexWindow else { return }
+                    self.updateCodexDockSeamVisibility(for: window)
+                }
+            }
+    }
+
+    private func updateCodexDockSeamVisibility(for window: CodexDesktopWindow) {
+        guard let seam = codexDockSeamPanel else { return }
+        // Electron can briefly report a helper process as the foreground app.
+        // Match the Codex application family instead of requiring the foreground
+        // PID to equal the WindowServer owner PID, otherwise the seam is hidden
+        // even though the attached Codex window is still active.
+        let codexIsFrontmost = NSWorkspace.shared.frontmostApplication
+            .map(CodexDesktopWindowLocator.isCodexApplication) ?? false
+        let shouldShow = codexIsFrontmost
+            && panel?.isVisible == true
+            && UserDefaults.standard.bool(forKey: codexDockAttachedKey)
+        if shouldShow {
+            if !seam.isVisible {
+                seam.alphaValue = 1
+                seam.orderFrontRegardless()
+            }
+        } else if seam.isVisible {
+            seam.orderOut(nil)
+        }
+    }
+
+    private func transparentHostingView<Content: View>(
+        rootView: Content
+    ) -> NSHostingView<Content> {
+        let hosting = NSHostingView(rootView: rootView)
+        hosting.wantsLayer = true
+        hosting.layer?.backgroundColor = NSColor.clear.cgColor
+        return hosting
+    }
+
+    private func updateCodexDockSeamFrame(
+        _ windowFrame: NSRect,
+        edge: CodexDockEdge
+    ) {
+        guard let seam = codexDockSeamPanel else { return }
+        let target = codexDockSeamFrame(windowFrame, edge: edge)
+        guard abs(target.minX - seam.frame.minX) > 0.5
+                || abs(target.minY - seam.frame.minY) > 0.5
+                || abs(target.width - seam.frame.width) > 0.5
+                || abs(target.height - seam.frame.height) > 0.5 else {
+            return
+        }
+        seam.setFrame(target, display: true)
+    }
+
+    private func codexDockSeamFrame(
+        _ windowFrame: NSRect,
+        edge: CodexDockEdge
+    ) -> NSRect {
+        let thickness = codexDockSeamSurfaceThickness
+        let half = thickness * 0.5
+        switch edge {
+        case .bottom:
+            return NSRect(
+                x: windowFrame.minX,
+                y: windowFrame.minY - half,
+                width: windowFrame.width,
+                height: thickness
+            )
+        case .top:
+            return NSRect(
+                x: windowFrame.minX,
+                y: windowFrame.maxY - half,
+                width: windowFrame.width,
+                height: thickness
+            )
+        case .left:
+            return NSRect(
+                x: windowFrame.minX - half,
+                y: windowFrame.minY,
+                width: thickness,
+                height: windowFrame.height
+            )
+        case .right:
+            return NSRect(
+                x: windowFrame.maxX - half,
+                y: windowFrame.minY,
+                width: thickness,
+                height: windowFrame.height
+            )
+        }
+    }
+
+    private func hideCodexDockSeam(immediately: Bool = false) {
+        if let observer = codexDockSeamActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            codexDockSeamActivationObserver = nil
+        }
+        guard let seam = codexDockSeamPanel else { return }
+        codexDockSeamPanel = nil
+        if immediately {
+            seam.orderOut(nil)
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            seam.animator().alphaValue = 0
+        } completionHandler: {
+            seam.orderOut(nil)
+        }
+    }
+
+    private func stopCodexDockTracking() {
+        codexDockTrackingTask?.cancel()
+        codexDockTrackingTask = nil
+    }
+
+    private func handleCodexDockDetach(
+        pointer: NSPoint,
+        translation: CGSize,
+        ended: Bool
+    ) {
+        guard UserDefaults.standard.bool(forKey: codexDockAttachedKey),
+              !isCodexDockTransitioning else { return }
+        let edge = CodexDockEdge(
+            rawValue: UserDefaults.standard.string(forKey: codexDockEdgeKey) ?? ""
+        ) ?? .bottom
+        let distance = edge.isVertical
+            ? abs(translation.width)
+            : abs(translation.height)
+        let progress = min(1, distance / codexDockProximity)
+        NotificationCenter.default.post(
+            name: .pulseCodexDockDetachmentProgress,
+            object: progress
+        )
+        if ended {
+            if progress >= 1 {
+                detachCodexDock(at: pointer, restoreSavedPosition: false)
+            } else {
+                NotificationCenter.default.post(
+                    name: .pulseCodexDockDetachmentProgress,
+                    object: CGFloat.zero
+                )
+            }
+        }
+    }
+
+    private func detachCodexDock(
+        at pointer: NSPoint,
+        restoreSavedPosition: Bool
+    ) {
+        guard let panel,
+              UserDefaults.standard.bool(forKey: codexDockAttachedKey),
+              !isCodexDockTransitioning else { return }
+        isCodexDockTransitioning = true
+        stopCodexDockTracking()
+        hideCodexDockSeam(immediately: true)
+        attachedCodexWindow = nil
+        panel.level = .statusBar
+        panel.orderFrontRegardless()
+        NotificationCenter.default.post(
+            name: .pulseCodexDockDetachmentProgress,
+            object: CGFloat(1)
+        )
+
+        let savedFrame = initialFrame()
+        let restoredSize = codexDockPreviousContentSize
+            ?? (savedFrame.width > 100 && savedFrame.height > 40
+                ? savedFrame.size
+                : CGSize(width: 283, height: 116))
+        let targetOrigin: NSPoint
+        if restoreSavedPosition {
+            targetOrigin = savedFrame.origin
+        } else {
+            targetOrigin = NSPoint(
+                x: pointer.x - restoredSize.width / 2,
+                y: pointer.y - restoredSize.height / 2
+            )
+        }
+        let target = NSRect(origin: targetOrigin, size: restoredSize)
+        // Switch the SwiftUI surface and contract the same visible panel. Never
+        // drop alpha to zero: that caused the blank frame captured by the user.
+        UserDefaults.standard.set(false, forKey: codexDockAttachedKey)
+        panel.contentView?.layoutSubtreeIfNeeded()
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                ? 0.01
+                : 0.27
+            context.timingFunction = CAMediaTimingFunction(
+                controlPoints: 0.20,
+                0.82,
+                0.24,
+                1
+            )
+            panel.animator().setFrame(target, display: true)
+        } completionHandler: { [weak self, weak panel] in
+            Task { @MainActor [weak self, weak panel] in
+                guard let self, let panel else { return }
+                panel.isMovableByWindowBackground = true
+                if let interactive = panel as? InteractiveCapsulePanel {
+                    interactive.usesCodexDockInteraction = false
+                    interactive.codexDockIsVertical = false
+                }
+                self.isCodexDockTransitioning = false
+                NotificationCenter.default.post(
+                    name: .pulseCodexDockDetachmentProgress,
+                    object: CGFloat.zero
+                )
+            }
+        }
+    }
+
+    private func codexDockTargets(for windowFrame: NSRect) -> [CodexDockTarget] {
+        CodexDockEdge.allCases.compactMap { edge in
+            guard isCodexDockAvailable(windowFrame, edge: edge) else { return nil }
+            return CodexDockTarget(
+                edge: edge,
+                frame: codexDockFrame(windowFrame, edge: edge)
+            )
+        }
+    }
+
+    private func codexDockFrame(
+        _ windowFrame: NSRect,
+        edge: CodexDockEdge
+    ) -> NSRect {
+        switch edge {
+        case .bottom:
+            return NSRect(
+                x: windowFrame.minX,
+                y: windowFrame.minY - codexDockHorizontalThickness,
+                width: windowFrame.width,
+                height: codexDockHorizontalThickness + codexDockOverlap
+            )
+        case .top:
+            return NSRect(
+                x: windowFrame.minX,
+                y: windowFrame.maxY - codexDockOverlap,
+                width: windowFrame.width,
+                height: codexDockHorizontalThickness + codexDockOverlap
+            )
+        case .left:
+            return NSRect(
+                x: windowFrame.minX - codexDockVerticalThickness,
+                y: windowFrame.minY,
+                width: codexDockVerticalThickness + codexDockOverlap,
+                height: windowFrame.height
+            )
+        case .right:
+            return NSRect(
+                x: windowFrame.maxX - codexDockOverlap,
+                y: windowFrame.minY,
+                width: codexDockVerticalThickness + codexDockOverlap,
+                height: windowFrame.height
+            )
+        }
+    }
+
+    private func isFullScreenCodexWindow(_ frame: NSRect) -> Bool {
+        guard let screen = NSScreen.screens.first(where: {
+            $0.frame.intersection(frame).width * $0.frame.intersection(frame).height
+                >= frame.width * frame.height * 0.7
+        }) else { return false }
+        return frame.width >= screen.frame.width - 4
+            && frame.height >= screen.frame.height - 8
+    }
+
+    private func isCodexDockAvailable(
+        _ frame: NSRect,
+        edge: CodexDockEdge
+    ) -> Bool {
+        guard !isFullScreenCodexWindow(frame),
+              let screen = NSScreen.screens.first(where: {
+                  $0.frame.intersection(frame).width * $0.frame.intersection(frame).height
+                      >= frame.width * frame.height * 0.7
+              }) else {
+            return false
+        }
+        let dock = codexDockFrame(frame, edge: edge)
+        return dock.minX >= screen.visibleFrame.minX - 1
+            && dock.maxX <= screen.visibleFrame.maxX + 1
+            && dock.minY >= screen.visibleFrame.minY - 1
+            && dock.maxY <= screen.visibleFrame.maxY + 1
+    }
+
+    private func rectDistance(_ lhs: NSRect, _ rhs: NSRect) -> CGFloat {
+        let dx = max(0, max(lhs.minX - rhs.maxX, rhs.minX - lhs.maxX))
+        let dy = max(0, max(lhs.minY - rhs.maxY, rhs.minY - lhs.maxY))
+        return hypot(dx, dy)
+    }
+
     // MARK: - 位置持久化
 
     /// 拖动和自动漫游都会连续触发 didMove。只在位置稳定后写一次，
     /// 避免漫游动画期间以 60fps 刷写 UserDefaults。
     private func scheduleFramePersistence() {
+        guard !UserDefaults.standard.bool(forKey: codexDockAttachedKey) else { return }
         framePersistenceTask?.cancel()
         framePersistenceTask = Task { @MainActor [weak self] in
             do {
@@ -1082,7 +2144,8 @@ final class FloatingCapsuleController {
     }
 
     private func persistFrame() {
-        guard let panel else { return }
+        guard let panel,
+              !UserDefaults.standard.bool(forKey: codexDockAttachedKey) else { return }
         UserDefaults.standard.set(NSStringFromRect(panel.frame), forKey: frameKey)
     }
 

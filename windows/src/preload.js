@@ -9,6 +9,10 @@ contextBridge.exposeInMainWorld("pulse", {
   skipUpdate: (version) => ipcRenderer.invoke("pulse:skip-update", String(version || "")),
   chooseCodex: () => ipcRenderer.invoke("pulse:choose-codex"),
   clearCodexPath: () => ipcRenderer.invoke("pulse:clear-codex-path"),
+  setFollowCodexLaunch: (enabled) => ipcRenderer.invoke(
+    "pulse:set-follow-codex-launch",
+    enabled === true
+  ),
   searchLocations: (query) => ipcRenderer.invoke("pulse:search-locations", String(query || "")),
   setInformationBarEnabled: (enabled) => ipcRenderer.invoke("pulse:set-information-enabled", Boolean(enabled)),
   setInformationBarLocation: (location) => ipcRenderer.invoke("pulse:set-information-location", location),
@@ -44,6 +48,10 @@ contextBridge.exposeInMainWorld("pulse", {
     x: Number(x),
     y: Number(y),
     moved: moved === true
+  }),
+  detachCodexDock: (x, y) => ipcRenderer.invoke("pulse:codex-dock-detach", {
+    x: Number(x),
+    y: Number(y)
   }),
   planPetRoam: (options) => ipcRenderer.invoke("pulse:pet-roam-plan", {
     forceInteraction: options?.forceInteraction === true
@@ -91,6 +99,11 @@ contextBridge.exposeInMainWorld("pulse", {
     const listener = (_event, drop) => callback(drop);
     ipcRenderer.on("pulse:pet-drop", listener);
     return () => ipcRenderer.removeListener("pulse:pet-drop", listener);
+  },
+  onCodexDockTransition: (callback) => {
+    const listener = (_event, transition) => callback(transition);
+    ipcRenderer.on("pulse:codex-dock-transition", listener);
+    return () => ipcRenderer.removeListener("pulse:codex-dock-transition", listener);
   },
   onBlackHoleCaptureGeometry: (callback) => {
     const listener = (_event, geometry) => callback(geometry);

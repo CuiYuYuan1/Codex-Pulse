@@ -54,6 +54,10 @@ struct CodexPulseApp: App {
                     #if os(macOS)
                     NSApp.activate(ignoringOtherApps: true)
                     FloatingCapsuleController.shared.restoreIfNeeded(store: store)
+                    FloatingCapsuleController.shared.setFollowCodexLaunch(
+                        store.settings.resolvedFollowCodexLaunch,
+                        store: store
+                    )
                     #endif
                 }
         }

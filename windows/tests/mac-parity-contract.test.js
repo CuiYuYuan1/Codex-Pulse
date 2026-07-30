@@ -36,11 +36,19 @@ const capsuleController = fs.readFileSync(
   "utf8"
 );
 const macApp = fs.readFileSync(path.join(root, "CodexPulse/App/CodexPulseApp.swift"), "utf8");
+const menuBarPanel = fs.readFileSync(
+  path.join(root, "CodexPulse/Views/MenuBar/MenuBarPanelView.swift"),
+  "utf8"
+);
 const settingsStore = fs.readFileSync(path.join(root, "Shared/Storage/SettingsStore.swift"), "utf8");
 const petGrowthSwift = fs.readFileSync(path.join(root, "Shared/Utilities/PetGrowth.swift"), "utf8");
 const snapshotStore = fs.readFileSync(path.join(root, "Shared/Storage/SnapshotStore.swift"), "utf8");
 const css = fs.readFileSync(path.join(root, "windows/src/renderer/styles.css"), "utf8");
 const renderer = fs.readFileSync(path.join(root, "windows/src/renderer/renderer.js"), "utf8");
+const dockInteraction = fs.readFileSync(
+  path.join(root, "windows/src/renderer/dock-interaction.js"),
+  "utf8"
+);
 const catRig = fs.readFileSync(path.join(root, "windows/src/renderer/cat-rig.js"), "utf8");
 const blackHoleWebGL = fs.readFileSync(
   path.join(root, "windows/src/renderer/black-hole-pet.js"),
@@ -82,6 +90,29 @@ function includes(source, fragment, label) {
   );
 }
 
+// Task polling is allowed to go silent, but quota-backed pets must continue to
+// refresh while idle and must bypass the client cache at the reset boundary.
+includes(
+  pulseStore,
+  "private let idleRateLimitPollingInterval: TimeInterval = 8",
+  "macOS persistent idle quota interval"
+);
+includes(
+  pulseStore,
+  "let forceRemote = self.hasDueRateLimitReset(reference: Date())",
+  "macOS reset-boundary force refresh"
+);
+includes(
+  pulseStore,
+  "await self.refreshRateLimitsOnly(forceRemote: forceRemote)",
+  "macOS lightweight quota-only refresh"
+);
+includes(
+  pulseStore,
+  "startRateLimitMonitoring()",
+  "macOS quota monitor startup"
+);
+
 // Shared collapsed layout contract.
 includes(swift, "private let informationCapsuleWidth: CGFloat = 275", "macOS information width");
 includes(css, "width: var(--information-capsule-width, 275px);", "Windows information width");
@@ -97,6 +128,218 @@ includes(swift, ".frame(maxWidth: 66)", "macOS live Token width");
 includes(css, ".token-metric strong { max-width: 66px;", "Windows live Token width");
 includes(swift, ".frame(width: 1, height: 22)", "macOS divider");
 includes(css, ".divider { width: 1px; height: 22px;", "Windows divider");
+
+// Codex window attachment stays compact and reversible on both desktop
+// platforms. The preview appears at 30px, the dock remains 44px tall, and
+// crossing the same 30px threshold is required to drag it back out.
+includes(capsuleController, "private let codexDockProximity: CGFloat = 30", "macOS Codex dock proximity");
+includes(capsuleController, "private let codexDockHorizontalThickness: CGFloat = 44", "macOS horizontal Codex dock thickness");
+includes(capsuleController, "private let codexDockVerticalThickness: CGFloat = 54", "macOS compact side dock thickness");
+includes(capsuleController, "private let codexDockOverlap: CGFloat = 16", "macOS shoulder overlap");
+includes(capsuleController, "distance / codexDockProximity", "macOS Codex dock detachment progress");
+includes(
+  capsuleController,
+  "let distance = edge.isVertical",
+  "macOS Codex dock edge-aware detachment"
+);
+includes(
+  capsuleController,
+  "if capsuleMouseDownScreenLocation != nil {\n                // 普通胶囊由 AppKit",
+  "macOS normal capsule emits live Codex dock drag updates"
+);
+includes(
+  capsuleController,
+  "private var cachedCodexWindows: [CodexDesktopWindow] = []",
+  "macOS Codex window lookup is cached during live drag"
+);
+includes(
+  capsuleController,
+  "CGWindowListCopyWindowInfo([.optionIncludingWindow], id)",
+  "macOS attached dock tracks only its bound Codex window"
+);
+includes(
+  capsuleController,
+  "try? await Task.sleep(nanoseconds: 8_333_333)",
+  "macOS attached dock follows at ProMotion cadence"
+);
+includes(
+  capsuleController,
+  "panel.level = .normal",
+  "macOS attached dock uses the Codex window level"
+);
+includes(
+  capsuleController,
+  "hideCodexDockPreview(immediately: true)",
+  "macOS attachment removes its guide before morphing"
+);
+assert(
+  !capsuleController.includes("let landingFrame = NSRect("),
+  "macOS attachment must remain one continuous envelope morph"
+);
+assert(
+  !capsuleController.includes("panel.alphaValue = 0"),
+  "macOS detachment must not introduce a blank frame"
+);
+includes(swift, '@AppStorage("pulse.codexDock.order")', "macOS Codex dock order persistence");
+includes(swift, "struct CodexDockExtensionShape: Shape", "macOS Codex dock extension shoulder");
+includes(swift, "enum CodexDockEdge: String, CaseIterable", "macOS four-edge dock model");
+includes(swift, "if vertical {", "macOS side dock hides metric labels");
+includes(capsuleController, "panel.order(.below", "macOS dock overlaps behind Codex");
+includes(
+  capsuleController,
+  "x: windowFrame.minX,",
+  "macOS Codex dock aligns to the visible window edge"
+);
+includes(main, "const CODEX_DOCK_PROXIMITY = 30;", "Windows Codex dock proximity");
+includes(main, "const CODEX_DOCK_HORIZONTAL_THICKNESS = 44;", "Windows horizontal dock thickness");
+includes(main, "const CODEX_DOCK_VERTICAL_THICKNESS = 54;", "Windows compact side dock thickness");
+includes(main, "const CODEX_DOCK_OVERLAP = 16;", "Windows shoulder overlap");
+includes(main, '["top", "bottom", "left", "right"]', "Windows four-edge dock model");
+includes(main, '"  Start-Sleep -Milliseconds 8"', "Windows Codex dock high-refresh tracking cadence");
+includes(
+  main,
+  "normalizeTrackedWindowBounds(trackedWindow, screen)",
+  "Windows Codex window tracking normalizes physical pixels into Electron DIPs"
+);
+includes(
+  main,
+  "visibleWindowBounds(",
+  "Windows Codex proximity follows the visible capsule instead of its transparent surface"
+);
+includes(
+  main,
+  "$knownInstall -and $windowTitle -match '(?i)(codex|chatgpt)'",
+  "Windows recognizes packaged Codex and ChatGPT desktop window hosts"
+);
+includes(
+  main,
+  "handle=$h.ToInt64().ToString()",
+  "Windows tracks the Codex HWND without losing precision"
+);
+includes(
+  main,
+  "windowRef.moveAbove(codexWindowMediaSourceId);",
+  "Windows keeps the normal-level dock visibly above its Codex source window"
+);
+includes(
+  main,
+  "if (!windowRef.isVisible()) windowRef.showInactive();",
+  "Windows attachment remains visible without stealing Codex focus"
+);
+includes(main, "windowRef.setAlwaysOnTop(false);", "Windows attached dock uses normal window level");
+includes(main, "windowRef.setAlwaysOnTop(true);", "Windows detached capsule restores top level");
+includes(main, 'ipcMain.handle("pulse:codex-dock-detach"', "Windows Codex dock reverse transition");
+includes(
+  main,
+  "function applyAttachedCodexDockShape(width, height, edge = codexDockEdge)",
+  "Windows main process owns the attached seam-clipped shape policy"
+);
+includes(
+  main,
+  "windowRef.setShape([shape]);",
+  "Windows attached dock excludes its transparent overlap from drawing and input"
+);
+includes(renderer, 'const codexDockOrderKey = "codexPulse.codexDockOrder";', "Windows Codex dock order persistence");
+includes(
+  renderer,
+  "if (codexDockAttached) {\n    return [{ x: 0, y: 0, width: innerWidth, height: innerHeight }];\n  }",
+  "Windows renderer keeps attached shape refreshes non-empty for main-process clipping"
+);
+includes(
+  renderer,
+  "if (expanded || miniMode || miniTransitioning || codexDockAttached) return;",
+  "Windows attached dock skips floating capsule width recalculation"
+);
+includes(
+  renderer,
+  "if (didMove) window.pulse.dragTo(event.screenX, event.screenY);",
+  "Windows flushes the final drag position before deciding attachment"
+);
+includes(
+  dockInteraction,
+  "const DETACH_DISTANCE = 18;",
+  "Windows detachment completes before the pointer leaves the native dock surface"
+);
+includes(
+  dockInteraction,
+  "Math.abs(normalDistance(edge, dx, dy))",
+  "Windows dock detaches in either perpendicular direction"
+);
+includes(html, '<script src="dock-interaction.js"></script>', "Windows loads the tested dock interaction policy");
+includes(
+  renderer,
+  "void window.pulse.detachCodexDock(event.screenX, event.screenY);",
+  "Windows starts detachment immediately at the threshold without waiting for an out-of-window pointerup"
+);
+includes(
+  main,
+  "1 - Math.exp(-elapsed / 22)",
+  "Windows Codex dock follows host movement with time-based interpolation"
+);
+includes(
+  main,
+  "codexDockPreviewSuppressUntil = Date.now() + 450;",
+  "Windows detached surfaces have a short anti-reattachment cooldown"
+);
+includes(
+  renderer,
+  "setTimeout(scheduleWindowShapeSync, 80);",
+  "Windows restores the floating capsule shape after detachment"
+);
+includes(css, "height: 100%;\n  padding-top: 16px;", "Windows Codex dock overlap frame");
+includes(css, "inset: 16px 0 0;", "Windows dock glass begins outside Codex");
+includes(css, "top: 16px;\n  left: 12px;", "Windows aurora line follows the bottom seam");
+includes(
+  capsuleController,
+  "private struct CodexDockSeamOverlayView: View",
+  "macOS Codex dock uses an independent aurora seam"
+);
+includes(
+  capsuleController,
+  "seam.level = .floating",
+  "macOS aurora seam keeps a stable non-flickering visual level"
+);
+includes(
+  capsuleController,
+  ".map(CodexDesktopWindowLocator.isCodexApplication) ?? false",
+  "macOS aurora seam never floats over an inactive Codex window"
+);
+includes(
+  capsuleController,
+  "y: windowFrame.minY - half,",
+  "macOS bottom aurora is centered on the exact Codex seam"
+);
+assert(
+  !swift.includes("CodexDockAuroraSeam"),
+  "macOS dock surface must not offset the aurora into its content"
+);
+includes(css, '.codex-dock-metric small {\n  display: none;', "Windows side dock hides metric labels");
+includes(preload, "onCodexDockTransition", "Windows Codex dock transition bridge");
+includes(
+  capsuleController,
+  "NSWorkspace.didLaunchApplicationNotification",
+  "macOS Codex launch follower"
+);
+includes(
+  settingsStore,
+  "var resolvedFollowCodexLaunch: Bool",
+  "shared Codex launch follower setting"
+);
+includes(
+  macApp,
+  "store.settings.resolvedFollowCodexLaunch",
+  "macOS Codex launch follower startup"
+);
+includes(
+  main,
+  'ipcMain.handle("pulse:set-follow-codex-launch"',
+  "Windows Codex launch follower setting"
+);
+includes(
+  renderer,
+  "window.pulse.setFollowCodexLaunch",
+  "Windows Codex launch follower control"
+);
 
 // Rich pet mini mode: generated opaque sprites stay readable on every desktop;
 // the programmatic monitor remains stable while the pet changes actions.
@@ -471,6 +714,41 @@ includes(macApp, "CommandGroup(replacing: .appTermination)", "macOS standard qui
 includes(macApp, "CodexPulseLifecycle.quit(store: store)", "macOS centralized graceful termination");
 includes(macApp, "runningApplications(withBundleIdentifier: AppConstants.bundleID)", "macOS single-instance guard");
 includes(macApp, "guard !isSecondaryInstance else { return }", "macOS duplicate instance does not start services");
+includes(menuBarPanel, '"随 Codex 启动"', "macOS menu panel exposes Codex launch follower");
+includes(
+  menuBarPanel,
+  "FloatingCapsuleController.shared.setFollowCodexLaunch(",
+  "macOS menu panel applies Codex launch follower immediately"
+);
+includes(
+  menuBarPanel,
+  ".frame(width: 332, height: menuPanelHeight)",
+  "macOS menu panel keeps a stable reset-card shell"
+);
+includes(
+  menuBarPanel,
+  'toolbarTextLabel("刷新", systemImage: "arrow.clockwise")',
+  "macOS menu panel keeps refresh on one compact toolbar row"
+);
+includes(
+  menuBarPanel,
+  ".frame(width: 52, height: 30)",
+  "macOS menu toolbar text actions reserve a non-wrapping hit target"
+);
+includes(
+  menuBarPanel,
+  ".frame(width: 30, height: 30)",
+  "macOS menu toolbar icon actions share one compact hit target"
+);
+includes(
+  menuBarPanel,
+  ".menuIndicator(.hidden)",
+  "macOS menu toolbar avoids a second overflow chevron"
+);
+assert(
+  !menuBarPanel.includes("withAnimation(.spring(response: 0.3, dampingFraction: 0.85))"),
+  "macOS reset-card collapse must not animate the MenuBarExtra window height"
+);
 includes(snapshotStore, "SecTaskCopyValueForEntitlement", "macOS App Group entitlement verification");
 includes(snapshotStore, "static let appGroupURL: URL?", "macOS App Group lookup is cached");
 includes(css, '--pet-display-left: 126px;', "Windows dino terminal x");

@@ -18,6 +18,14 @@ const path = require("path");
 const readline = require("readline");
 const crypto = require("crypto");
 const { isDeepStrictEqual } = require("util");
+const {
+  attachedDockShape,
+  detachedWindowBounds,
+  mediaSourceIdForWindowHandle,
+  normalizeTrackedWindowBounds,
+  visibleWindowBounds,
+  rectangleDistance
+} = require("./codex-dock-geometry");
 const APP_VERSION = require("../package.json").version;
 const processStartedAt = process.hrtime.bigint();
 
@@ -34,6 +42,11 @@ const INFORMATION_MAX_WIDTH = 471;
 const EXPANDED_SIZE = { width: 390, height: 810 };
 // 普通宠物为 216×130；黑洞使用 216×184，为竖向吸积盘留出透明空间。
 const MINI_SIZE = { width: 240, height: 154 };
+const CODEX_DOCK_HORIZONTAL_THICKNESS = 44;
+const CODEX_DOCK_VERTICAL_THICKNESS = 54;
+const CODEX_DOCK_OVERLAP = 16;
+const CODEX_DOCK_PROXIMITY = 30;
+const CODEX_DOCK_PREVIEW_RELEASE_DISTANCE = 42;
 const USE_STABLE_DESKTOP_SURFACE = process.platform === "win32";
 const SETTINGS_FILE = () => path.join(app.getPath("userData"), "settings.json");
 const WEATHER_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -109,6 +122,25 @@ let weatherRequestGeneration = 0;
 const weatherCache = new Map();
 const geocodingCache = new Map();
 let dragState;
+let codexWindowWatcher;
+let codexWindowBounds = null;
+let codexWindowMediaSourceId = null;
+let codexWindowWasPresent = false;
+let codexDockPreviewRef;
+let codexDockPreviewEdge = null;
+let codexDockCandidate = null;
+let codexDockCandidateEdge = null;
+let codexDockAttached = false;
+let codexDockEdge = "bottom";
+let codexDockRestorePending = false;
+let codexDockPreviousLayout = null;
+let codexDockLastZOrderAt = 0;
+let codexDockTransition = "idle";
+let codexDockTransitionTimer;
+let codexDockFollowTarget = null;
+let codexDockFollowTimer;
+let codexDockFollowLastAt = 0;
+let codexDockPreviewSuppressUntil = 0;
 let petRoamGeneration = 0;
 let petRoamTimer;
 let petRoamResolve;
@@ -135,6 +167,7 @@ let state = {
     message: null,
     updatedAt: null
   },
+  followCodexLaunch: false,
   appUpdate: {
     currentVersion: APP_VERSION,
     status: "idle",
@@ -2607,6 +2640,11 @@ async function connect(customPath) {
 
 function resizeWindow(mode) {
   if (!windowRef || windowRef.isDestroyed()) return null;
+  if (codexDockAttached
+      || codexDockTransition !== "idle"
+      || currentWindowLayoutMode === "codex-dock") {
+    return windowRef.getBounds();
+  }
   const adaptiveRequest = mode && typeof mode === "object";
   const resolvedMode = adaptiveRequest ? mode.mode : mode;
   const informationLayout = adaptiveRequest && resolvedMode === "collapsed"
@@ -2952,6 +2990,520 @@ function runPetRoam(plan) {
   });
 }
 
+function startCodexWindowWatcher() {
+  if (process.platform !== "win32"
+      || codexWindowWatcher
+      || !windowRef
+      || windowRef.isDestroyed()) return;
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue';",
+    "$packageRoots = @(Get-AppxPackage | Where-Object { $_.Name -match '(?i)(openai|codex|chatgpt)' } | ForEach-Object { $_.InstallLocation } | Where-Object { $_ });",
+    "$localRoots = @((Join-Path $env:LOCALAPPDATA 'Programs\\Codex'), (Join-Path $env:LOCALAPPDATA 'Programs\\ChatGPT'), (Join-Path $env:LOCALAPPDATA 'OpenAI')) | Where-Object { Test-Path $_ };",
+    "$knownRoots = @($packageRoots + $localRoots) | Select-Object -Unique;",
+    "Add-Type -TypeDefinition @'",
+    "using System;",
+    "using System.Runtime.InteropServices;",
+    "public static class PulseWindowRect {",
+    "  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }",
+    "  [DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);",
+    "  [DllImport(\"user32.dll\")] public static extern bool IsIconic(IntPtr hWnd);",
+    "  [DllImport(\"user32.dll\")] public static extern bool IsWindow(IntPtr hWnd);",
+    "  [DllImport(\"dwmapi.dll\")] private static extern int DwmGetWindowAttribute(IntPtr hWnd, int attribute, out RECT rect, int size);",
+    "  public static bool TryGetVisibleRect(IntPtr hWnd, out RECT rect, out bool physical) {",
+    "    if (DwmGetWindowAttribute(hWnd, 9, out rect, Marshal.SizeOf(typeof(RECT))) == 0) { physical = true; return true; }",
+    "    physical = false;",
+    "    return GetWindowRect(hWnd, out rect);",
+    "  }",
+    "}",
+    "'@;",
+    "$h = [IntPtr]::Zero;",
+    "$r = New-Object PulseWindowRect+RECT;",
+    "while ($true) {",
+    "  if ($h -eq [IntPtr]::Zero -or -not [PulseWindowRect]::IsWindow($h)) {",
+    "    $p = Get-Process -ErrorAction SilentlyContinue | Where-Object {",
+    "      if ($_.MainWindowHandle -eq 0 -or $_.ProcessName -eq 'CodexPulse') { return $false }",
+    "      $processName = [string]$_.ProcessName;",
+    "      $windowTitle = [string]$_.MainWindowTitle;",
+    "      $processPath = try { [string]$_.Path } catch { '' };",
+    "      $knownProcess = $processName -match '(?i)(^codex$|^codex[._-]|openai.*codex|chatgpt.*codex)';",
+    "      $knownInstall = $false;",
+    "      foreach ($root in $knownRoots) { if ($processPath -and $processPath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $knownInstall = $true; break } }",
+    "      $knownProcess -or ($knownInstall -and $windowTitle -match '(?i)(codex|chatgpt)')",
+    "    } | Sort-Object @{ Expression = { if ($_.ProcessName -eq 'Codex') { 0 } else { 1 } } } | Select-Object -First 1;",
+    "    $h = if ($null -eq $p) { [IntPtr]::Zero } else { $p.MainWindowHandle };",
+    "  }",
+    "  if ($h -eq [IntPtr]::Zero) { Write-Output 'null' } else {",
+    "    $physical = $false;",
+    "    if (-not [PulseWindowRect]::IsIconic($h) -and [PulseWindowRect]::TryGetVisibleRect($h, [ref]$r, [ref]$physical)) {",
+    "      @{ handle=$h.ToInt64().ToString(); left=$r.Left; top=$r.Top; right=$r.Right; bottom=$r.Bottom; physical=$physical } | ConvertTo-Json -Compress",
+    "    } else { Write-Output 'null' }",
+    "  }",
+    "  Start-Sleep -Milliseconds 8",
+    "}"
+  ].join("\n");
+  codexWindowWatcher = spawn(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script],
+    {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"]
+    }
+  );
+  const lines = readline.createInterface({ input: codexWindowWatcher.stdout });
+  lines.on("line", (line) => {
+    try {
+      const trackedWindow = JSON.parse(line);
+      codexWindowBounds = normalizeTrackedWindowBounds(trackedWindow, screen);
+      codexWindowMediaSourceId = codexWindowBounds
+        ? mediaSourceIdForWindowHandle(trackedWindow?.handle)
+        : null;
+    } catch {
+      codexWindowBounds = null;
+      codexWindowMediaSourceId = null;
+    }
+    const codexWindowIsPresent = Boolean(codexWindowBounds);
+    if (codexWindowIsPresent
+        && !codexWindowWasPresent
+        && state.followCodexLaunch === true) {
+      showStartupCapsule();
+    }
+    codexWindowWasPresent = codexWindowIsPresent;
+    syncAttachedCodexDock();
+  });
+  codexWindowWatcher.once("exit", () => {
+    lines.close();
+    codexWindowWatcher = null;
+    codexWindowBounds = null;
+    codexWindowMediaSourceId = null;
+  });
+}
+
+function stopCodexWindowWatcher() {
+  if (!codexWindowWatcher) return;
+  codexWindowWatcher.kill();
+  codexWindowWatcher = null;
+  codexWindowBounds = null;
+  codexWindowMediaSourceId = null;
+}
+
+function codexDockFrameForBounds(bounds = codexWindowBounds, edge = codexDockEdge) {
+  if (!bounds || !screen) return null;
+  const display = screen.getDisplayMatching(bounds);
+  const full = display.bounds;
+  const work = display.workArea;
+  const fillsDisplay = bounds.x <= full.x + 3
+    && bounds.y <= full.y + 3
+    && bounds.x + bounds.width >= full.x + full.width - 3
+    && bounds.y + bounds.height >= full.y + full.height - 3;
+  if (fillsDisplay) return null;
+  let frame;
+  if (edge === "top") {
+    frame = {
+      x: bounds.x,
+      y: bounds.y - CODEX_DOCK_HORIZONTAL_THICKNESS,
+      width: bounds.width,
+      height: CODEX_DOCK_HORIZONTAL_THICKNESS + CODEX_DOCK_OVERLAP
+    };
+  } else if (edge === "left") {
+    frame = {
+      x: bounds.x - CODEX_DOCK_VERTICAL_THICKNESS,
+      y: bounds.y,
+      width: CODEX_DOCK_VERTICAL_THICKNESS + CODEX_DOCK_OVERLAP,
+      height: bounds.height
+    };
+  } else if (edge === "right") {
+    frame = {
+      x: bounds.x + bounds.width - CODEX_DOCK_OVERLAP,
+      y: bounds.y,
+      width: CODEX_DOCK_VERTICAL_THICKNESS + CODEX_DOCK_OVERLAP,
+      height: bounds.height
+    };
+  } else {
+    frame = {
+      x: bounds.x,
+      y: bounds.y + bounds.height - CODEX_DOCK_OVERLAP,
+      width: bounds.width,
+      height: CODEX_DOCK_HORIZONTAL_THICKNESS + CODEX_DOCK_OVERLAP
+    };
+  }
+  const insideWorkArea = frame.x >= work.x - 1
+    && frame.y >= work.y - 1
+    && frame.x + frame.width <= work.x + work.width + 1
+    && frame.y + frame.height <= work.y + work.height + 1;
+  return insideWorkArea ? frame : null;
+}
+
+function codexDockTargetsForBounds(bounds = codexWindowBounds) {
+  return ["top", "bottom", "left", "right"].flatMap((edge) => {
+    const frame = codexDockFrameForBounds(bounds, edge);
+    return frame ? [{ edge, frame }] : [];
+  });
+}
+
+function showCodexDockPreview(frame, edge) {
+  codexDockCandidate = frame;
+  codexDockCandidateEdge = edge;
+  if (!codexDockPreviewRef || codexDockPreviewRef.isDestroyed()) {
+    codexDockPreviewRef = new BrowserWindow({
+      ...frame,
+      frame: false,
+      transparent: true,
+      resizable: false,
+      focusable: false,
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      show: false,
+      hasShadow: false,
+      backgroundColor: "#00000000",
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true
+      }
+    });
+    codexDockPreviewRef.setIgnoreMouseEvents(true);
+    codexDockPreviewEdge = edge;
+    codexDockPreviewRef.loadFile(
+      path.join(__dirname, "renderer", "dock-preview.html"),
+      { query: { edge } }
+    );
+    codexDockPreviewRef.once("ready-to-show", () => {
+      if (codexDockCandidate && codexDockPreviewRef && !codexDockPreviewRef.isDestroyed()) {
+        codexDockPreviewRef.showInactive();
+      }
+    });
+  } else {
+    if (!isDeepStrictEqual(codexDockPreviewRef.getBounds(), frame)) {
+      codexDockPreviewRef.setBounds(frame, false);
+    }
+    if (codexDockPreviewEdge !== edge) {
+      codexDockPreviewEdge = edge;
+      codexDockPreviewRef.loadFile(
+        path.join(__dirname, "renderer", "dock-preview.html"),
+        { query: { edge } }
+      );
+    }
+    if (!codexDockPreviewRef.isVisible()) codexDockPreviewRef.showInactive();
+  }
+}
+
+function hideCodexDockPreview() {
+  codexDockCandidate = null;
+  codexDockCandidateEdge = null;
+  if (codexDockPreviewRef && !codexDockPreviewRef.isDestroyed()) {
+    codexDockPreviewRef.hide();
+  }
+}
+
+function stopCodexDockFollow() {
+  clearTimeout(codexDockFollowTimer);
+  codexDockFollowTimer = null;
+  codexDockFollowTarget = null;
+  codexDockFollowLastAt = 0;
+}
+
+function applyAttachedCodexDockShape(width, height, edge = codexDockEdge) {
+  const shape = attachedDockShape(width, height, edge, CODEX_DOCK_OVERLAP);
+  const signature = JSON.stringify([shape]);
+  windowShapeBounds = shape;
+  if (windowShapeSignature === signature) return;
+  windowShapeSignature = signature;
+  // The native frame still overlaps Codex so both windows share one exact
+  // seam, but the draw/hit region starts outside the host. This prevents the
+  // transparent shoulder from covering Codex controls on Windows.
+  windowRef.setShape([shape]);
+}
+
+function nextCodexDockCoordinate(current, target, alpha) {
+  const delta = target - current;
+  if (Math.abs(delta) <= 1) return target;
+  const interpolated = Math.round(current + delta * alpha);
+  return interpolated === current
+    ? current + Math.sign(delta)
+    : interpolated;
+}
+
+function followCodexDockFrame(target, immediate = false) {
+  if (!windowRef || windowRef.isDestroyed() || !target) return;
+  codexDockFollowTarget = {
+    x: Math.round(target.x),
+    y: Math.round(target.y),
+    width: Math.round(target.width),
+    height: Math.round(target.height)
+  };
+  if (immediate) {
+    clearTimeout(codexDockFollowTimer);
+    codexDockFollowTimer = null;
+    codexDockFollowLastAt = 0;
+    if (!isDeepStrictEqual(windowRef.getBounds(), codexDockFollowTarget)) {
+      windowRef.setBounds(codexDockFollowTarget, false);
+    }
+    return;
+  }
+  if (codexDockFollowTimer) return;
+  const step = () => {
+    codexDockFollowTimer = null;
+    if (!codexDockAttached
+        || !codexDockFollowTarget
+        || !windowRef
+        || windowRef.isDestroyed()) {
+      stopCodexDockFollow();
+      return;
+    }
+    const now = performance.now();
+    const elapsed = codexDockFollowLastAt > 0
+      ? Math.min(34, Math.max(4, now - codexDockFollowLastAt))
+      : 8;
+    codexDockFollowLastAt = now;
+    // A time-based spring-like low-pass removes the 16ms PowerShell
+    // staircase while staying close enough to the native Codex window.
+    const alpha = Math.min(0.68, Math.max(0.24, 1 - Math.exp(-elapsed / 22)));
+    const current = windowRef.getBounds();
+    const next = {
+      x: nextCodexDockCoordinate(current.x, codexDockFollowTarget.x, alpha),
+      y: nextCodexDockCoordinate(current.y, codexDockFollowTarget.y, alpha),
+      width: nextCodexDockCoordinate(current.width, codexDockFollowTarget.width, alpha),
+      height: nextCodexDockCoordinate(current.height, codexDockFollowTarget.height, alpha)
+    };
+    if (!isDeepStrictEqual(current, next)) {
+      windowRef.setBounds(next, false);
+      if (next.width !== current.width || next.height !== current.height) {
+        applyAttachedCodexDockShape(next.width, next.height, codexDockEdge);
+      }
+    }
+    if (isDeepStrictEqual(next, codexDockFollowTarget)) {
+      codexDockFollowTarget = null;
+      codexDockFollowLastAt = 0;
+      return;
+    }
+    codexDockFollowTimer = setTimeout(step, 8);
+  };
+  codexDockFollowTimer = setTimeout(step, 0);
+}
+
+function keepCodexDockVisible(force = false) {
+  if (!codexDockAttached
+      || !codexWindowMediaSourceId
+      || !windowRef
+      || windowRef.isDestroyed()
+      || typeof windowRef.moveAbove !== "function") return false;
+  const now = Date.now();
+  if (!force && now - codexDockLastZOrderAt < 250) return true;
+  try {
+    // `moveAbove` keeps this normal (non-topmost) window immediately above
+    // Codex in the same z-order group. The previous native SetWindowPos loop
+    // put the dock behind Codex, where another window could fully occlude it.
+    windowRef.moveAbove(codexWindowMediaSourceId);
+    codexDockLastZOrderAt = now;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function updateCodexDockCandidate() {
+  if (codexDockAttached
+      || codexDockTransition !== "idle"
+      || Date.now() < codexDockPreviewSuppressUntil
+      || !windowRef
+      || windowRef.isDestroyed()) {
+    hideCodexDockPreview();
+    return;
+  }
+  const current = visibleWindowBounds(
+    windowRef.getBounds(),
+    windowShapeBounds,
+    USE_STABLE_DESKTOP_SURFACE
+  );
+  if (!current) {
+    hideCodexDockPreview();
+    return;
+  }
+  const target = codexDockTargetsForBounds().sort(
+    (left, right) => rectangleDistance(current, left.frame)
+      - rectangleDistance(current, right.frame)
+  )[0];
+  const distance = target ? rectangleDistance(current, target.frame) : Infinity;
+  const releaseDistance = codexDockCandidate
+      && codexDockCandidateEdge === target?.edge
+    ? CODEX_DOCK_PREVIEW_RELEASE_DISTANCE
+    : CODEX_DOCK_PROXIMITY;
+  if (!target || distance > releaseDistance) {
+    hideCodexDockPreview();
+    return;
+  }
+  showCodexDockPreview(target.frame, target.edge);
+}
+
+function syncAttachedCodexDock(forceNotify = false) {
+  if ((!codexDockAttached && !codexDockRestorePending)
+      || !windowRef
+      || windowRef.isDestroyed()) return;
+  const target = codexDockFrameForBounds(codexWindowBounds, codexDockEdge);
+  if (!target) {
+    stopCodexDockFollow();
+    if (currentWindowLayoutMode === "codex-dock") {
+      detachCodexDock({ restoreSavedPosition: true });
+    }
+    return;
+  }
+  const restoringAttachment = codexDockRestorePending;
+  if (codexDockRestorePending) {
+    codexDockRestorePending = false;
+    codexDockAttached = true;
+    windowRef.setAlwaysOnTop(false);
+  }
+  followCodexDockFrame(
+    target,
+    restoringAttachment || currentWindowLayoutMode !== "codex-dock" || forceNotify
+  );
+  const currentBounds = windowRef.getContentBounds();
+  applyAttachedCodexDockShape(currentBounds.width, currentBounds.height, codexDockEdge);
+  if (currentWindowLayoutMode !== "codex-dock" || forceNotify) {
+    currentWindowLayoutMode = "codex-dock";
+    windowRef.webContents.send("pulse:codex-dock-transition", {
+      phase: "attached",
+      width: target.width,
+      height: target.height,
+      edge: codexDockEdge,
+      restored: true
+    });
+  }
+  if (!windowRef.isVisible()) windowRef.showInactive();
+  keepCodexDockVisible(forceNotify);
+}
+
+function attachCodexDock(frame = codexDockCandidate) {
+  if (!frame
+      || codexDockAttached
+      || codexDockTransition !== "idle"
+      || !windowRef
+      || windowRef.isDestroyed()) return false;
+  const previous = windowRef.getBounds();
+  codexDockPreviousLayout = {
+    mode: currentWindowLayoutMode,
+    bounds: previous,
+    shape: windowShapeBounds ? { ...windowShapeBounds } : null
+  };
+  codexDockTransition = "attaching";
+  codexDockRestorePending = false;
+  codexDockEdge = codexDockCandidateEdge || "bottom";
+  writeSettings({
+    codexDockAttached: true,
+    codexDockEdge,
+    codexDockPreviousLayout
+  });
+  hideCodexDockPreview();
+  cancelPetRoamAnimation();
+  windowRef.webContents.send("pulse:codex-dock-transition", {
+    phase: "attaching",
+    width: frame.width,
+    height: frame.height,
+    edge: codexDockEdge
+  });
+  clearTimeout(codexDockTransitionTimer);
+  codexDockTransitionTimer = setTimeout(() => {
+    codexDockTransitionTimer = null;
+    if (codexDockTransition !== "attaching"
+        || !windowRef
+        || windowRef.isDestroyed()) return;
+    codexDockAttached = true;
+    codexDockTransition = "idle";
+    currentWindowLayoutMode = "codex-dock";
+    windowRef.setAlwaysOnTop(false);
+    followCodexDockFrame(frame, true);
+    applyAttachedCodexDockShape(frame.width, frame.height, codexDockEdge);
+    if (!windowRef.isVisible()) windowRef.showInactive();
+    keepCodexDockVisible(true);
+    windowRef.webContents.send("pulse:codex-dock-transition", {
+      phase: "attached",
+      width: frame.width,
+      height: frame.height,
+      edge: codexDockEdge
+    });
+  }, 220);
+  return true;
+}
+
+function detachCodexDock({ pointer = null, restoreSavedPosition = false } = {}) {
+  if (!codexDockAttached
+      || codexDockTransition !== "idle"
+      || !windowRef
+      || windowRef.isDestroyed()) return false;
+  const settings = readSettings();
+  const previous = codexDockPreviousLayout || settings.codexDockPreviousLayout;
+  const fallback = { x: 40, y: 40, width: COLLAPSED_SIZE.width, height: COLLAPSED_SIZE.height };
+  const saved = previous?.bounds && Number(previous.bounds.width) > 80
+    ? previous.bounds
+    : fallback;
+  const savedShape = previous?.shape
+      && Number(previous.shape.width) > 0
+      && Number(previous.shape.height) > 0
+    ? previous.shape
+    : {
+        x: Math.max(0, (Number(saved.width) - COLLAPSED_SIZE.width) / 2),
+        y: 0,
+        width: Math.min(Number(saved.width), COLLAPSED_SIZE.width),
+        height: Math.min(Number(saved.height), COLLAPSED_SIZE.height)
+      };
+  const detached = restoreSavedPosition || !pointer
+    ? {
+        x: Math.round(saved.x),
+        y: Math.round(saved.y),
+        width: Math.round(saved.width),
+        height: Math.round(saved.height)
+      }
+    : detachedWindowBounds(pointer, saved, savedShape);
+  const area = screen.getDisplayNearestPoint(
+    pointer || { x: detached.x, y: detached.y }
+  ).workArea;
+  const clamped = clampWindowPositionToVisibleShape(
+    detached.x,
+    detached.y,
+    area,
+    detached,
+    savedShape
+  );
+  const target = {
+    ...detached,
+    x: Math.round(clamped.x),
+    y: Math.round(clamped.y)
+  };
+  codexDockTransition = "detaching";
+  codexDockAttached = false;
+  codexDockRestorePending = false;
+  codexDockLastZOrderAt = 0;
+  codexDockPreviewSuppressUntil = Date.now() + 450;
+  stopCodexDockFollow();
+  hideCodexDockPreview();
+  windowRef.setAlwaysOnTop(true);
+  writeSettings({ codexDockAttached: false });
+  windowRef.webContents.send("pulse:codex-dock-transition", {
+    phase: "detaching",
+    mode: previous?.mode || "collapsed",
+    edge: codexDockEdge
+  });
+  currentWindowLayoutMode = previous?.mode || "collapsed";
+  windowRef.setBounds(target, false);
+  windowShapeBounds = { x: 0, y: 0, width: target.width, height: target.height };
+  windowShapeSignature = JSON.stringify([windowShapeBounds]);
+  windowRef.setShape([windowShapeBounds]);
+  if (!windowRef.isVisible()) windowRef.showInactive();
+  clearTimeout(codexDockTransitionTimer);
+  codexDockTransitionTimer = setTimeout(() => {
+    codexDockTransitionTimer = null;
+    if (codexDockTransition !== "detaching"
+        || !windowRef
+        || windowRef.isDestroyed()) return;
+    codexDockTransition = "idle";
+    windowRef.webContents.send("pulse:codex-dock-transition", {
+      phase: "detached",
+      mode: currentWindowLayoutMode
+    });
+  }, 24);
+  return true;
+}
+
 function createWindow() {
   windowRef = new BrowserWindow({
     ...(USE_STABLE_DESKTOP_SURFACE
@@ -2962,6 +3514,8 @@ function createWindow() {
     resizable: false,
     maximizable: false,
     fullscreenable: false,
+    // Start as a normal floating Pulse surface even when a saved attachment
+    // is pending. The level is lowered only after a live Codex target exists.
     alwaysOnTop: true,
     skipTaskbar: false,
     show: false,
@@ -2982,6 +3536,7 @@ function createWindow() {
   // ready-to-show only as a fallback. Background services start afterwards.
   windowRef.webContents.once("dom-ready", () => {
     showStartupCapsule();
+    syncAttachedCodexDock(true);
     scheduleBackgroundStartup();
   });
   windowRef.once("ready-to-show", () => {
@@ -3114,6 +3669,13 @@ ipcMain.handle("pulse:search-locations", async (_event, query) => {
 ipcMain.handle("pulse:set-information-enabled", (_event, enabled) => {
   return setInformationBarEnabled(enabled);
 });
+ipcMain.handle("pulse:set-follow-codex-launch", (_event, enabled) => {
+  const followCodexLaunch = enabled === true;
+  writeSettings({ followCodexLaunch });
+  publish({ followCodexLaunch });
+  if (followCodexLaunch && codexWindowBounds) showStartupCapsule();
+  return state;
+});
 ipcMain.handle("pulse:set-information-location", (_event, location) => {
   try {
     return setInformationBarLocation(location);
@@ -3153,12 +3715,30 @@ ipcMain.handle("pulse:clear-codex-path", async () => {
   return state;
 });
 ipcMain.handle("pulse:resize", (_event, mode) => resizeWindow(mode));
+ipcMain.handle("pulse:codex-dock-detach", (event, pointer) => {
+  if (!windowRef || windowRef.isDestroyed() || event.sender !== windowRef.webContents) {
+    return false;
+  }
+  return detachCodexDock({
+    pointer: {
+      x: Number(pointer?.x) || windowRef.getBounds().x,
+      y: Number(pointer?.y) || windowRef.getBounds().y
+    }
+  });
+});
 ipcMain.handle("pulse:set-window-shape", (_event, rects) => {
   if (!USE_STABLE_DESKTOP_SURFACE
       || !windowRef
       || windowRef.isDestroyed()
       || typeof windowRef.setShape !== "function") return false;
   const bounds = windowRef.getContentBounds();
+  // The renderer can finish a queued floating-capsule shape sync after the
+  // attachment transition. Re-apply the edge-aware dock region so a stale
+  // request cannot restore either the old capsule or the covered overlap.
+  if (codexDockAttached || currentWindowLayoutMode === "codex-dock") {
+    applyAttachedCodexDockShape(bounds.width, bounds.height, codexDockEdge);
+    return true;
+  }
   const normalized = (Array.isArray(rects) ? rects : []).flatMap((rect) => {
     const x = Math.max(0, Math.min(bounds.width, Math.round(Number(rect?.x) || 0)));
     const y = Math.max(0, Math.min(bounds.height, Math.round(Number(rect?.y) || 0)));
@@ -3273,6 +3853,13 @@ ipcMain.on("pulse:pet-roam-cancel", (event) => {
 });
 ipcMain.on("pulse:drag-begin", (event, point) => {
   if (!windowRef || windowRef.isDestroyed() || event.sender !== windowRef.webContents) return;
+  if (codexDockAttached || codexDockTransition !== "idle") return;
+  hideCodexDockPreview();
+  if (codexDockRestorePending) {
+    codexDockRestorePending = false;
+    writeSettings({ codexDockAttached: false });
+    windowRef.setAlwaysOnTop(true);
+  }
   cancelPetRoamAnimation();
   const bounds = windowRef.getBounds();
   dragState = {
@@ -3315,6 +3902,7 @@ ipcMain.on("pulse:drag-move", (event, point) => {
       y: nextY
     });
   }
+  updateCodexDockCandidate();
 });
 function classifyManualPetDrop(point) {
   if (!windowRef || windowRef.isDestroyed()) return null;
@@ -3358,7 +3946,16 @@ ipcMain.on("pulse:drag-end", (event, point) => {
   if (!didMove
       || !windowRef
       || windowRef.isDestroyed()
-      || event.sender !== windowRef.webContents) return;
+      || event.sender !== windowRef.webContents) {
+    hideCodexDockPreview();
+    return;
+  }
+  // Re-evaluate with the final pointer-delivered window position. A pointerup
+  // can arrive between animation frames, so relying only on the last preview
+  // calculation makes quick releases at the 30px edge miss attachment.
+  updateCodexDockCandidate();
+  if (codexDockCandidate && attachCodexDock()) return;
+  hideCodexDockPreview();
   const finalDrop = classifyManualPetDrop(point);
   const drop = finalDrop && encountered?.kind
     ? {
@@ -3373,6 +3970,14 @@ ipcMain.on("pulse:quit", () => { app.isQuitting = true; app.quit(); });
 
 app.whenReady().then(() => {
   app.setAppUserModelId("com.codexpulse.windows");
+  const startupSettings = readSettings();
+  state.followCodexLaunch = startupSettings.followCodexLaunch === true;
+  codexDockAttached = false;
+  codexDockRestorePending = startupSettings.codexDockAttached === true;
+  codexDockEdge = ["top", "bottom", "left", "right"].includes(startupSettings.codexDockEdge)
+    ? startupSettings.codexDockEdge
+    : "bottom";
+  codexDockPreviousLayout = startupSettings.codexDockPreviousLayout || null;
   session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
     void desktopCapturer.getSources({
       types: ["screen"],
@@ -3405,6 +4010,7 @@ app.whenReady().then(() => {
   powerMonitor.on("unlock-screen", () => triggerAutomaticUpdateCheck(true));
   initializeInformationBar();
   createWindow();
+  startCodexWindowWatcher();
 });
 
 app.on("browser-window-focus", () => triggerAutomaticUpdateCheck(false));
@@ -3412,6 +4018,12 @@ app.on("browser-window-focus", () => triggerAutomaticUpdateCheck(false));
 app.on("before-quit", () => {
   app.isQuitting = true;
   cancelPetRoamAnimation();
+  stopCodexDockFollow();
+  clearTimeout(codexDockTransitionTimer);
+  stopCodexWindowWatcher();
+  if (codexDockPreviewRef && !codexDockPreviewRef.isDestroyed()) {
+    codexDockPreviewRef.destroy();
+  }
   clearTimeout(refreshTimer);
   clearTimeout(localUsageDayTimer);
   clearTimeout(weatherRefreshTimer);
