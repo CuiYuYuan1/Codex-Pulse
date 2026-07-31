@@ -6,7 +6,7 @@ import AppKit
 @main
 struct CodexPulseApp: App {
     @State private var store = PulseStore()
-    @State private var modelRankings = ArtificialAnalysisLeaderboardStore()
+    @State private var modelRankings = ArtificialAnalysisLeaderboardStore.shared
     @State private var resetPrediction = CodexResetPredictionStore()
     @State private var appUpdates = AppUpdateService.shared
     private let isSecondaryInstance: Bool

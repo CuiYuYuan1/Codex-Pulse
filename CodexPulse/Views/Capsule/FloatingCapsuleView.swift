@@ -84,11 +84,57 @@ struct CodexDockExtensionShape: Shape {
 private enum CodexDockMetric: String, CaseIterable, Identifiable {
     case quota
     case tokens
-    case reset
-    case weather
-    case time
+    case cacheHit
+    case cost
+    case trend
 
     var id: String { rawValue }
+}
+
+private struct CodexDockTokenSparkline: View {
+    let buckets: [DailyTokenBucket]
+    let tint: Color
+    var lineWidth: CGFloat = 1.6
+    var fillOpacity: Double = 0.14
+
+    private var ceiling: Int64 {
+        max(1, buckets.map(\.tokens).max() ?? 0)
+    }
+
+    var body: some View {
+        Chart(buckets) { bucket in
+            AreaMark(
+                x: .value("日期", bucket.dateString),
+                y: .value("Token", bucket.tokens)
+            )
+            .foregroundStyle(
+                LinearGradient(
+                    colors: [tint.opacity(fillOpacity), tint.opacity(0.01)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+
+            LineMark(
+                x: .value("日期", bucket.dateString),
+                y: .value("Token", bucket.tokens)
+            )
+            .foregroundStyle(tint)
+            .lineStyle(
+                StrokeStyle(
+                    lineWidth: lineWidth,
+                    lineCap: .round,
+                    lineJoin: .round
+                )
+            )
+        }
+        .chartXScale(range: .plotDimension(padding: 1))
+        .chartYScale(domain: Int64(0)...ceiling)
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
+        .chartLegend(.hidden)
+        .accessibilityHidden(true)
+    }
 }
 
 /// 悬浮胶囊 — 玻璃拟态,置顶悬浮。
@@ -97,6 +143,7 @@ private enum CodexDockMetric: String, CaseIterable, Identifiable {
 /// 状态灯:绿=空闲 · 橙=思考/运行 · 红=等待授权 · 灰=未连接
 struct FloatingCapsuleView: View {
     @Environment(PulseStore.self) private var store
+    @Environment(ArtificialAnalysisLeaderboardStore.self) private var modelRankings
     @Environment(AppUpdateService.self) private var appUpdates
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.pulseVisualTheme) private var visualTheme
@@ -127,11 +174,14 @@ struct FloatingCapsuleView: View {
     @State private var codexDockContentVisible = false
     @State private var codexDockDetachmentProgress: CGFloat = 0
     @State private var codexDockDraggedMetric: CodexDockMetric?
+    @State private var codexDockFocusedMetric: CodexDockMetric?
+    @State private var codexDockResetCardIndex = 0
     @AppStorage("pulse.codexDock.attached") private var isCodexDockAttached = false
     @AppStorage("pulse.codexDock.width") private var codexDockWidth = 720.0
     @AppStorage("pulse.codexDock.height") private var codexDockHeight = 60.0
     @AppStorage("pulse.codexDock.edge") private var codexDockEdgeRaw =
         CodexDockEdge.bottom.rawValue
+    @AppStorage("pulse.codexDock.fullScreen") private var isCodexDockFullScreen = false
     @AppStorage("pulse.codexDock.order") private var codexDockOrderRaw =
         CodexDockMetric.allCases.map(\.rawValue).joined(separator: ",")
     @AppStorage("pulse.orb.page") private var orbPageRawValue = OrbPetPage.quota.rawValue
@@ -148,6 +198,12 @@ struct FloatingCapsuleView: View {
 
     private var codexDockEdge: CodexDockEdge {
         CodexDockEdge(rawValue: codexDockEdgeRaw) ?? .bottom
+    }
+
+    /// 全屏时状态脊位于 Codex 顶栏内部。它在交互语义上仍属于顶部吸附，
+    /// 但视觉上需要使用“上沿贴合、下沿圆角”的底部延伸轮廓。
+    private var codexDockVisualEdge: CodexDockEdge {
+        isCodexDockFullScreen ? .bottom : codexDockEdge
     }
 
     private var hasAvailableUpdate: Bool {
@@ -771,6 +827,10 @@ struct FloatingCapsuleView: View {
             guard let update = note.object as? CodexDockReorderUpdate else { return }
             reorderCodexDock(using: update)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .pulseCodexDockTap)) { note in
+            guard let update = note.object as? CodexDockTapUpdate else { return }
+            handleCodexDockTap(update)
+        }
         .onReceive(
             NotificationCenter.default.publisher(for: .pulseCodexDockDetachmentProgress)
         ) { note in
@@ -809,11 +869,13 @@ struct FloatingCapsuleView: View {
             } else {
                 codexDockContentVisible = false
                 codexDockDraggedMetric = nil
+                codexDockFocusedMetric = nil
                 codexDockDetachmentProgress = 0
                 synchronizeCatRoaming()
             }
         }
         .onAppear {
+            modelRankings.start()
             guard isCodexDockAttached else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
                 withAnimation(.easeOut(duration: reduceMotion ? 0.01 : 0.30)) {
@@ -862,8 +924,11 @@ struct FloatingCapsuleView: View {
         let stored = codexDockOrderRaw
             .split(separator: ",")
             .compactMap { CodexDockMetric(rawValue: String($0)) }
+            .filter { $0 != .trend }
             .filter { seen.insert($0).inserted }
-        return stored + CodexDockMetric.allCases.filter { seen.insert($0).inserted }
+        let movable = stored + CodexDockMetric.allCases
+            .filter { $0 != .trend && seen.insert($0).inserted }
+        return movable + [.trend]
     }
 
     private var codexAttachedDock: some View {
@@ -879,22 +944,18 @@ struct FloatingCapsuleView: View {
                     if codexDockEdge == .right {
                         Color.clear.frame(width: codexDockSeamOverlap)
                     }
-                    VStack(spacing: 0) {
-                        codexDockItems(at: date, vertical: true)
-                    }
+                    codexDockItems(at: date, vertical: true)
                     if codexDockEdge == .left {
                         Color.clear.frame(width: codexDockSeamOverlap)
                     }
                 }
             } else {
                 VStack(spacing: 0) {
-                    if codexDockEdge == .bottom {
+                    if codexDockEdge == .bottom || isCodexDockFullScreen {
                         Color.clear.frame(height: codexDockSeamOverlap)
                     }
-                    HStack(spacing: 0) {
-                        codexDockItems(at: date, vertical: false)
-                    }
-                    if codexDockEdge == .top {
+                    codexDockItems(at: date, vertical: false)
+                    if codexDockEdge == .top && !isCodexDockFullScreen {
                         Color.clear.frame(height: codexDockSeamOverlap)
                     }
                 }
@@ -927,7 +988,7 @@ struct FloatingCapsuleView: View {
                 )
                 .allowsHitTesting(false)
         }
-        .clipShape(CodexDockExtensionShape(edge: codexDockEdge))
+        .clipShape(CodexDockExtensionShape(edge: codexDockVisualEdge))
         .scaleEffect(
             x: codexDockEdge.isVertical
                 ? 1
@@ -943,6 +1004,40 @@ struct FloatingCapsuleView: View {
 
     @ViewBuilder
     private func codexDockItems(at date: Date, vertical: Bool) -> some View {
+        ZStack {
+            Group {
+                if vertical {
+                    VStack(spacing: 0) {
+                        codexDockNavigationItems(at: date, vertical: true)
+                    }
+                } else {
+                    HStack(spacing: 0) {
+                        codexDockNavigationItems(at: date, vertical: false)
+                    }
+                }
+            }
+            .opacity(codexDockFocusedMetric == nil ? 1 : 0)
+
+            if let focusedMetric = codexDockFocusedMetric {
+                Group {
+                    if vertical {
+                        codexDockVerticalFocusedContent(focusedMetric, at: date)
+                    } else {
+                        codexDockFocusedContent(focusedMetric, at: date)
+                    }
+                }
+                .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(
+            reduceMotion ? nil : .easeOut(duration: 0.14),
+            value: codexDockFocusedMetric
+        )
+    }
+
+    @ViewBuilder
+    private func codexDockNavigationItems(at date: Date, vertical: Bool) -> some View {
         let order = resolvedCodexDockOrder
         ForEach(Array(order.enumerated()), id: \.element.id) { index, metric in
             codexDockItem(metric, index: index, at: date, vertical: vertical)
@@ -999,18 +1094,20 @@ struct FloatingCapsuleView: View {
                 .fill(.ultraThinMaterial)
             LinearGradient(
                 colors: [
-                    Color.white.opacity(colorScheme == .dark ? 0.10 : 0.38),
-                    visualTheme.accent.opacity(0.07),
-                    Color.purple.opacity(0.05)
+                    Color.white.opacity(colorScheme == .dark ? 0.32 : 0.56),
+                    Color(red: 0.78, green: 0.91, blue: 1.0)
+                        .opacity(colorScheme == .dark ? 0.20 : 0.32),
+                    visualTheme.accent.opacity(0.05),
+                    Color.purple.opacity(0.035)
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
             Rectangle()
-                .fill(Color.white.opacity(colorScheme == .dark ? 0.05 : 0.16))
+                .fill(Color.white.opacity(colorScheme == .dark ? 0.11 : 0.20))
                 .blendMode(.plusLighter)
         }
-        .shadow(color: Color.black.opacity(0.12), radius: 9, y: 5)
+        .shadow(color: Color.black.opacity(0.08), radius: 9, y: 5)
     }
 
     @ViewBuilder
@@ -1022,26 +1119,72 @@ struct FloatingCapsuleView: View {
         let presentation = codexDockMetricPresentation(metric, at: date)
         Group {
             if vertical {
-                VStack(spacing: 4) {
-                    Image(systemName: presentation.symbol)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(presentation.tint)
-                        .symbolRenderingMode(.hierarchical)
-                    Text(presentation.value)
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.primary)
+                if metric == .trend {
+                    VStack(spacing: 4) {
+                        Image(systemName: presentation.symbol)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(presentation.tint)
+                        CodexDockTokenSparkline(
+                            buckets: codexDockTrendBuckets,
+                            tint: presentation.tint,
+                            lineWidth: 1.35,
+                            fillOpacity: 0.10
+                        )
+                        .frame(width: 34, height: 22)
+                        Text(presentation.value)
+                            .font(.system(size: 8.5, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                            .minimumScaleFactor(0.55)
+                    }
+                } else {
+                    VStack(spacing: 4) {
+                        Image(systemName: presentation.symbol)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(presentation.tint)
+                            .symbolRenderingMode(.hierarchical)
+                        Text(presentation.value)
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.primary)
+                    }
                 }
             } else {
-                HStack(spacing: 6) {
-                    Image(systemName: presentation.symbol)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(presentation.tint)
-                        .symbolRenderingMode(.hierarchical)
-                    Text(presentation.label)
-                        .foregroundStyle(.secondary)
-                    Text(presentation.value)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(.primary)
+                if metric == .trend {
+                    HStack(spacing: 7) {
+                        Image(systemName: presentation.symbol)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(presentation.tint)
+                        Text(presentation.label)
+                            .foregroundStyle(.secondary)
+                        CodexDockTokenSparkline(
+                            buckets: codexDockTrendBuckets,
+                            tint: presentation.tint
+                        )
+                        .frame(width: 66, height: 20)
+                    }
+                } else {
+                    HStack(spacing: 6) {
+                        Image(systemName: presentation.symbol)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(presentation.tint)
+                            .symbolRenderingMode(.hierarchical)
+                        Text(presentation.label)
+                            .foregroundStyle(.secondary)
+                        Text(presentation.value)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.primary)
+                            .monospacedDigit()
+                            .contentTransition(.numericText(countsDown: false))
+                            .animation(
+                                reduceMotion ? nil : .easeOut(duration: 0.20),
+                                value: presentation.value
+                            )
+                        if metric == .quota, store.snapshot.activeTaskCount > 0 {
+                            CodexDockTaskBadge(
+                                count: store.snapshot.activeTaskCount,
+                                expanded: false
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -1067,32 +1210,900 @@ struct FloatingCapsuleView: View {
                 orbQuotaColor(remaining)
             )
         case .tokens:
-            return ("cylinder.split.1x2.fill", "已用 Token", PulseFormatters.tokens(todayTokens), PulseTheme.blue)
-        case .reset:
             return (
-                "arrow.clockwise",
-                "重置时间",
-                codexDockResetText(at: date),
-                PulseTheme.orange
+                "cylinder.split.1x2.fill",
+                "今日 Token",
+                codexDockTokenText(todayTokens),
+                PulseTheme.blue
             )
-        case .weather:
-            let weather = weatherViewModel.snapshot
-            let value = weather.map {
-                "\($0.condition.compactDisplayName) \(String(format: "%.0f°C", $0.temperature))"
-            } ?? "—"
+        case .cacheHit:
             return (
-                weather?.condition.symbolName ?? "cloud.sun.fill",
-                "",
-                value,
-                weather?.isDay == false ? Color(hex: 0x9BBEFF) : Color(hex: 0x64C7FF)
+                "arrow.triangle.2.circlepath",
+                "缓存命中率",
+                codexDockCacheHitText,
+                PulseTheme.green
             )
-        case .time:
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "zh_CN")
-            formatter.timeZone = weatherLocation.flatMap { TimeZone(identifier: $0.timezone) } ?? .current
-            formatter.dateFormat = "HH:mm"
-            return ("clock", "当前时间", formatter.string(from: date), Color.purple)
+        case .cost:
+            return (
+                "dollarsign.circle.fill",
+                "成本",
+                codexDockCurrencyText(store.snapshot.usage.localTodayEstimatedCostUSD),
+                Color(hex: 0x12A675)
+            )
+        case .trend:
+            return (
+                "chart.xyaxis.line",
+                "近 7 日",
+                codexDockTokenText(codexDockTrendTotal),
+                Color(hex: 0x7C6CF2)
+            )
         }
+    }
+
+    @ViewBuilder
+    private func codexDockFocusedContent(
+        _ metric: CodexDockMetric,
+        at date: Date
+    ) -> some View {
+        Group {
+            switch metric {
+            case .quota:
+                codexDockQuotaFocus(at: date)
+            case .tokens:
+                codexDockTokenFocus
+            case .cacheHit:
+                codexDockCacheHitFocus
+            case .cost:
+                codexDockCostFocus
+            case .trend:
+                codexDockTrendFocus
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .clipped()
+        .opacity(
+            codexDockContentVisible
+                ? 1 - Double(codexDockDetachmentProgress) * 0.92
+                : 0
+        )
+        .offset(y: codexDockContentVisible ? 0 : 4)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("再次点击返回全部信息")
+    }
+
+    private func codexDockVerticalFocusedContent(
+        _ metric: CodexDockMetric,
+        at date: Date
+    ) -> some View {
+        let presentation = codexDockMetricPresentation(metric, at: date)
+        return VStack(spacing: 9) {
+            Image(systemName: presentation.symbol)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(presentation.tint)
+                .symbolRenderingMode(.hierarchical)
+
+            Text(presentation.value)
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .foregroundStyle(.primary)
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.62)
+
+            Rectangle()
+                .fill(Color.primary.opacity(0.11))
+                .frame(width: 24, height: 1)
+
+            codexDockVerticalFocusDetails(metric, at: date)
+
+            Image(systemName: "arrow.uturn.backward")
+                .font(.system(size: 8.5, weight: .semibold))
+                .foregroundStyle(.tertiary)
+                .padding(.top, 2)
+        }
+        .padding(.horizontal, 2)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .opacity(
+            codexDockContentVisible
+                ? 1 - Double(codexDockDetachmentProgress) * 0.92
+                : 0
+        )
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("再次点击返回全部信息")
+    }
+
+    @ViewBuilder
+    private func codexDockVerticalFocusDetails(
+        _ metric: CodexDockMetric,
+        at date: Date
+    ) -> some View {
+        switch metric {
+        case .quota:
+            let remaining = remainingPercent ?? 0
+            CodexDockProgressBar(
+                progress: remaining / 100,
+                tint: codexDockUsageProgressTint(remaining)
+            )
+            .frame(width: 28)
+            verticalDockDetailText(codexDockResetText(at: date))
+            if store.snapshot.activeTaskCount > 0 {
+                verticalDockDetailText("\(store.snapshot.activeTaskCount) 个任务")
+            }
+        case .tokens:
+            verticalDockDetailText("累计")
+            verticalDockDetailText(codexDockTokenText(store.snapshot.usage.totalTokens))
+        case .cacheHit:
+            verticalDockDetailText("缓存")
+            verticalDockDetailText(
+                codexDockTokenText(store.snapshot.usage.localTodayCachedInputTokens)
+            )
+            verticalDockDetailText("输入")
+            verticalDockDetailText(
+                codexDockTokenText(store.snapshot.usage.localTodayInputTokens)
+            )
+        case .cost:
+            verticalDockDetailText("API估算")
+            verticalDockDetailText(
+                codexDockCurrencyText(store.snapshot.usage.localTodayEstimatedCostUSD)
+            )
+            verticalDockDetailText("输出")
+            verticalDockDetailText(
+                codexDockCurrencyText(store.snapshot.usage.localTodayOutputCostUSD)
+            )
+        case .trend:
+            verticalDockDetailText("峰值")
+            verticalDockDetailText(codexDockTokenText(codexDockTrendPeak))
+            verticalDockDetailText("今日")
+            verticalDockDetailText(codexDockTokenText(todayTokens))
+        }
+    }
+
+    private func verticalDockDetailText(_ value: String) -> some View {
+        Text(value)
+            .font(.system(size: 8.5, weight: .semibold, design: .rounded))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.55)
+            .frame(maxWidth: 38)
+    }
+
+    private func codexDockQuotaFocus(at date: Date) -> some View {
+        let remaining = remainingPercent ?? 0
+        let resetText = codexDockResetText(at: date)
+        return HStack(spacing: 0) {
+            codexDockFocusCell(minWidth: 128) {
+                HStack(spacing: 6) {
+                    Image(systemName: "circle")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(orbQuotaColor(remaining))
+                    Text("可用额度")
+                        .foregroundStyle(.secondary)
+                    CodexDockRollingText(
+                        value: remainingPercent.map { PulseFormatters.percent($0) } ?? "—",
+                        size: 13,
+                        weight: .bold
+                    )
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 112) {
+                CodexDockProgressBar(
+                    progress: remaining / 100,
+                    tint: codexDockUsageProgressTint(remaining)
+                )
+                .frame(maxWidth: 150)
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 116) {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(PulseTheme.orange)
+                    Text("重置")
+                        .foregroundStyle(.secondary)
+                    Text(resetText)
+                        .fontWeight(.semibold)
+                        .monospacedDigit()
+                }
+            }
+
+            if store.snapshot.activeTaskCount > 0 {
+                codexDockFocusDivider
+                codexDockFocusCell(minWidth: 112) {
+                    CodexDockTaskBadge(
+                        count: store.snapshot.activeTaskCount,
+                        expanded: true
+                    )
+                }
+            }
+
+            if !codexDockSortedResetCards.isEmpty {
+                codexDockFocusDivider
+                codexDockFocusCell(minWidth: 236) {
+                    codexDockResetCardPager(compact: false)
+                }
+                .layoutPriority(2)
+            }
+        }
+        .font(.system(size: 11, weight: .medium, design: .rounded))
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .lineLimit(1)
+        .animation(
+            reduceMotion ? nil : .easeOut(duration: 0.22),
+            value: remaining
+        )
+    }
+
+    private var codexDockTokenFocus: some View {
+        let usage = store.snapshot.usage
+        let isLive = mode == .working || mode == .attention
+        let programmingIQ = modelRankings.programmingIndex(
+            model: store.snapshot.currentTask.model,
+            reasoningEffort: store.snapshot.currentTask.reasoningEffort
+        ).map { String(format: "%.1f", $0) } ?? "—"
+        let total = codexDockTokenText(usage.totalTokens)
+
+        return HStack(spacing: 0) {
+            codexDockFocusCell(minWidth: 172) {
+                codexDockTokenFocusLead(isLive: isLive)
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 150) {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .foregroundStyle(PulseTheme.green)
+                    Text("缓存命中率")
+                        .foregroundStyle(.tertiary)
+                    CodexDockRollingText(
+                        value: codexDockCacheHitText,
+                        size: 11,
+                        weight: .semibold
+                    )
+                }
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 128) {
+                HStack(spacing: 6) {
+                    Text("成本")
+                        .foregroundStyle(.tertiary)
+                    CodexDockRollingText(
+                        value: codexDockCurrencyText(usage.localTodayEstimatedCostUSD),
+                        size: 11,
+                        weight: .semibold
+                    )
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 118) {
+                HStack(spacing: 6) {
+                    Text("编程 IQ")
+                        .foregroundStyle(.tertiary)
+                    CodexDockRollingText(
+                        value: programmingIQ,
+                        size: 11,
+                        weight: .semibold
+                    )
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.primary)
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 120) {
+                HStack(spacing: 6) {
+                    Text("累计")
+                        .foregroundStyle(.tertiary)
+                    CodexDockRollingText(value: total, size: 11, weight: .semibold)
+                }
+            }
+        }
+        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .lineLimit(1)
+    }
+
+    private func codexDockTokenFocusLead(isLive: Bool) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "cylinder.split.1x2.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(PulseTheme.blue)
+            if isLive {
+                CodexDockActivityDot()
+                Text("思考中 · 今日 Token")
+                    .foregroundStyle(PulseTheme.blue)
+            } else {
+                Text("今日 Token")
+                    .foregroundStyle(.secondary)
+            }
+            CodexDockRollingText(
+                value: codexDockTokenText(todayTokens),
+                size: 13,
+                weight: .bold
+            )
+        }
+    }
+
+    private var codexDockCacheHitFocus: some View {
+        let usage = store.snapshot.usage
+        let hitRate = usage.localTodayCacheHitRate ?? 0
+        let cached = usage.localTodayCachedInputTokens
+        let input = usage.localTodayInputTokens
+        let uncached = max(0, (input ?? 0) - (cached ?? 0))
+
+        return HStack(spacing: 0) {
+            codexDockFocusCell(minWidth: 164) {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(PulseTheme.green)
+                    Text("缓存命中率")
+                        .foregroundStyle(.secondary)
+                    CodexDockRollingText(
+                        value: codexDockCacheHitText,
+                        size: 13,
+                        weight: .bold
+                    )
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 124) {
+                CodexDockProgressBar(
+                    progress: hitRate,
+                    tint: PulseTheme.green
+                )
+                .frame(maxWidth: 154)
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 138) {
+                codexDockDetailPair(
+                    label: "缓存输入",
+                    value: codexDockTokenText(cached)
+                )
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 138) {
+                codexDockDetailPair(
+                    label: "未缓存",
+                    value: codexDockTokenText(input == nil ? nil : uncached)
+                )
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 138) {
+                codexDockDetailPair(
+                    label: "总输入",
+                    value: codexDockTokenText(input)
+                )
+            }
+        }
+        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .lineLimit(1)
+    }
+
+    private var codexDockCostFocus: some View {
+        let usage = store.snapshot.usage
+        return HStack(spacing: 0) {
+            codexDockFocusCell(minWidth: 168) {
+                HStack(spacing: 6) {
+                    Image(systemName: "dollarsign.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color(hex: 0x12A675))
+                    Text("今日成本")
+                        .foregroundStyle(.secondary)
+                    CodexDockRollingText(
+                        value: codexDockCurrencyText(usage.localTodayEstimatedCostUSD),
+                        size: 13,
+                        weight: .bold
+                    )
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 150) {
+                codexDockDetailPair(
+                    label: "未缓存输入",
+                    value: codexDockCurrencyText(usage.localTodayUncachedInputCostUSD)
+                )
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 142) {
+                codexDockDetailPair(
+                    label: "缓存输入",
+                    value: codexDockCurrencyText(usage.localTodayCachedInputCostUSD)
+                )
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 122) {
+                codexDockDetailPair(
+                    label: "输出",
+                    value: codexDockCurrencyText(usage.localTodayOutputCostUSD)
+                )
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 150) {
+                Text("API 等价估算")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .lineLimit(1)
+    }
+
+    private func codexDockDetailPair(label: String, value: String) -> some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .foregroundStyle(.tertiary)
+            CodexDockRollingText(value: value, size: 11, weight: .semibold)
+        }
+    }
+
+    private var codexDockTrendFocus: some View {
+        HStack(spacing: 0) {
+            codexDockFocusCell(minWidth: 174) {
+                HStack(spacing: 6) {
+                    Image(systemName: "chart.xyaxis.line")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color(hex: 0x7C6CF2))
+                    Text("近 7 日 Token")
+                        .foregroundStyle(.secondary)
+                    CodexDockRollingText(
+                        value: codexDockTokenText(codexDockTrendTotal),
+                        size: 12,
+                        weight: .bold
+                    )
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 270) {
+                CodexDockTokenSparkline(
+                    buckets: codexDockTrendBuckets,
+                    tint: Color(hex: 0x7C6CF2),
+                    lineWidth: 1.8,
+                    fillOpacity: 0.18
+                )
+                .frame(maxWidth: 320)
+                .frame(height: 28)
+            }
+            .layoutPriority(2)
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 116) {
+                codexDockDetailPair(
+                    label: "今日",
+                    value: codexDockTokenText(todayTokens)
+                )
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 116) {
+                codexDockDetailPair(
+                    label: "峰值",
+                    value: codexDockTokenText(codexDockTrendPeak)
+                )
+            }
+        }
+        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .lineLimit(1)
+        .accessibilityLabel("近 7 日 Token 使用趋势")
+        .accessibilityValue(
+            "合计 \(codexDockTokenText(codexDockTrendTotal))，"
+                + "今日 \(codexDockTokenText(todayTokens))，"
+                + "峰值 \(codexDockTokenText(codexDockTrendPeak))"
+        )
+    }
+
+    private func codexDockResetFocus(at date: Date) -> some View {
+        let bucket = store.snapshot.rateLimits.primaryBucket
+        let remaining = bucket?.remainingPercent ?? 0
+        let countdown = PulseFormatters.countdown(
+            bucket?.resetsAt?.timeIntervalSince(date)
+        )
+        return HStack(spacing: 0) {
+            codexDockFocusCell(minWidth: 168) {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(PulseTheme.orange)
+                    Text("重置时间")
+                        .foregroundStyle(.secondary)
+                    CodexDockRollingText(
+                        value: codexDockResetDetailText(at: date),
+                        size: 12,
+                        weight: .bold
+                    )
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 130) {
+                HStack(spacing: 6) {
+                    Text("倒计时")
+                        .foregroundStyle(.tertiary)
+                    Text(countdown)
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .monospacedDigit()
+                }
+            }
+
+            if let name = bucket?.name {
+                codexDockFocusDivider
+                codexDockFocusCell(minWidth: 112) {
+                    Text(name)
+                        .foregroundStyle(.secondary)
+                        .fontWeight(.semibold)
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 164) {
+                HStack(spacing: 8) {
+                    CodexDockProgressBar(
+                        progress: remaining / 100,
+                        tint: codexDockUsageProgressTint(remaining)
+                    )
+                    .frame(maxWidth: 112)
+                    Text(remainingPercent.map { PulseFormatters.percent($0) } ?? "—")
+                        .fontWeight(.bold)
+                        .monospacedDigit()
+                }
+            }
+
+            if !codexDockSortedResetCards.isEmpty {
+                codexDockFocusDivider
+                codexDockFocusCell(minWidth: 110) {
+                    Text("重置卡 \(codexDockSortedResetCards.count) 张")
+                        .foregroundStyle(.secondary)
+                        .fontWeight(.semibold)
+                }
+            }
+        }
+        .font(.system(size: 11, weight: .medium, design: .rounded))
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .lineLimit(1)
+    }
+
+    private func codexDockWeatherFocus(at date: Date) -> some View {
+        let weather = weatherViewModel.snapshot
+        let tint = weather?.isDay == false ? Color(hex: 0x9BBEFF) : Color(hex: 0x64C7FF)
+        let updatedText = weather.map {
+            "\(PulseFormatters.relativeDate($0.observedAt, relativeTo: date))更新"
+        } ?? "等待更新"
+        return HStack(spacing: 0) {
+            codexDockFocusCell(minWidth: 126) {
+                HStack(spacing: 7) {
+                    Image(systemName: weather?.condition.symbolName ?? "cloud.sun.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(tint)
+                        .symbolRenderingMode(.hierarchical)
+                    Text(weatherLocation?.name ?? "天气")
+                        .fontWeight(.semibold)
+                    Text(updatedText)
+                        .font(.system(size: 9, weight: .medium, design: .rounded))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 122) {
+                HStack(spacing: 7) {
+                    Text(weather?.condition.displayName ?? "暂无天气")
+                        .foregroundStyle(.secondary)
+                    CodexDockRollingText(
+                        value: weather.map { String(format: "%.0f°C", $0.temperature) } ?? "—",
+                        size: 13,
+                        weight: .bold
+                    )
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 104) {
+                HStack(spacing: 6) {
+                    Text("体感")
+                        .foregroundStyle(.tertiary)
+                    Text(weather?.apparentTemperature.map { String(format: "%.0f°C", $0) } ?? "—")
+                        .fontWeight(.semibold)
+                        .monospacedDigit()
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 126) {
+                HStack(spacing: 6) {
+                    Text("最高/最低")
+                        .foregroundStyle(.tertiary)
+                    Text(codexDockWeatherRange(weather))
+                        .fontWeight(.semibold)
+                        .monospacedDigit()
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 154) {
+                HStack(spacing: 8) {
+                    Text("湿度")
+                        .foregroundStyle(.tertiary)
+                    Text(weather?.relativeHumidity.map { String(format: "%.0f%%", $0) } ?? "—")
+                        .fontWeight(.semibold)
+                        .monospacedDigit()
+                    Text("风")
+                        .foregroundStyle(.tertiary)
+                    Text(weather?.windSpeed.map { String(format: "%.0f km/h", $0) } ?? "—")
+                        .fontWeight(.semibold)
+                        .monospacedDigit()
+                }
+            }
+        }
+        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .lineLimit(1)
+    }
+
+    private func codexDockWeatherRange(_ weather: WeatherSnapshot?) -> String {
+        guard let maximum = weather?.maximumTemperature,
+              let minimum = weather?.minimumTemperature else { return "—" }
+        return String(format: "%.0f°/%.0f°", maximum, minimum)
+    }
+
+    private func codexDockTimeFocus(at date: Date) -> some View {
+        HStack(spacing: 0) {
+            codexDockFocusCell(minWidth: 184) {
+                HStack(spacing: 7) {
+                    Image(systemName: "clock")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color.purple)
+                    Text("当前时间")
+                        .foregroundStyle(.secondary)
+                    CodexDockRollingText(
+                        value: codexDockClockText(at: date),
+                        size: 14,
+                        weight: .bold
+                    )
+                }
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 190) {
+                Text(codexDockDateText(at: date))
+                    .fontWeight(.semibold)
+            }
+
+            codexDockFocusDivider
+            codexDockFocusCell(minWidth: 170) {
+                HStack(spacing: 7) {
+                    Text(weatherLocation?.name ?? TimeZone.current.localizedName(
+                        for: .generic,
+                        locale: Locale(identifier: "zh_CN")
+                    ) ?? "本地")
+                        .foregroundStyle(.secondary)
+                    Text(codexDockTimeZoneText(at: date))
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .font(.system(size: 11, weight: .medium, design: .rounded))
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .lineLimit(1)
+    }
+
+    private func codexDockFocusCell<Content: View>(
+        minWidth: CGFloat = 0,
+        alignment: Alignment = .center,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        content()
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment)
+            .frame(minWidth: minWidth)
+            .padding(.horizontal, 8)
+    }
+
+    private func codexDockUsageProgressTint(_ remaining: Double) -> Color {
+        remaining <= 20 ? PulseTheme.red : Color.primary.opacity(0.82)
+    }
+
+    private var codexDockFocusDivider: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.11))
+            .frame(width: 1, height: 16)
+    }
+
+    private var codexDockSortedResetCards: [RateLimitResetCard] {
+        store.snapshot.rateLimits.resetCards.sorted { lhs, rhs in
+            if lhs.isAvailable != rhs.isAvailable {
+                return lhs.isAvailable && !rhs.isAvailable
+            }
+            return (lhs.expiresAt ?? .distantFuture) < (rhs.expiresAt ?? .distantFuture)
+        }
+    }
+
+    private func codexDockResetCardPager(compact: Bool) -> some View {
+        let cards = codexDockSortedResetCards
+        let index = min(max(0, codexDockResetCardIndex), max(0, cards.count - 1))
+        let card = cards[index]
+        return HStack(spacing: compact ? 3 : 5) {
+            if !compact {
+                Text("重置卡 \(cards.filter(\.isAvailable).count)张")
+                    .foregroundStyle(.secondary)
+                Text(codexDockResetCardSummary(card))
+                    .fontWeight(.semibold)
+                    .lineLimit(1)
+            } else {
+                Text("重置卡")
+                    .foregroundStyle(.secondary)
+            }
+            Text("前往使用 ↗")
+                .fontWeight(.semibold)
+                .foregroundStyle(PulseTheme.blue)
+                .frame(width: compact ? 58 : 72, alignment: .trailing)
+            Image(systemName: "chevron.left")
+                .font(.system(size: 8.5, weight: .bold))
+                .foregroundStyle(cards.count > 1 ? Color.secondary : Color.secondary.opacity(0.28))
+                .frame(width: 18)
+            Text("\(index + 1)/\(cards.count)")
+                .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 34)
+                .contentTransition(.numericText())
+            Image(systemName: "chevron.right")
+                .font(.system(size: 8.5, weight: .bold))
+                .foregroundStyle(cards.count > 1 ? Color.secondary : Color.secondary.opacity(0.28))
+                .frame(width: 18)
+        }
+        .padding(.leading, compact ? 2 : 5)
+    }
+
+    private func codexDockResetCardSummary(_ card: RateLimitResetCard) -> String {
+        let rawName = card.applicableLimitTypes.first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let name: String
+        if let rawName, !rawName.isEmpty, !rawName.lowercased().contains("codex") {
+            name = rawName
+        } else {
+            name = "Full reset"
+        }
+        guard let expiration = card.expiresAt else { return name }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = .current
+        formatter.dateFormat = "M/d到期"
+        return "\(name) · \(formatter.string(from: expiration))"
+    }
+
+    private func codexDockTokenText(_ value: Int64?) -> String {
+        guard let value else { return "—" }
+        if value >= 1_000_000_000_000 {
+            return String(format: "%.3fT", Double(value) / 1_000_000_000_000)
+        }
+        if value >= 1_000_000_000 {
+            return String(format: "%.3fB", Double(value) / 1_000_000_000)
+        }
+        if value >= 1_000_000 {
+            return String(format: "%.3fM", Double(value) / 1_000_000)
+        }
+        if value >= 1_000 {
+            return String(format: "%.3fK", Double(value) / 1_000)
+        }
+        return "\(value)"
+    }
+
+    private var codexDockTrendBuckets: [DailyTokenBucket] {
+        store.snapshot.usage.filledLast7Days()
+    }
+
+    private var codexDockTrendPeak: Int64? {
+        guard !codexDockTrendBuckets.isEmpty else { return nil }
+        return codexDockTrendBuckets.map(\.tokens).max()
+    }
+
+    private var codexDockTrendTotal: Int64? {
+        guard !codexDockTrendBuckets.isEmpty else { return nil }
+        return codexDockTrendBuckets.reduce(Int64(0)) { partial, bucket in
+            let (value, overflow) = partial.addingReportingOverflow(bucket.tokens)
+            return overflow ? Int64.max : value
+        }
+    }
+
+    private var codexDockCacheHitText: String {
+        guard let rate = store.snapshot.usage.localTodayCacheHitRate else { return "—" }
+        return String(format: "%.1f%%", rate * 100)
+    }
+
+    private func codexDockCurrencyText(_ value: Double?) -> String {
+        guard let value, value.isFinite else { return "—" }
+        if value >= 1_000 {
+            return String(format: "$%.2fK", value / 1_000)
+        }
+        if value >= 100 {
+            return String(format: "$%.1f", value)
+        }
+        if value >= 1 {
+            return String(format: "$%.2f", value)
+        }
+        if value >= 0.01 {
+            return String(format: "$%.3f", value)
+        }
+        return String(format: "$%.4f", value)
+    }
+
+    private func codexDockClockText(at date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = codexDockTimeZone
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: date)
+    }
+
+    private func codexDockDateText(at date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = codexDockTimeZone
+        formatter.dateFormat = "yyyy年M月d日 EEEE"
+        return formatter.string(from: date)
+    }
+
+    private func codexDockCompactDateText(at date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = codexDockTimeZone
+        formatter.dateFormat = "M/d E"
+        return formatter.string(from: date)
+    }
+
+    private func codexDockTimeZoneText(at date: Date) -> String {
+        let seconds = codexDockTimeZone.secondsFromGMT(for: date)
+        let sign = seconds >= 0 ? "+" : "−"
+        let absolute = abs(seconds)
+        let hours = absolute / 3_600
+        let minutes = absolute % 3_600 / 60
+        if minutes == 0 {
+            return "UTC\(sign)\(hours)"
+        }
+        return String(format: "UTC%@%d:%02d", sign, hours, minutes)
+    }
+
+    private var codexDockTimeZone: TimeZone {
+        weatherLocation.flatMap { TimeZone(identifier: $0.timezone) } ?? .current
+    }
+
+    private func codexDockResetDetailText(at date: Date) -> String {
+        guard let reset = store.snapshot.rateLimits.primaryBucket?.resetsAt else { return "—" }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = .current
+        formatter.dateFormat = Calendar.current.isDate(reset, inSameDayAs: date)
+            ? "今天 HH:mm"
+            : "M月d日 HH:mm"
+        return formatter.string(from: reset)
     }
 
     private func codexDockResetText(at date: Date) -> String {
@@ -1108,7 +2119,75 @@ struct FloatingCapsuleView: View {
         return formatter.string(from: reset)
     }
 
+    private func handleCodexDockTap(_ update: CodexDockTapUpdate) {
+        guard isCodexDockAttached else { return }
+
+        if let focusedMetric = codexDockFocusedMetric {
+            if !codexDockEdge.isVertical,
+               focusedMetric == .quota,
+               handleCodexDockQuotaAction(at: update.primaryPosition) {
+                return
+            }
+            codexDockFocusedMetric = nil
+            return
+        }
+
+        let primaryInset: CGFloat = codexDockEdge.isVertical ? 10 : 14
+        let primaryLength = codexDockEdge.isVertical
+            ? CGFloat(codexDockHeight)
+            : CGFloat(codexDockWidth)
+        let extent = max(1, primaryLength - primaryInset * 2)
+        let localPosition = min(
+            extent - 0.001,
+            max(0, update.primaryPosition - primaryInset)
+        )
+        let order = resolvedCodexDockOrder
+        guard !order.isEmpty else { return }
+        let index = min(
+            order.count - 1,
+            max(0, Int(floor(localPosition / extent * CGFloat(order.count))))
+        )
+        codexDockFocusedMetric = order[index]
+    }
+
+    /// The quota row keeps its actionable controls right-aligned at stable widths.
+    /// AppKit owns the drag recognizer, so routing these short-tap zones here avoids
+    /// a SwiftUI Button competing with reorder or detach after the 3pt threshold.
+    private func handleCodexDockQuotaAction(at primaryPosition: CGFloat) -> Bool {
+        let cards = codexDockSortedResetCards
+        guard !cards.isEmpty else { return false }
+        let trailing = max(0, CGFloat(codexDockWidth) - primaryPosition)
+
+        if trailing <= 42 {
+            guard cards.count > 1 else { return true }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                let safeIndex = min(max(0, codexDockResetCardIndex), cards.count - 1)
+                codexDockResetCardIndex = (safeIndex + 1) % cards.count
+            }
+            return true
+        }
+        if trailing >= 66, trailing <= 98 {
+            guard cards.count > 1 else { return true }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                let safeIndex = min(max(0, codexDockResetCardIndex), cards.count - 1)
+                codexDockResetCardIndex = (safeIndex - 1 + cards.count) % cards.count
+            }
+            return true
+        }
+        if trailing > 98, trailing <= 184 {
+            store.openUsagePage()
+            return true
+        }
+        return false
+    }
+
     private func reorderCodexDock(using update: CodexDockReorderUpdate) {
+        guard codexDockFocusedMetric == nil else {
+            if update.ended {
+                codexDockDraggedMetric = nil
+            }
+            return
+        }
         var order = resolvedCodexDockOrder
         guard !order.isEmpty else { return }
         let extent = max(
@@ -1128,8 +2207,12 @@ struct FloatingCapsuleView: View {
         }
         guard let dragged = codexDockDraggedMetric,
               let currentIndex = order.firstIndex(of: dragged) else { return }
+        guard dragged != .trend else {
+            if update.ended { codexDockDraggedMetric = nil }
+            return
+        }
         let targetIndex = min(
-            order.count - 1,
+            max(0, order.count - 2),
             max(0, Int(floor(update.currentX / itemWidth)))
         )
         if targetIndex != currentIndex {
@@ -1921,9 +3004,7 @@ struct FloatingCapsuleView: View {
         }
         .fixedSize(horizontal: true, vertical: false)
         .help(
-            usesAPIKeyUsageFallback
-                ? "API Key 模式：今日值来自本机全部 session 的 token_count，账单以 OpenAI API Usage / Costs 为准"
-                : "今日 Token 取 Codex App Server 与本机当天全部 session 汇总中的较大值；切换账号后立即更新"
+            "今日 Token 来自本机当天全部 Codex session，包含本机使用过的所有账号；切换账号不会清空"
         )
     }
 
@@ -1954,9 +3035,6 @@ struct FloatingCapsuleView: View {
                     .foregroundStyle(mode.color)
             }
             .padding(.bottom, 10)
-
-            accountDetails(snapshot.account)
-                .padding(.bottom, 12)
 
             dataTrustStatus(snapshot)
                 .padding(.bottom, 12)
@@ -2018,15 +3096,8 @@ struct FloatingCapsuleView: View {
 
             cardDivider
 
-            // Token 与任务
-            HStack(spacing: 0) {
-                metric("今日", PulseFormatters.tokens(todayTokens))
-                metricDivider
-                metric("累计", PulseFormatters.tokens(snapshot.usage.totalTokens))
-                metricDivider
-                taskOrOnlineMetric(snapshot)
-            }
-            .padding(.vertical, 12)
+            usageSummaryMetrics(snapshot)
+                .padding(.vertical, 12)
 
             if mode == .working || mode == .attention {
                 cardDivider
@@ -2263,8 +3334,8 @@ struct FloatingCapsuleView: View {
                 .lineLimit(1)
                 .help(store.lastError ?? title)
 
-            if snapshot.account.authMode == .apiKey, snapshot.usage.todayTokens != nil {
-                Text("API Key 今日值：本机全部 session 汇总 · 非 OpenAI 账单")
+            if snapshot.usage.localTodayTokens != nil {
+                Text("今日与累计 Token：本机全部 session 汇总 · 跨账号 · 非 OpenAI 账单")
                     .font(.system(size: 9, weight: .regular))
                     .foregroundStyle(.tertiary)
                     .lineLimit(2)
@@ -2285,11 +3356,53 @@ struct FloatingCapsuleView: View {
             Text(value)
                 .font(.system(size: 13, weight: .semibold, design: .rounded))
                 .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.62)
             Text(label)
                 .font(.system(size: 9))
                 .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private func usageSummaryMetrics(_ snapshot: PulseSnapshot) -> some View {
+        let usage = snapshot.usage
+        let cachedTokens = usage.localTodayCachedInputTokens
+        let uncachedTokens: Int64? = usage.localTodayInputTokens.map { input in
+            max(0, input - (cachedTokens ?? 0))
+        }
+        let cacheHitRate = usage.localTodayCacheHitRate.map {
+            String(format: "%.1f%%", $0 * 100)
+        } ?? "—"
+
+        return VStack(spacing: 9) {
+            HStack(spacing: 0) {
+                metric("今日 Token", PulseFormatters.tokens(todayTokens))
+                metricDivider
+                metric("累计 Token", PulseFormatters.tokens(usage.totalTokens))
+                metricDivider
+                metric("缓存 Token", PulseFormatters.tokens(cachedTokens))
+                metricDivider
+                metric("未缓存 Token", PulseFormatters.tokens(uncachedTokens))
+            }
+
+            Rectangle()
+                .fill(Color.primary.opacity(0.055))
+                .frame(height: 1)
+
+            HStack(spacing: 0) {
+                metric("缓存命中率", cacheHitRate)
+                metricDivider
+                metric("成本", codexDockCurrencyText(usage.localTodayEstimatedCostUSD))
+                metricDivider
+                metric("累计成本", codexDockCurrencyText(usage.localTotalEstimatedCostUSD))
+                metricDivider
+                taskOrOnlineMetric(snapshot)
+            }
+        }
+        .accessibilityElement(children: .contain)
     }
 
     @ViewBuilder
@@ -2310,39 +3423,6 @@ struct FloatingCapsuleView: View {
                 "在线天数",
                 snapshot.usage.currentStreakDays.map { "\($0) 天" } ?? "—"
             )
-        }
-    }
-
-    private func accountDetails(_ account: AccountInfo) -> some View {
-        VStack(spacing: 7) {
-            accountRow("账号", account.displayEmail)
-            accountRow("套餐与认证", "\(account.planType.displayName) · \(account.authMode.displayName)")
-            if let workspace = account.workspaceName, !workspace.isEmpty {
-                accountRow("工作区", workspace)
-            }
-//            if let cli = account.cliVersion, !cli.isEmpty {
-//                accountRow("Codex CLI", cli)
-//            }
-//            accountRow("最近同步", PulseFormatters.relativeDate(account.lastSyncedAt))
-        }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(Color.primary.opacity(0.045))
-        )
-    }
-
-    private func accountRow(_ label: String, _ value: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Text(label)
-                .font(.system(size: 9.5, weight: .medium))
-                .foregroundStyle(.tertiary)
-                .frame(width: 62, alignment: .leading)
-            Text(value)
-                .font(.system(size: 10.5, weight: .medium))
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 0)
         }
     }
 
@@ -2640,6 +3720,123 @@ struct FloatingCapsuleView: View {
         if remaining <= 0 || remaining < 24 * 3600 { return PulseTheme.red }
         if remaining < 3 * 24 * 3600 { return PulseTheme.orange }
         return .secondary
+    }
+}
+
+/// Unboxed numeric transition shared by the attached dock. The glyphs keep a
+/// tabular width while SwiftUI moves only the changing numeric content.
+private struct CodexDockRollingText: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    let value: String
+    let size: CGFloat
+    let weight: Font.Weight
+
+    var body: some View {
+        Text(value)
+            .font(.system(size: size, weight: weight, design: .rounded))
+            .monospacedDigit()
+            .lineLimit(1)
+            .contentTransition(.numericText(countsDown: false))
+            .animation(
+                reduceMotion ? nil : .easeOut(duration: 0.20),
+                value: value
+            )
+    }
+}
+
+private struct CodexDockProgressBar: View {
+    let progress: Double
+    let tint: Color
+
+    var body: some View {
+        GeometryReader { proxy in
+            let clamped = min(1, max(0, progress))
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.primary.opacity(0.10))
+                Capsule()
+                    .fill(tint)
+                    .frame(width: proxy.size.width * CGFloat(clamped))
+            }
+        }
+        .frame(height: 4)
+        .accessibilityValue(PulseFormatters.percent(progress * 100))
+    }
+}
+
+private struct CodexDockActivityDot: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 18.0, paused: reduceMotion)) { context in
+            let phase = context.date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: 1.8) / 1.8
+            let pulse = reduceMotion
+                ? 0.5
+                : (sin(phase * .pi * 2 - .pi / 2) + 1) / 2
+            Circle()
+                .fill(PulseTheme.blue)
+                .frame(width: 5, height: 5)
+                .scaleEffect(CGFloat(0.88 + pulse * 0.20))
+                .opacity(0.58 + pulse * 0.42)
+                .shadow(
+                    color: PulseTheme.blue.opacity(0.25 + pulse * 0.30),
+                    radius: 3
+                )
+        }
+        .frame(width: 7, height: 7)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct CodexDockTaskBadge: View {
+    let count: Int
+    let expanded: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            CodexDockActivityDot()
+            Text(expanded ? "\(count) 个任务执行中" : "\(count)")
+                .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .contentTransition(.numericText(countsDown: false))
+        }
+        .foregroundStyle(PulseTheme.blue)
+        .padding(.horizontal, expanded ? 7 : 5)
+        .padding(.vertical, 3)
+        .background(PulseTheme.blue.opacity(0.09), in: Capsule())
+        .animation(.easeOut(duration: 0.18), value: count)
+        .accessibilityLabel("\(count) 个任务执行中")
+    }
+}
+
+private struct CodexDockSparkline: View {
+    let values: [Int64]
+    let tint: Color
+
+    var body: some View {
+        Canvas { context, size in
+            guard values.count > 1 else { return }
+            let peak = max(Int64(1), values.max() ?? 0)
+            var path = Path()
+            for (index, value) in values.enumerated() {
+                let x = size.width * CGFloat(index) / CGFloat(values.count - 1)
+                let normalized = CGFloat(Double(max(0, value)) / Double(peak))
+                let y = size.height - normalized * max(1, size.height - 2) - 1
+                if index == 0 {
+                    path.move(to: CGPoint(x: x, y: y))
+                } else {
+                    path.addLine(to: CGPoint(x: x, y: y))
+                }
+            }
+            context.stroke(
+                path,
+                with: .color(tint.opacity(0.86)),
+                style: StrokeStyle(lineWidth: 1.25, lineCap: .round, lineJoin: .round)
+            )
+        }
+        .accessibilityHidden(true)
     }
 }
 

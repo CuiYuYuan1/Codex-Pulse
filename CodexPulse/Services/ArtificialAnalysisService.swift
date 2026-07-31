@@ -266,6 +266,8 @@ actor ArtificialAnalysisAPIClient {
 @MainActor
 @Observable
 final class ArtificialAnalysisLeaderboardStore {
+    static let shared = ArtificialAnalysisLeaderboardStore()
+
     private(set) var snapshot: ArtificialAnalysisSnapshot?
     private(set) var isLoading = false
     private(set) var hasAPIKey = false
@@ -286,6 +288,42 @@ final class ArtificialAnalysisLeaderboardStore {
     var isCacheStale: Bool {
         guard let fetchedAt = snapshot?.fetchedAt else { return true }
         return Date().timeIntervalSince(fetchedAt) >= cacheLifetime
+    }
+
+    /// 返回当前“模型 + 推理档位”在 Artificial Analysis 中对应的编程指数。
+    /// reasoning effort 仅用于定位同一模型的 low/high/max 版本，绝不再被当成
+    /// 编程能力本身展示。
+    func programmingIndex(model rawModel: String?, reasoningEffort: String?) -> Double? {
+        guard let rawModel, let snapshot else { return nil }
+        let modelKey = Self.normalizedModelKey(rawModel)
+        let requestedEffort = Self.modelEffort(in: rawModel)
+            ?? Self.normalizedEffort(reasoningEffort)
+        let requestedBase = Self.modelBase(modelKey)
+        guard !requestedBase.isEmpty else { return nil }
+
+        return snapshot.models
+            .filter { $0.isOpenAI && $0.codingIndex != nil }
+            .compactMap { candidate -> (score: Int, value: Double)? in
+                guard let value = candidate.codingIndex else { return nil }
+                let slugKey = Self.normalizedModelKey(candidate.slug)
+                let nameKey = Self.normalizedModelKey(candidate.name)
+                let candidateBase = Self.modelBase(slugKey)
+                guard candidateBase == requestedBase
+                        || Self.modelBase(nameKey) == requestedBase else {
+                    return nil
+                }
+                let candidateEffort = Self.modelEffort(in: candidate.name)
+                    ?? Self.modelEffort(in: candidate.slug)
+                var score = slugKey == modelKey || nameKey == modelKey ? 120 : 100
+                if let requestedEffort {
+                    score += candidateEffort == requestedEffort ? 40 : -40
+                } else if candidateEffort == "max" {
+                    score += 5
+                }
+                return (score, value)
+            }
+            .max(by: { $0.score < $1.score })?
+            .value
     }
 
     func start() {
@@ -353,6 +391,52 @@ final class ArtificialAnalysisLeaderboardStore {
         cachedAPIKey = value
         hasAPIKey = value != nil
         return value
+    }
+
+    private static func normalizedModelKey(_ rawValue: String) -> String {
+        String(
+            rawValue
+                .lowercased()
+                .filter { $0.isLetter || $0.isNumber }
+        )
+    }
+
+    private static func normalizedEffort(_ rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let normalized = String(
+            rawValue
+                .lowercased()
+                .filter { $0.isLetter || $0.isNumber }
+        )
+        switch normalized {
+        case "minimal": return "minimal"
+        case "low": return "low"
+        case "medium": return "medium"
+        case "high": return "high"
+        case "xhigh", "extrahigh": return "xhigh"
+        case "max", "maximum": return "max"
+        case "nonreasoning", "none": return "nonreasoning"
+        default: return nil
+        }
+    }
+
+    private static func modelEffort(in rawValue: String) -> String? {
+        let key = normalizedModelKey(rawValue)
+        for effort in ["nonreasoning", "minimal", "medium", "xhigh", "high", "low", "maximum", "max"] {
+            if key.hasSuffix(effort) {
+                return effort == "maximum" ? "max" : effort
+            }
+        }
+        return nil
+    }
+
+    private static func modelBase(_ key: String) -> String {
+        for effort in ["nonreasoning", "minimal", "medium", "xhigh", "high", "low", "maximum", "max"] {
+            if key.hasSuffix(effort) {
+                return String(key.dropLast(effort.count))
+            }
+        }
+        return key
     }
 }
 

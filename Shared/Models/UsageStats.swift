@@ -15,16 +15,33 @@ struct UsageStats: Codable, Equatable, Sendable {
     var updatedAt: Date
     /// 接口说明：为何为空 / 是否仅 ChatGPT 认证可用
     var sourceNote: String?
-    /// 本机所有 Codex session JSONL 的当日累计值，用于实时速度、切换账号后的
-    /// 即时补偿，以及 API Key 模式下官方汇总不可用时的今日用量估算。
-    /// 本机日志不含账号 ID；因此今日标题始终明确采用设备汇总口径，账号切换后
-    /// 也会立即重新读取，不把它描述成单一账号的官方账单。
+    /// 本机所有 Codex session JSONL 的当日累计值。session 日志不含账号 ID，
+    /// 因此“今日 Token”始终采用设备口径，包含今天在本机使用过的所有账号。
     var localTodayTokens: Int64? = nil
-    /// 本机全部 session 最近 7 个自然日的增量桶。日志没有账号 ID，
-    /// 因此只有 API Key 模式会把它提升为界面历史；ChatGPT 仅保留官方日桶。
+    /// 本机全部 session 最近 7 个自然日的增量桶。
     var localDailyBuckets: [DailyTokenBucket]? = nil
+    /// 本机全部 session 的历史累计 Token，跨账号且不随登录账号切换清空。
+    var localTotalTokens: Int64? = nil
+    /// 本机全部 session 按自然日计算的当前/历史最长连续活跃天数。
+    /// 与账号额度解耦，切换账号时仍保持设备级统计。
+    var localCurrentStreakDays: Int? = nil
+    var localLongestStreakDays: Int? = nil
     /// 经过平滑的本机 Token 消耗速度。
     var tokenVelocityPerMinute: Int64? = nil
+    /// 今日设备级 Token 构成。`input` 已包含 `cachedInput`，与 Codex
+    /// session JSONL 的 `last_token_usage` 字段保持一致。
+    var localTodayInputTokens: Int64? = nil
+    var localTodayCachedInputTokens: Int64? = nil
+    var localTodayOutputTokens: Int64? = nil
+    /// 按 session 记录的模型和公开 API 单价换算，仅用于成本感知，不代表
+    /// ChatGPT 套餐账单。
+    var localTodayEstimatedCostUSD: Double? = nil
+    var localTodayUncachedInputCostUSD: Double? = nil
+    var localTodayCachedInputCostUSD: Double? = nil
+    var localTodayOutputCostUSD: Double? = nil
+    /// 本机全部 session 按事件模型与公开 API 单价换算的历史累计成本。
+    /// 仅用于成本感知，不代表 ChatGPT 套餐账单。
+    var localTotalEstimatedCostUSD: Double? = nil
 
     static let empty = UsageStats(
         totalTokens: nil,
@@ -48,6 +65,17 @@ struct UsageStats: Codable, Equatable, Sendable {
             || last7DaysTokens != nil
             || last30DaysTokens != nil
             || dailyBuckets.contains(where: { $0.tokens > 0 })
+            || localTodayTokens != nil
+            || localTotalTokens != nil
+            || localDailyBuckets?.contains(where: { $0.tokens > 0 }) == true
+    }
+
+    var localTodayCacheHitRate: Double? {
+        guard let input = localTodayInputTokens, input > 0,
+              let cached = localTodayCachedInputTokens else {
+            return nil
+        }
+        return min(1, max(0, Double(cached) / Double(input)))
     }
 
     /// 切换到新的本地自然日。历史桶顺移，但“今日”必须立即从 0 开始，
@@ -60,7 +88,17 @@ struct UsageStats: Codable, Equatable, Sendable {
         todayTokens = 0
         localTodayTokens = 0
         tokenVelocityPerMinute = nil
+        localTodayInputTokens = 0
+        localTodayCachedInputTokens = 0
+        localTodayOutputTokens = 0
+        localTodayEstimatedCostUSD = 0
+        localTodayUncachedInputCostUSD = 0
+        localTodayCachedInputCostUSD = 0
+        localTodayOutputCostUSD = 0
         dailyBuckets = filledLast7Days(reference: reference, calendar: calendar)
+        if localDailyBuckets != nil {
+            localDailyBuckets = dailyBuckets
+        }
         updatedAt = reference
     }
 
@@ -133,63 +171,144 @@ struct UsageStats: Codable, Equatable, Sendable {
         sourceNote = "今日数据包含 App Server 实时 Token 事件"
     }
 
-    /// 记录本机日志累计；ChatGPT 账号切换时由调用方禁止提升，API Key 模式
-    /// 则将当日全部本地 session 用量作为今日估算。
+    /// 记录本机日志累计。提升后设备值是界面“今日 Token”的唯一口径，
+    /// 不与当前账号的远端摘要取较大值。
     mutating func mergeLocalTodayTokens(
         _ localTokens: Int64,
-        promoteToAccountTotals: Bool = false,
+        promoteToDisplayedUsage: Bool = false,
         reference: Date = Date(),
         calendar: Calendar = .current
     ) {
-        guard localTokens > 0 else { return }
-        localTodayTokens = localTokens
-        guard promoteToAccountTotals else { return }
+        guard localTokens >= 0 else { return }
+        // 完整 session 重扫是设备口径的权威值，必须允许纠正旧版本曾经高估的
+        // 持久化快照；实时事件在 Store 中单独增量合并，不依赖这里取 max。
+        let resolvedLocalTokens = localTokens
+        localTodayTokens = resolvedLocalTokens
+        guard promoteToDisplayedUsage else { return }
 
         let formatter = Self.dayFormatter(calendar: calendar)
         let todayKey = formatter.string(from: reference)
-        let resolvedToday = max(todayTokens ?? 0, localTokens)
-        todayTokens = resolvedToday
+        todayTokens = resolvedLocalTokens
 
         if let index = dailyBuckets.firstIndex(where: {
             Self.normalizeDay($0.dateString) == todayKey
         }) {
             dailyBuckets[index].dateString = todayKey
-            dailyBuckets[index].tokens = max(dailyBuckets[index].tokens, resolvedToday)
+            dailyBuckets[index].tokens = resolvedLocalTokens
         } else {
-            dailyBuckets.append(DailyTokenBucket(dateString: todayKey, tokens: resolvedToday))
+            dailyBuckets.append(DailyTokenBucket(dateString: todayKey, tokens: resolvedLocalTokens))
         }
 
         dailyBuckets = filledLast7Days(reference: reference, calendar: calendar)
+        if localDailyBuckets != nil {
+            localDailyBuckets = dailyBuckets
+        }
+        let yesterdayKey = calendar.date(byAdding: .day, value: -1, to: reference)
+            .map { formatter.string(from: $0) }
+        if let yesterdayKey {
+            yesterdayTokens = dailyBuckets.first(where: { $0.dateString == yesterdayKey })?.tokens
+        }
         last7DaysTokens = dailyBuckets.reduce(0) { $0 + $1.tokens }
-        peakDailyTokens = max(peakDailyTokens ?? 0, dailyBuckets.map(\.tokens).max() ?? 0)
+        peakDailyTokens = dailyBuckets.map(\.tokens).max()
         updatedAt = reference
+        sourceNote = "Token 来自本机全部 Codex session，包含本机使用过的所有账号"
+    }
+
+    mutating func mergeLocalTodayBreakdown(
+        inputTokens: Int64,
+        cachedInputTokens: Int64,
+        outputTokens: Int64,
+        estimatedCostUSD: Double?,
+        uncachedInputCostUSD: Double?,
+        cachedInputCostUSD: Double?,
+        outputCostUSD: Double?
+    ) {
+        localTodayInputTokens = max(0, inputTokens)
+        localTodayCachedInputTokens = min(
+            max(0, cachedInputTokens),
+            max(0, inputTokens)
+        )
+        localTodayOutputTokens = max(0, outputTokens)
+        localTodayEstimatedCostUSD = estimatedCostUSD.map { max(0, $0) }
+        localTodayUncachedInputCostUSD = uncachedInputCostUSD.map { max(0, $0) }
+        localTodayCachedInputCostUSD = cachedInputCostUSD.map { max(0, $0) }
+        localTodayOutputCostUSD = outputCostUSD.map { max(0, $0) }
     }
 
     mutating func mergeLocalDailyBuckets(
         _ localBuckets: [DailyTokenBucket],
-        promoteToAccountTotals: Bool = false,
+        promoteToDisplayedUsage: Bool = false,
         reference: Date = Date(),
         calendar: Calendar = .current
     ) {
-        localDailyBuckets = localBuckets
-        guard promoteToAccountTotals else { return }
-
         var byDay: [String: Int64] = [:]
-        for bucket in dailyBuckets + localBuckets {
+        for bucket in localBuckets {
             let day = Self.normalizeDay(bucket.dateString)
-            byDay[day] = max(byDay[day] ?? 0, max(0, bucket.tokens))
+            let value = max(0, bucket.tokens)
+            let current = byDay[day] ?? 0
+            let (next, overflow) = current.addingReportingOverflow(value)
+            byDay[day] = overflow ? Int64.max : next
         }
+        let previousDisplayedBuckets = dailyBuckets
         dailyBuckets = byDay.map { DailyTokenBucket(dateString: $0.key, tokens: $0.value) }
-        dailyBuckets = filledLast7Days(reference: reference, calendar: calendar)
+        let filledLocal = filledLast7Days(reference: reference, calendar: calendar)
+        localDailyBuckets = filledLocal
+        guard promoteToDisplayedUsage else {
+            dailyBuckets = previousDisplayedBuckets
+            return
+        }
+        dailyBuckets = filledLocal
 
-        let todayKey = Self.dayFormatter(calendar: calendar).string(from: reference)
+        let formatter = Self.dayFormatter(calendar: calendar)
+        let todayKey = formatter.string(from: reference)
         if let localToday = dailyBuckets.first(where: { $0.dateString == todayKey })?.tokens {
-            todayTokens = max(todayTokens ?? 0, localToday)
+            todayTokens = localToday
+        }
+        let yesterdayKey = calendar.date(byAdding: .day, value: -1, to: reference)
+            .map { formatter.string(from: $0) }
+        if let yesterdayKey {
+            yesterdayTokens = dailyBuckets.first(where: { $0.dateString == yesterdayKey })?.tokens
         }
         last7DaysTokens = dailyBuckets.reduce(0) { $0 + $1.tokens }
-        peakDailyTokens = max(peakDailyTokens ?? 0, dailyBuckets.map(\.tokens).max() ?? 0)
+        peakDailyTokens = dailyBuckets.map(\.tokens).max()
         updatedAt = reference
-        sourceNote = "API Key 用量来自本机全部 session 汇总；不代表 OpenAI 账单"
+        sourceNote = "Token 来自本机全部 Codex session，包含本机使用过的所有账号"
+    }
+
+    mutating func mergeLocalTotalTokens(
+        _ localTokens: Int64,
+        estimatedCostUSD: Double? = nil,
+        promoteToDisplayedUsage: Bool = false,
+        reference: Date = Date()
+    ) {
+        guard localTokens >= 0 else { return }
+        // 历史文件被清理或聚合算法修正后累计值也可能合法下降。
+        let resolvedLocalTokens = localTokens
+        localTotalTokens = resolvedLocalTokens
+        if let estimatedCostUSD {
+            localTotalEstimatedCostUSD = max(0, estimatedCostUSD)
+        }
+        guard promoteToDisplayedUsage else { return }
+        totalTokens = resolvedLocalTokens
+        updatedAt = reference
+        sourceNote = "Token 来自本机全部 Codex session，包含本机使用过的所有账号"
+    }
+
+    mutating func mergeLocalStreak(
+        currentDays: Int,
+        longestDays: Int,
+        promoteToDisplayedUsage: Bool = false,
+        reference: Date = Date()
+    ) {
+        let current = max(0, currentDays)
+        let longest = max(current, longestDays)
+        localCurrentStreakDays = current
+        localLongestStreakDays = longest
+        guard promoteToDisplayedUsage else { return }
+        currentStreakDays = current
+        longestStreakDays = longest
+        updatedAt = reference
+        sourceNote = "连续天数来自本机全部 Codex session，包含本机使用过的所有账号"
     }
 
     /// 本次只拿到本机今日数据或官方接口返回不完整时，保留同一账号上一份完整汇总。
@@ -200,6 +319,25 @@ struct UsageStats: Codable, Equatable, Sendable {
         calendar: Calendar = .current
     ) {
         totalTokens = totalTokens ?? cached.totalTokens
+        localTotalTokens = localTotalTokens ?? cached.localTotalTokens
+        localTodayTokens = localTodayTokens ?? cached.localTodayTokens
+        localDailyBuckets = localDailyBuckets ?? cached.localDailyBuckets
+        localCurrentStreakDays = localCurrentStreakDays ?? cached.localCurrentStreakDays
+        localLongestStreakDays = localLongestStreakDays ?? cached.localLongestStreakDays
+        localTodayInputTokens = localTodayInputTokens ?? cached.localTodayInputTokens
+        localTodayCachedInputTokens =
+            localTodayCachedInputTokens ?? cached.localTodayCachedInputTokens
+        localTodayOutputTokens = localTodayOutputTokens ?? cached.localTodayOutputTokens
+        localTodayEstimatedCostUSD =
+            localTodayEstimatedCostUSD ?? cached.localTodayEstimatedCostUSD
+        localTodayUncachedInputCostUSD =
+            localTodayUncachedInputCostUSD ?? cached.localTodayUncachedInputCostUSD
+        localTodayCachedInputCostUSD =
+            localTodayCachedInputCostUSD ?? cached.localTodayCachedInputCostUSD
+        localTodayOutputCostUSD =
+            localTodayOutputCostUSD ?? cached.localTodayOutputCostUSD
+        localTotalEstimatedCostUSD =
+            localTotalEstimatedCostUSD ?? cached.localTotalEstimatedCostUSD
         yesterdayTokens = yesterdayTokens ?? cached.yesterdayTokens
         last30DaysTokens = last30DaysTokens ?? cached.last30DaysTokens
         currentStreakDays = currentStreakDays ?? cached.currentStreakDays
@@ -224,6 +362,68 @@ struct UsageStats: Codable, Equatable, Sendable {
             max(peakDailyTokens ?? 0, cached.peakDailyTokens ?? 0),
             dailyBuckets.map(\.tokens).max() ?? 0
         )
+
+        // 远端账号摘要仅用于补齐非 Token 元数据；一旦存在本机值，重新提升本机
+        // 口径，避免账号切换或慢响应把设备汇总覆盖回单账号数据。
+        if let localBuckets = localDailyBuckets {
+            mergeLocalDailyBuckets(
+                localBuckets,
+                promoteToDisplayedUsage: true,
+                reference: reference,
+                calendar: calendar
+            )
+        }
+        if let localTodayTokens {
+            mergeLocalTodayTokens(
+                localTodayTokens,
+                promoteToDisplayedUsage: true,
+                reference: reference,
+                calendar: calendar
+            )
+        }
+        if let localTotalTokens {
+            mergeLocalTotalTokens(
+                localTotalTokens,
+                promoteToDisplayedUsage: true,
+                reference: reference
+            )
+        }
+        if let localCurrentStreakDays {
+            mergeLocalStreak(
+                currentDays: localCurrentStreakDays,
+                longestDays: localLongestStreakDays ?? localCurrentStreakDays,
+                promoteToDisplayedUsage: true,
+                reference: reference
+            )
+        }
+    }
+
+    /// 清理旧版本留下的混合口径缓存。本机今日与本机累计都存在时，两者天然属于
+    /// 同一设备口径；只有完全没有本机来源时才沿用旧的账号摘要校验。
+    mutating func discardImpossibleTodayUsage(
+        reference: Date = Date(),
+        calendar: Calendar = .current
+    ) {
+        if let localTotalTokens {
+            totalTokens = localTotalTokens
+        }
+        if let localTodayTokens {
+            todayTokens = localTodayTokens
+        }
+        if localTotalTokens != nil { return }
+        if localTodayTokens != nil {
+            if let todayTokens, let totalTokens, todayTokens > totalTokens {
+                self.totalTokens = nil
+            }
+            return
+        }
+        guard let todayTokens, let totalTokens, todayTokens > totalTokens else { return }
+        let todayKey = Self.dayFormatter(calendar: calendar).string(from: reference)
+        self.todayTokens = nil
+        dailyBuckets.removeAll { Self.normalizeDay($0.dateString) == todayKey }
+        dailyBuckets = filledLast7Days(reference: reference, calendar: calendar)
+        last7DaysTokens = dailyBuckets.reduce(0) { $0 + $1.tokens }
+        tokenVelocityPerMinute = nil
     }
 
     static func dayFormatter(calendar: Calendar = .current) -> DateFormatter {
@@ -243,6 +443,60 @@ struct UsageStats: Codable, Equatable, Sendable {
             if prefix.contains("-") { return prefix }
         }
         return s
+    }
+}
+
+struct LocalUsageStreakSummary: Equatable, Sendable {
+    var currentDays: Int
+    var longestDays: Int
+
+    static func calculate(
+        activeDayKeys: Set<String>,
+        reference: Date = Date(),
+        calendar: Calendar = .current
+    ) -> LocalUsageStreakSummary {
+        let formatter = UsageStats.dayFormatter(calendar: calendar)
+        let normalizedDays = Set(activeDayKeys.map(UsageStats.normalizeDay))
+        let activeDates = normalizedDays.compactMap(formatter.date(from:)).sorted()
+        guard !activeDates.isEmpty else {
+            return LocalUsageStreakSummary(currentDays: 0, longestDays: 0)
+        }
+
+        var longest = 1
+        var run = 1
+        for index in activeDates.indices.dropFirst() {
+            let previous = activeDates[activeDates.index(before: index)]
+            let current = activeDates[index]
+            if calendar.dateComponents([.day], from: previous, to: current).day == 1 {
+                run += 1
+                longest = max(longest, run)
+            } else {
+                run = 1
+            }
+        }
+
+        let today = calendar.startOfDay(for: reference)
+        let todayKey = formatter.string(from: today)
+        let yesterday = calendar.date(byAdding: .day, value: -1, to: today)
+        let anchor: Date?
+        if normalizedDays.contains(todayKey) {
+            anchor = today
+        } else if let yesterday,
+                  normalizedDays.contains(formatter.string(from: yesterday)) {
+            // 零点后尚未开始工作时保留截至昨天的连续记录。
+            anchor = yesterday
+        } else {
+            anchor = nil
+        }
+
+        var currentDays = 0
+        var cursor = anchor
+        while let day = cursor,
+              normalizedDays.contains(formatter.string(from: day)) {
+            currentDays += 1
+            cursor = calendar.date(byAdding: .day, value: -1, to: day)
+        }
+        return LocalUsageStreakSummary(currentDays: currentDays, longestDays: longest)
     }
 }
 

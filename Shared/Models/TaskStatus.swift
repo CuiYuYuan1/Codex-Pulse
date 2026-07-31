@@ -170,6 +170,11 @@ struct TaskRecord: Codable, Identifiable, Equatable, Sendable {
     var startedAt: Date? = nil
     /// 本机会话监听提取出的当前 turn 可见对话，不写入历史导出时可保持 nil。
     var conversation: [TaskConversationMessage]? = nil
+    /// 当前 turn 的推理强度（low / medium / high / xhigh / max）。
+    var reasoningEffort: String? = nil
+    /// 最近一次 token_count 事件的单次用量。仅本地 session 通道提供，
+    /// 用于避免交错累计流造成实时 Token 重复增长。
+    var lastTokenUsage: Int64? = nil
 
     var indicatorColor: PulseStatusColor {
         if let runState { return runState.indicatorColor }

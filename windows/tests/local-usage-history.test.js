@@ -13,12 +13,18 @@ function loadUsageFunctions() {
   const testExports = `
     module.exports = {
       dayKey,
+      calculateLocalUsageStreak,
       mergeLocalDailyUsage,
       mergeLocalTodayUsage,
+      mergeLocalTotalUsage,
       mergeLocalSessionFallback,
+      deviceLocalUsageSnapshot,
       millisecondsUntilNextLocalDay,
       parseSessionDailyTokenText,
       parseSessionTodayTokenText,
+      parseSessionAllTimeTokenText,
+      estimatedAPICost,
+      tokenPriceForModel,
       estimateTextTokens,
       unionShapeBounds,
       clampWindowPositionToVisibleShape,
@@ -79,18 +85,86 @@ function localTime(year, month, day, hour = 0, minute = 0, second = 0) {
   return new Date(year, month - 1, day, hour, minute, second, 0);
 }
 
-function tokenEvent(date, tokens) {
+function tokenEvent(date, tokens, lastTokens = null, components = null) {
+  const info = { total_token_usage: { total_tokens: tokens } };
+  if (lastTokens !== null) {
+    info.last_token_usage = {
+      total_tokens: lastTokens,
+      ...(components ? {
+        input_tokens: components.input,
+        cached_input_tokens: components.cached,
+        output_tokens: components.output
+      } : {})
+    };
+  }
   return JSON.stringify({
     timestamp: date.toISOString(),
     type: "event_msg",
     payload: {
       type: "token_count",
-      info: { total_token_usage: { total_tokens: tokens } }
+      info
+    }
+  });
+}
+
+function turnContext(date, model) {
+  return JSON.stringify({
+    timestamp: date.toISOString(),
+    type: "turn_context",
+    payload: { model }
+  });
+}
+
+function subagentSessionMeta(date, id = "child-session") {
+  return JSON.stringify({
+    timestamp: date.toISOString(),
+    type: "session_meta",
+    payload: {
+      id,
+      source: {
+        subagent: {
+          thread_spawn: {
+            parent_thread_id: "parent-session",
+            depth: 1
+          }
+        }
+      }
     }
   });
 }
 
 const usage = loadUsageFunctions();
+const streak = usage.calculateLocalUsageStreak(
+  new Set([
+    usage.dayKey(localTime(2026, 7, 2)),
+    usage.dayKey(localTime(2026, 7, 3)),
+    usage.dayKey(localTime(2026, 7, 8)),
+    usage.dayKey(localTime(2026, 7, 9)),
+    usage.dayKey(localTime(2026, 7, 10)),
+    usage.dayKey(localTime(2026, 7, 11)),
+    usage.dayKey(localTime(2026, 7, 12)),
+    usage.dayKey(localTime(2026, 7, 13)),
+    usage.dayKey(localTime(2026, 7, 14))
+  ]),
+  localTime(2026, 7, 14, 12)
+);
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(streak)),
+  { currentDays: 7, longestDays: 7 },
+  "device streak must use all local session days rather than the seven-day chart window"
+);
+const beforeFirstUseToday = usage.calculateLocalUsageStreak(
+  new Set([
+    usage.dayKey(localTime(2026, 7, 12)),
+    usage.dayKey(localTime(2026, 7, 13))
+  ]),
+  localTime(2026, 7, 14, 0, 1)
+);
+assert.strictEqual(
+  beforeFirstUseToday.currentDays,
+  2,
+  "the local streak should remain visible after midnight until today's first session"
+);
 assert.strictEqual(usage.normalizedVersion("v0.1.24"), "0.1.24");
 assert.strictEqual(usage.isVersionNewer("0.1.24", "0.1.23"), true);
 assert.strictEqual(usage.isVersionNewer("0.1.23", "0.1.23"), false);
@@ -139,6 +213,104 @@ assert.strictEqual(
   "today parser should subtract the latest pre-day counter"
 );
 assert.strictEqual(parsed.estimated, false, "native token_count must remain exact");
+const allTime = usage.parseSessionAllTimeTokenText([
+  tokenEvent(localTime(2026, 7, 12, 9), 100),
+  tokenEvent(localTime(2026, 7, 12, 10), 160),
+  tokenEvent(localTime(2026, 7, 13, 9), 10),
+  tokenEvent(localTime(2026, 7, 13, 10), 40)
+].join("\n"));
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(allTime)),
+  { tokens: 200, estimated: false },
+  "lifetime parser must sum positive deltas and restart after counter resets"
+);
+const interleavedFixture = [
+  tokenEvent(localTime(2026, 7, 14, 9), 100, 100),
+  tokenEvent(localTime(2026, 7, 14, 10), 160, 60),
+  tokenEvent(localTime(2026, 7, 14, 11), 20, 20),
+  tokenEvent(localTime(2026, 7, 14, 12), 220, 60),
+  tokenEvent(localTime(2026, 7, 14, 12), 220, 60)
+].join("\n");
+const interleavedDaily = usage.parseSessionDailyTokenText(
+  interleavedFixture,
+  localTime(2026, 7, 14).getTime(),
+  end.getTime()
+);
+assert.strictEqual(
+  interleavedDaily.get(usage.dayKey(localTime(2026, 7, 14))),
+  240,
+  "interleaved cumulative streams must use per-event last usage and ignore duplicates"
+);
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(usage.parseSessionAllTimeTokenText(interleavedFixture))),
+  { tokens: 240, estimated: false },
+  "lifetime aggregation must not count cumulative stream switches as Token usage"
+);
+
+const cacheFixture = [
+  turnContext(localTime(2026, 7, 14, 8, 59), "gpt-5.6-terra"),
+  tokenEvent(
+    localTime(2026, 7, 14, 9),
+    110_000,
+    110_000,
+    { input: 100_000, cached: 80_000, output: 10_000 }
+  )
+].join("\n");
+const cacheDaily = usage.parseSessionDailyTokenText(
+  cacheFixture,
+  localTime(2026, 7, 14).getTime(),
+  end.getTime()
+);
+assert.strictEqual(cacheDaily.breakdown.inputTokens, 100_000);
+assert.strictEqual(cacheDaily.breakdown.cachedInputTokens, 80_000);
+assert.strictEqual(cacheDaily.breakdown.outputTokens, 10_000);
+assert(Math.abs(cacheDaily.breakdown.estimatedCostUSD - 0.22) < 0.000001);
+assert(Math.abs(cacheDaily.breakdown.uncachedInputCostUSD - 0.05) < 0.000001);
+assert(Math.abs(cacheDaily.breakdown.cachedInputCostUSD - 0.02) < 0.000001);
+assert(Math.abs(cacheDaily.breakdown.outputCostUSD - 0.15) < 0.000001);
+const cacheLifetime = usage.parseSessionAllTimeTokenText(cacheFixture);
+assert.strictEqual(cacheLifetime.tokens, 110_000);
+assert(
+  Math.abs(cacheLifetime.estimatedCostUSD - 0.22) < 0.000001,
+  "lifetime parser must accumulate model-aware API-equivalent cost"
+);
+
+const replayStart = localTime(2026, 7, 14, 14);
+const replayedSubagentFixture = [
+  subagentSessionMeta(replayStart),
+  ...Array.from({ length: 8 }, (_, index) => tokenEvent(
+    new Date(replayStart.getTime() + index + 1),
+    (index + 1) * 100,
+    100
+  )),
+  tokenEvent(new Date(replayStart.getTime() + 10_000), 900, 100)
+].join("\n");
+const replayedSubagentDaily = usage.parseSessionDailyTokenText(
+  replayedSubagentFixture,
+  localTime(2026, 7, 14).getTime(),
+  end.getTime()
+);
+assert.strictEqual(
+  replayedSubagentDaily.get(usage.dayKey(replayStart)),
+  100,
+  "forked subagent history replay must not be counted again as today's usage"
+);
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(usage.parseSessionAllTimeTokenText(replayedSubagentFixture))),
+  { tokens: 100, estimated: false },
+  "forked subagent history replay must not inflate lifetime usage"
+);
+
+const quickSubagentFixture = [
+  subagentSessionMeta(replayStart, "quick-child-session"),
+  tokenEvent(new Date(replayStart.getTime() + 100), 100, 100),
+  tokenEvent(new Date(replayStart.getTime() + 200), 200, 100)
+].join("\n");
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(usage.parseSessionAllTimeTokenText(quickSubagentFixture))),
+  { tokens: 200, estimated: false },
+  "a normal fast subagent response must not be mistaken for inherited replay"
+);
 
 const providerUsageFixture = [
   JSON.stringify({
@@ -229,12 +401,48 @@ const remote = {
 };
 const merged = usage.mergeLocalDailyUsage(remote, localDaily, localTime(2026, 7, 14, 12));
 const mergedByDate = new Map(merged.daily.map((bucket) => [bucket.date, bucket.tokens]));
-assert.strictEqual(mergedByDate.get(usage.dayKey(localTime(2026, 7, 12))), 150, "remote bucket must not be double-counted");
+assert.strictEqual(mergedByDate.get(usage.dayKey(localTime(2026, 7, 12))), 120, "device bucket must replace account history");
 assert.strictEqual(mergedByDate.get(usage.dayKey(localTime(2026, 7, 13))), 120);
 assert.strictEqual(mergedByDate.get(usage.dayKey(localTime(2026, 7, 14))), 50);
 assert.strictEqual(merged.today, 50);
 assert.strictEqual(merged.total, 999, "local 7-day total must not overwrite lifetime total");
 assert.strictEqual(merged.localSevenDayTokens, 290);
+const mergedTotal = usage.mergeLocalTotalUsage(merged, {
+  tokens: 12_345,
+  estimated: false,
+  estimatedCostUSD: 286.42,
+  streakDays: 7,
+  longestStreakDays: 12
+});
+assert.strictEqual(mergedTotal.total, 12_345, "all local sessions must replace the account lifetime summary");
+assert.strictEqual(mergedTotal.localTotal, 12_345);
+assert.strictEqual(mergedTotal.localTotalEstimatedCostUSD, 286.42);
+assert.strictEqual(mergedTotal.streakDays, 7, "the displayed streak must come from local sessions");
+assert.strictEqual(mergedTotal.localLongestStreakDays, 12);
+
+const correctedInflatedToday = usage.mergeLocalTodayUsage(
+  {
+    today: 2_400_000_000,
+    localToday: 2_400_000_000,
+    daily: [{ date: usage.dayKey(localTime(2026, 7, 14)), tokens: 2_400_000_000 }]
+  },
+  { tokens: 210_000_000, estimated: false },
+  localTime(2026, 7, 14, 12)
+);
+assert.strictEqual(
+  correctedInflatedToday.today,
+  210_000_000,
+  "an authoritative rescan must be able to correct an inflated persisted today value"
+);
+const correctedInflatedTotal = usage.mergeLocalTotalUsage(
+  { total: 24_000_000_000, localTotal: 24_000_000_000 },
+  { tokens: 7_500_000_000, estimated: false }
+);
+assert.strictEqual(
+  correctedInflatedTotal.total,
+  7_500_000_000,
+  "an authoritative rescan must be able to correct an inflated persisted lifetime value"
+);
 
 const newDay = localTime(2026, 7, 15, 0, 0);
 const stalePreviousDay = {
@@ -263,32 +471,47 @@ assert(boundaryDelay >= 1_000 && boundaryDelay <= 1_500, "midnight timer must ta
 assert.strictEqual(merged.localDailyAvailable, true);
 
 const remoteFailureDate = localTime(2026, 7, 14, 12);
+usage.setAccount("ChatGPT", "account@example.com");
 const remoteFailureFallback = usage.mergeLocalSessionFallback(
   { today: 0, total: 0, daily: [] },
   { tokens: 4321, estimated: false },
   [{ date: usage.dayKey(remoteFailureDate), tokens: 4321, estimated: false }],
+  { tokens: 98_765, estimated: false },
   remoteFailureDate
 );
-assert.strictEqual(remoteFailureFallback.today, 4321, "remote failure must promote local session today usage");
+assert.strictEqual(remoteFailureFallback.today, 4321, "ChatGPT must use the device-wide today value");
+assert.strictEqual(remoteFailureFallback.localToday, 4321);
+assert.strictEqual(remoteFailureFallback.total, 98_765, "ChatGPT must use the device-wide lifetime value");
 assert.strictEqual(remoteFailureFallback.localSessionFallback, true, "remote failure must mark local fallback source");
 assert(
-  remoteFailureFallback.sourceNote.includes("本机 Codex session"),
-  "remote failure must explain the local session source"
+  remoteFailureFallback.sourceNote.includes("所有账号"),
+  "the source note must explain the cross-account device scope"
 );
 
 usage.setAccount("API Key");
 assert.strictEqual(usage.shouldPromoteLocalTodayUsage(), true);
 assert.strictEqual(usage.shouldPromoteLocalDailyUsage(), true);
+const apiFailureFallback = usage.mergeLocalSessionFallback(
+  { today: 0, total: 0, daily: [] },
+  { tokens: 4321, estimated: false },
+  [{ date: usage.dayKey(remoteFailureDate), tokens: 4321, estimated: false }],
+  { tokens: 98_765, estimated: false },
+  remoteFailureDate
+);
+assert.strictEqual(apiFailureFallback.today, 4321, "API Key fallback must promote local session usage");
 usage.setAccount("ChatGPT", "first@example.com");
 assert.strictEqual(usage.shouldPromoteLocalTodayUsage(), true);
-assert.strictEqual(usage.shouldPromoteLocalDailyUsage(), false, "ChatGPT history must remain server-scoped");
+assert.strictEqual(usage.shouldPromoteLocalDailyUsage(), true, "ChatGPT history must use device sessions");
+const beforeSwitch = usage.deviceLocalUsageSnapshot(remoteFailureFallback, remoteFailureDate);
 usage.setAccount("ChatGPT", "second@example.com");
-assert.strictEqual(usage.shouldPromoteLocalTodayUsage(), true, "account switch must keep device-wide today usage live");
+assert.strictEqual(usage.shouldPromoteLocalTodayUsage(), true);
+assert.strictEqual(beforeSwitch.today, 4321, "account switch must preserve device-wide today");
+assert.strictEqual(beforeSwitch.total, 98_765, "account switch must preserve device-wide lifetime");
 usage.setProvider("deepseek");
 assert.strictEqual(usage.shouldPromoteLocalTodayUsage(), true, "custom providers must enable local today usage");
 assert.strictEqual(usage.shouldPromoteLocalDailyUsage(), true, "custom providers must enable local history even with ChatGPT login");
 usage.setProvider("openai");
-assert.strictEqual(usage.shouldPromoteLocalDailyUsage(), false, "native OpenAI ChatGPT history remains server-scoped");
+assert.strictEqual(usage.shouldPromoteLocalDailyUsage(), true, "native OpenAI ChatGPT history remains device-scoped");
 
 const visibleShape = usage.unionShapeBounds([
   { x: 72, y: 6, width: 246, height: 86 },

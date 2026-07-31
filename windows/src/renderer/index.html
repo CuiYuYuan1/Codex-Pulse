@@ -12,29 +12,115 @@
     <section id="codexDock" class="codex-dock" hidden aria-label="CodexPulse Codex 吸附信息栏">
       <button class="codex-dock-metric" type="button" data-metric="quota" aria-label="可用额度">
         <span class="codex-dock-icon quota" aria-hidden="true"></span>
-        <span id="codexDockQuota" class="codex-dock-value">—</span>
+        <span class="codex-dock-value-line">
+          <span id="codexDockQuota" class="codex-dock-value">—</span>
+          <span id="codexDockTaskCount" class="codex-dock-task-count" hidden aria-label="执行中任务数"></span>
+        </span>
         <small>可用额度</small>
       </button>
-      <button class="codex-dock-metric" type="button" data-metric="tokens" aria-label="已使用 Token">
+      <button class="codex-dock-metric" type="button" data-metric="tokens" aria-label="今日 Token">
         <span class="codex-dock-icon tokens" aria-hidden="true"></span>
         <span id="codexDockTokens" class="codex-dock-value">—</span>
-        <small>已使用 Token</small>
+        <small>今日 Token</small>
       </button>
-      <button class="codex-dock-metric" type="button" data-metric="reset" aria-label="重置时间">
-        <span class="codex-dock-icon reset" aria-hidden="true"></span>
-        <span id="codexDockReset" class="codex-dock-value">—</span>
-        <small>重置时间</small>
+      <button class="codex-dock-metric" type="button" data-metric="cacheHit" aria-label="缓存命中率">
+        <span class="codex-dock-icon cache-hit" aria-hidden="true"></span>
+        <span id="codexDockCacheHit" class="codex-dock-value">—</span>
+        <small>缓存命中率</small>
       </button>
-      <button class="codex-dock-metric" type="button" data-metric="weather" aria-label="天气">
-        <span class="codex-dock-icon weather" aria-hidden="true"></span>
-        <span id="codexDockWeather" class="codex-dock-value">—</span>
-        <small>天气</small>
+      <button class="codex-dock-metric" type="button" data-metric="cost" aria-label="成本">
+        <span class="codex-dock-icon cost" aria-hidden="true"></span>
+        <span id="codexDockCost" class="codex-dock-value">—</span>
+        <small>成本</small>
       </button>
-      <button class="codex-dock-metric" type="button" data-metric="time" aria-label="当前时间">
-        <span class="codex-dock-icon time" aria-hidden="true"></span>
-        <span id="codexDockTime" class="codex-dock-value">--:--</span>
-        <small>当前时间</small>
+      <button class="codex-dock-metric codex-dock-trend-metric" type="button" data-metric="trend" aria-label="近 7 日 Token 使用趋势">
+        <span class="codex-dock-icon trend" aria-hidden="true"></span>
+        <span class="codex-dock-trend-summary">
+          <svg class="codex-dock-sparkline compact" viewBox="0 0 100 24" preserveAspectRatio="none" aria-hidden="true">
+            <path id="codexDockTrendArea" class="codex-dock-trend-area"></path>
+            <polyline id="codexDockTrendLine" class="codex-dock-trend-line"></polyline>
+          </svg>
+          <span id="codexDockTrendTotal" class="codex-dock-value">—</span>
+        </span>
+        <small>近 7 日 Token</small>
       </button>
+      <div id="codexDockFocus" class="codex-dock-focus" hidden data-dock-metric="" aria-live="polite">
+        <section class="codex-dock-focus-panel" data-focus-panel="quota" hidden>
+          <span class="codex-dock-focus-cell codex-dock-focus-lead">
+            <span class="codex-dock-icon quota" aria-hidden="true"></span>
+            <span class="codex-dock-focus-label">可用额度</span>
+            <strong id="codexDockFocusQuota" class="codex-dock-focus-primary">—</strong>
+          </span>
+          <span class="codex-dock-focus-cell codex-dock-focus-progress-cell">
+            <span class="codex-dock-focus-progress" aria-hidden="true">
+              <span id="codexDockFocusQuotaFill"></span>
+            </span>
+          </span>
+          <span id="codexDockFocusQuotaReset" class="codex-dock-focus-cell codex-dock-focus-detail">重置 —</span>
+          <span id="codexDockFocusTaskCount" class="codex-dock-focus-cell codex-dock-focus-task-count" hidden></span>
+          <span id="codexDockQuotaCards" class="codex-dock-focus-cell codex-dock-card-pager" hidden>
+            <span id="codexDockQuotaCardCount" class="codex-dock-card-count"></span>
+            <button id="codexDockCardPrevious" class="codex-dock-control codex-dock-card-arrow" type="button" aria-label="上一张重置卡">‹</button>
+            <span id="codexDockCardTitle" class="codex-dock-card-title">Full reset</span>
+            <span id="codexDockCardExpiry" class="codex-dock-card-expiry">—</span>
+            <button id="codexDockCardOpen" class="codex-dock-control codex-dock-card-open" type="button">前往使用 ↗</button>
+            <span id="codexDockCardPage" class="codex-dock-card-page">1/1</span>
+            <button id="codexDockCardNext" class="codex-dock-control codex-dock-card-arrow" type="button" aria-label="下一张重置卡">›</button>
+          </span>
+        </section>
+        <section class="codex-dock-focus-panel" data-focus-panel="tokens" hidden>
+          <span class="codex-dock-focus-cell codex-dock-focus-lead">
+            <span class="codex-dock-icon tokens" aria-hidden="true"></span>
+            <span id="codexDockTokenStatus" class="codex-dock-focus-label">今日 Token</span>
+            <strong id="codexDockFocusTokens" class="codex-dock-focus-primary">—</strong>
+          </span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">缓存命中率 <strong id="codexDockTokenCacheHit">—</strong></span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">成本 <strong id="codexDockTokenCost">—</strong></span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">编程 IQ <strong id="codexDockTokenProgrammingIQ">—</strong></span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">累计 <strong id="codexDockTokenTotal">—</strong></span>
+        </section>
+        <section class="codex-dock-focus-panel" data-focus-panel="cacheHit" hidden>
+          <span class="codex-dock-focus-cell codex-dock-focus-lead">
+            <span class="codex-dock-icon cache-hit" aria-hidden="true"></span>
+            <span class="codex-dock-focus-label">缓存命中率</span>
+            <strong id="codexDockFocusCacheHit" class="codex-dock-focus-primary">—</strong>
+          </span>
+          <span class="codex-dock-focus-cell codex-dock-focus-progress-cell">
+            <span class="codex-dock-focus-progress cache-hit" aria-hidden="true">
+              <span id="codexDockFocusCacheHitFill"></span>
+            </span>
+          </span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">缓存输入 <strong id="codexDockCacheTokens">—</strong></span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">未缓存 <strong id="codexDockUncachedTokens">—</strong></span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">总输入 <strong id="codexDockInputTokens">—</strong></span>
+        </section>
+        <section class="codex-dock-focus-panel" data-focus-panel="cost" hidden>
+          <span class="codex-dock-focus-cell codex-dock-focus-lead">
+            <span class="codex-dock-icon cost" aria-hidden="true"></span>
+            <span class="codex-dock-focus-label">今日成本</span>
+            <strong id="codexDockFocusCost" class="codex-dock-focus-primary">—</strong>
+          </span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">未缓存输入 <strong id="codexDockUncachedCost">—</strong></span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">缓存输入 <strong id="codexDockCachedCost">—</strong></span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">输出 <strong id="codexDockOutputCost">—</strong></span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail"><strong>API 等价估算</strong></span>
+        </section>
+        <section class="codex-dock-focus-panel" data-focus-panel="trend" hidden>
+          <span class="codex-dock-focus-cell codex-dock-focus-lead">
+            <span class="codex-dock-icon trend" aria-hidden="true"></span>
+            <span class="codex-dock-focus-label">近 7 日 Token</span>
+            <strong id="codexDockFocusTrendTotal" class="codex-dock-focus-primary">—</strong>
+          </span>
+          <span class="codex-dock-focus-cell codex-dock-focus-trend-chart">
+            <svg class="codex-dock-sparkline focus" viewBox="0 0 100 24" preserveAspectRatio="none" aria-hidden="true">
+              <path id="codexDockFocusTrendArea" class="codex-dock-trend-area"></path>
+              <polyline id="codexDockFocusTrendLine" class="codex-dock-trend-line"></polyline>
+            </svg>
+          </span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">今日 <strong id="codexDockFocusTrendToday">—</strong></span>
+          <span class="codex-dock-focus-cell codex-dock-focus-detail">峰值 <strong id="codexDockFocusTrendPeak">—</strong></span>
+        </section>
+      </div>
       <span class="codex-dock-detach-hint" aria-hidden="true">上下拖出</span>
     </section>
 
@@ -293,10 +379,19 @@
         <canvas id="tokenChart" width="304" height="130" aria-label="近 7 日 Token 图表"></canvas>
       </div>
 
-      <div class="metrics-row">
-        <div><strong id="todayDetail">—</strong><small>今日</small></div>
-        <div><strong id="totalTokens">—</strong><small id="totalMetricLabel">累计</small></div>
-        <div><strong id="taskElapsed">—</strong><small id="taskMetricLabel">在线天数</small></div>
+      <div class="metrics-summary">
+        <div class="metrics-row">
+          <div><strong id="todayDetail">—</strong><small>今日 Token</small></div>
+          <div><strong id="totalTokens">—</strong><small id="totalMetricLabel">累计 Token</small></div>
+          <div><strong id="cachedTokensDetail">—</strong><small>缓存 Token</small></div>
+          <div><strong id="uncachedTokensDetail">—</strong><small>未缓存 Token</small></div>
+        </div>
+        <div class="metrics-row">
+          <div><strong id="cacheHitDetail">—</strong><small>缓存命中率</small></div>
+          <div><strong id="todayCostDetail">—</strong><small>成本</small></div>
+          <div><strong id="totalCostDetail">—</strong><small>累计成本</small></div>
+          <div><strong id="taskElapsed">—</strong><small id="taskMetricLabel">在线天数</small></div>
+        </div>
       </div>
 
       <footer class="footer-row">
@@ -347,6 +442,7 @@
   <script src="cat-rig.js"></script>
   <script src="black-hole-pet.js"></script>
   <script src="dock-interaction.js"></script>
+  <script src="dock-metrics.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

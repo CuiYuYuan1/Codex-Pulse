@@ -72,6 +72,10 @@ final class MockCodexAppServerClient: CodexAppServerClient, @unchecked Sendable 
         cached.hasAnyTokenMetric ? cached : makeUsage()
     }
 
+    func readRealtimeLocalUsage(merging cached: UsageStats) async -> UsageStats {
+        cached.hasAnyTokenMetric ? cached : makeUsage()
+    }
+
     func invalidateAccountScopedState() {}
 
     func listRecentThreads(limit: Int) async throws -> [TaskRecord] {

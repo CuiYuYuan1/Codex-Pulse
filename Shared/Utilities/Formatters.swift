@@ -3,6 +3,12 @@ import Foundation
 enum PulseFormatters {
     static func tokens(_ value: Int64?) -> String {
         guard let value else { return "—" }
+        if value >= 1_000_000_000_000 {
+            return String(format: "%.1fT", Double(value) / 1_000_000_000_000)
+        }
+        if value >= 1_000_000_000 {
+            return String(format: "%.1fB", Double(value) / 1_000_000_000)
+        }
         if value >= 1_000_000 {
             return String(format: "%.1fM", Double(value) / 1_000_000)
         }
@@ -16,6 +22,9 @@ enum PulseFormatters {
     /// 详情数据中保留，避免百万级用量把主胶囊撑得过宽。
     static func liveTokens(_ value: Int64?) -> String {
         guard let value else { return "—" }
+        if value >= 1_000_000_000_000 {
+            return String(format: "%.1fT", Double(value) / 1_000_000_000_000)
+        }
         if value >= 1_000_000_000 {
             return String(format: "%.1fB", Double(value) / 1_000_000_000)
         }

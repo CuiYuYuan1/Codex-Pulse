@@ -4,6 +4,8 @@ const assert = require("assert");
 const {
   attachedDockShape,
   detachedWindowBounds,
+  fullscreenTopDockFrame,
+  isFullscreenWindowBounds,
   mediaSourceIdForWindowHandle,
   normalizeTrackedWindowBounds,
   visibleWindowBounds,
@@ -20,6 +22,40 @@ assert.deepStrictEqual(
   attachedDockShape(900, 60, "top", 16),
   { x: 0, y: 0, width: 900, height: 44 },
   "top dock must exclude the native overlap strip"
+);
+
+assert.strictEqual(
+  isFullscreenWindowBounds(
+    { x: 0, y: 0, width: 1920, height: 1080 },
+    { x: 0, y: 0, width: 1920, height: 1080 }
+  ),
+  true,
+  "a display-filling Codex window must enter the dedicated full-screen dock mode"
+);
+
+assert.strictEqual(
+  isFullscreenWindowBounds(
+    { x: 120, y: 80, width: 1500, height: 900 },
+    { x: 0, y: 0, width: 1920, height: 1080 }
+  ),
+  false,
+  "ordinary maximized or floating Codex windows must keep their chosen dock edge"
+);
+
+assert.deepStrictEqual(
+  fullscreenTopDockFrame(
+    { x: 0, y: 0, width: 1920, height: 1080 }
+  ),
+  { x: 519, y: 24, width: 883, height: 60 },
+  "full-screen dock must be centered below the title bar at the approved 46% ratio"
+);
+
+assert.deepStrictEqual(
+  fullscreenTopDockFrame(
+    { x: 50, y: 20, width: 1366, height: 768 }
+  ),
+  { x: 419, y: 44, width: 628, height: 60 },
+  "full-screen dock width must adapt proportionally to the Codex window"
 );
 
 assert.deepStrictEqual(

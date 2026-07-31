@@ -61,9 +61,19 @@ final class PulseStore {
     /// 账号通知到达时递增；旧刷新即使稍后返回也不能覆盖新账号的空态/数据。
     private var accountRevision = 0
     private var isAccountTransitioning = false
+    /// 当前账号必须经过 account/read 确认后，额度通知和轻量轮询才有资格写入。
+    /// 它与 accountRevision 配对，彻底隔离切号前已经在途的响应。
+    private var confirmedAccountRevision: Int?
+    private var authenticationReconnectTask: Task<Void, Never>?
+    private var authenticationReconnectRequested = false
+    private var accountTransitionRecoveryTask: Task<Void, Never>?
     private var postTurnRefreshTask: Task<Void, Never>?
     private var localUsageRefreshTask: Task<Void, Never>?
     private var localUsageRefreshRevision = 0
+    /// 本地 session 额度只用于覆盖已经由当前账号远端确认过的桶。
+    /// 单独保存已接受的桶，防止慢 RPC 完成后把更新的本地百分比写回旧值。
+    private var latestLocalRateLimitObservation: RateLimitSnapshot?
+    private var lastLocalRateLimitEventAt: Date = .distantPast
     private var reconnectTask: Task<Void, Never>?
     private var reconnectRecoveryID: UUID?
     private var startupDataRecoveryTask: Task<Void, Never>?
@@ -84,6 +94,9 @@ final class PulseStore {
     private var lastActiveTaskEvidenceAt: Date?
     /// 各线程最近一次推送的累计 Token（thread/tokenUsage/updated 是累计值）。
     private var threadTokenTotals: [String: Int64] = [:]
+    /// 与线程累计值配对的采样时间，用于直接计算当前任务的实时消耗速度。
+    private var threadTokenSampleTimes: [String: Date] = [:]
+    private var lastRealtimeVelocityAt: Date?
     /// 当前所属自然日（yyyy-MM-dd）；跨天时重置“今日”相关状态。
     private var currentDayKey = UsageStats.dayFormatter().string(from: Date())
     /// “今日 Token”采用这台机器当天全部 Codex session 的汇总。session 日志没有
@@ -116,7 +129,8 @@ final class PulseStore {
         didStart = true
         settings = SettingsStore.shared.load()
         didUseStartupRecoveryReconnect = false
-        if let cached = SnapshotStore.shared.load() {
+        if var cached = SnapshotStore.shared.load() {
+            cached.usage.discardImpossibleTodayUsage()
             snapshot = cached
             if cached.updatedAt != .distantPast {
                 currentDayKey = UsageStats.dayFormatter().string(from: cached.updatedAt)
@@ -155,6 +169,11 @@ final class PulseStore {
         localUsageRefreshTask?.cancel()
         localUsageRefreshTask = nil
         localUsageRefreshRevision &+= 1
+        latestLocalRateLimitObservation = nil
+        lastLocalRateLimitEventAt = .distantPast
+        authenticationReconnectTask?.cancel()
+        authenticationReconnectRequested = false
+        accountTransitionRecoveryTask?.cancel()
         reconnectTask?.cancel()
         startupDataRecoveryTask?.cancel()
         unhealthyRecoveryTask?.cancel()
@@ -163,6 +182,10 @@ final class PulseStore {
         rateLimitMonitorTask = nil
         dayRolloverTask = nil
         liveTaskStatusTask = nil
+        authenticationReconnectTask = nil
+        authenticationReconnectRequested = false
+        accountTransitionRecoveryTask = nil
+        confirmedAccountRevision = nil
         reconnectTask = nil
         reconnectRecoveryID = nil
         startupDataRecoveryTask = nil
@@ -171,6 +194,10 @@ final class PulseStore {
         unhealthyRecoveryID = nil
         criticalRecoveryEligibleServices.removeAll()
         locallyCompletedTaskAt.removeAll()
+        threadTokenTotals.removeAll()
+        threadTokenSampleTimes.removeAll()
+        smoothedTokenVelocity = nil
+        lastRealtimeVelocityAt = nil
         nextReconnectAt = nil
         let clientToStop = client
         client = nil
@@ -185,6 +212,8 @@ final class PulseStore {
     private func reconnectCore() async {
         cancelRealConnectionRecovery()
         cancelUnhealthyConnectionRecovery()
+        accountTransitionRecoveryTask?.cancel()
+        accountTransitionRecoveryTask = nil
         eventTask?.cancel()
         pollTask?.cancel()
         rateLimitMonitorTask?.cancel()
@@ -219,6 +248,7 @@ final class PulseStore {
             connectionDetail = "已连接 · \(cliPath ?? "codex")"
             lastError = nil
             markRealConnectionRestored()
+            await verifyAccountScopeBeforeInitialSync(using: stdio)
         } catch {
             let message = error.localizedDescription
             needsRealRecovery = true
@@ -266,6 +296,44 @@ final class PulseStore {
         scheduleStartupDataRecoveryIfNeeded()
         if needsRealRecovery {
             scheduleRealConnectionRecovery()
+        }
+    }
+
+    /// 新建 app-server 连接后先确认账号身份，再允许旧快照继续显示。
+    /// 这覆盖“应用关闭期间切号”的场景：文件监听只有基线、不会产生变更事件，
+    /// 但上一次账号的额度仍不能在新账号下短暂出现。
+    private func verifyAccountScopeBeforeInitialSync(
+        using monitoredClient: any CodexAppServerClient
+    ) async {
+        guard !isUsingMock, isCurrentClient(monitoredClient) else { return }
+        let revision = accountRevision
+
+        do {
+            let refreshedAccount = try await monitoredClient.readAccount()
+            guard didStart,
+                  isCurrentClient(monitoredClient),
+                  revision == accountRevision else { return }
+
+            let identityChanged = !sameAccountIdentity(snapshot.account, refreshedAccount)
+            if identityChanged, !isAccountTransitioning {
+                prepareForAccountTransition()
+            }
+
+            guard isCurrentClient(monitoredClient) else { return }
+            var next = snapshot
+            next.account = refreshedAccount
+            next.updatedAt = Date()
+            apply(next)
+            confirmedAccountRevision = accountRevision
+            recordSyncSuccess(.account)
+            PulseLog.write("account scope preflight confirmed: \(refreshedAccount.displayEmail)")
+        } catch {
+            guard didStart, isCurrentClient(monitoredClient) else { return }
+            // 无法确认当前账号时宁可显示同步中，也不能沿用磁盘中的上一个账号额度。
+            if confirmedAccountRevision != accountRevision, !isAccountTransitioning {
+                prepareForAccountTransition()
+            }
+            PulseLog.write("account scope preflight unavailable: \(error.localizedDescription)")
         }
     }
 
@@ -373,17 +441,23 @@ final class PulseStore {
             }
             if accountChanged {
                 isAccountTransitioning = true
+                confirmedAccountRevision = nil
                 client.invalidateAccountScopedState()
                 next.rateLimits = .empty
-                next.usage = .empty
+                next.usage = deviceLocalUsage(from: next.usage)
                 next.primaryRateLimitForecast = nil
                 primaryRateLimitForecast = nil
                 threadTokenTotals.removeAll()
+                threadTokenSampleTimes.removeAll()
                 smoothedTokenVelocity = nil
+                lastRealtimeVelocityAt = nil
+                latestLocalRateLimitObservation = nil
+                lastLocalRateLimitEventAt = .distantPast
                 notifiedThresholds.removeAll()
                 didRestoreNotifiedThresholds = false
-                PulseLog.write("account identity changed during refresh; old scoped data discarded")
+                PulseLog.write("account identity changed; quota cleared and device Token totals preserved")
             }
+            confirmedAccountRevision = refreshAccountRevision
             PulseLog.write("account ok: \(next.account.displayEmail) \(next.account.planType.displayName)")
         } catch {
             recordSyncFailure(
@@ -402,11 +476,29 @@ final class PulseStore {
         next.updatedAt = Date()
         apply(next)
 
+        // 切号后的 account/read 尚未成功时，不读取账号级额度，但本机 Token
+        // 与账号无关，可以继续刷新；旧 app-server 的账号响应仍然不能写回。
+        guard confirmedAccountRevision == refreshAccountRevision else {
+            var localUsage = await client.readLocalUsage(
+                merging: deviceLocalUsage(from: next.usage)
+            )
+            guard isCurrentClient(client),
+                  accountRevision == refreshAccountRevision,
+                  currentDayKey == refreshDayKey else { return }
+            promoteDeviceLocalUsage(&localUsage)
+            next.usage = localUsage
+            next.updatedAt = Date()
+            apply(next)
+            PulseLog.write("account scope not confirmed; refreshed device Token only")
+            return
+        }
+
         var shouldRefreshRemoteUsage = true
         do {
-            next.rateLimits = try await client.readRateLimits(
+            let remoteLimits = try await client.readRateLimits(
                 forceRefresh: forceRemote || accountChanged
             )
+            next.rateLimits = reconciledRemoteRateLimits(remoteLimits)
             recordSyncSuccess(.rateLimits)
             await updateRateLimitForecastOffMain(from: next.rateLimits)
             next.primaryRateLimitForecast = primaryRateLimitForecast
@@ -439,18 +531,11 @@ final class PulseStore {
                 // Token profile 与额度接口共享较重的远端拉取链路；额度完成后再请求 Token，
                 // 避免两个 profile 请求互相阻塞并同时触发客户端超时。
                 var usage = try await client.readUsage(forceRefresh: forceRemote || accountChanged)
-                if shouldPromoteLocalToday(
-                    usage: usage,
-                    currentAccount: next.account
-                ), let localToday = usage.localTodayTokens {
-                    usage.mergeLocalTodayTokens(localToday, promoteToAccountTotals: true)
-                }
-                if next.account.authMode == .apiKey,
-                   let localDaily = usage.localDailyBuckets {
-                    usage.mergeLocalDailyBuckets(localDaily, promoteToAccountTotals: true)
-                }
+                promoteDeviceLocalUsage(&usage)
                 if isSameAccount {
-                    usage.preserveMissingSummary(from: previous.usage)
+                    var cachedUsage = previous.usage
+                    cachedUsage.discardImpossibleTodayUsage()
+                    usage.preserveMissingSummary(from: cachedUsage)
                 }
                 applyTokenVelocity(to: &usage, previous: previous.usage, sameAccount: isSameAccount)
                 next.usage = usage
@@ -472,21 +557,11 @@ final class PulseStore {
                 recordSyncFailure(.usage, message: error.localizedDescription)
                 // usage 常对部分账号不可用，降级为次要提示；保留上次数据
                 PulseLog.write("usage fail: \(error.localizedDescription)")
-                // 即使远端 RPC 在客户端之外抛错，API Key 仍可从本机 session
-                // 日志得到今日总量；同账号 ChatGPT 也保留本机补源。
+                // 远端 RPC 失败不影响设备口径，今日与累计仍从本机 sessions 得到。
                 var fallback = await client.readLocalUsage(
-                    merging: isSameAccount ? previous.usage : .empty
+                    merging: isSameAccount ? previous.usage : deviceLocalUsage(from: previous.usage)
                 )
-                if shouldPromoteLocalToday(
-                    usage: fallback,
-                    currentAccount: next.account
-                ), let localToday = fallback.localTodayTokens {
-                    fallback.mergeLocalTodayTokens(localToday, promoteToAccountTotals: true)
-                }
-                if next.account.authMode == .apiKey,
-                   let localDaily = fallback.localDailyBuckets {
-                    fallback.mergeLocalDailyBuckets(localDaily, promoteToAccountTotals: true)
-                }
+                promoteDeviceLocalUsage(&fallback)
                 if fallback.hasAnyTokenMetric || next.usage.updatedAt == .distantPast || !next.usage.hasAnyTokenMetric {
                     fallback.sourceNote = fallback.sourceNote ?? "Token 统计暂不可用：\(error.localizedDescription)"
                     fallback.updatedAt = Date()
@@ -496,18 +571,11 @@ final class PulseStore {
                 smoothedTokenVelocity = nil
             }
         } else {
-            let cachedUsage = isSameAccount ? previous.usage : .empty
+            let cachedUsage = isSameAccount
+                ? previous.usage
+                : deviceLocalUsage(from: previous.usage)
             var usage = await client.readLocalUsage(merging: cachedUsage)
-            if shouldPromoteLocalToday(
-                usage: usage,
-                currentAccount: next.account
-            ), let localToday = usage.localTodayTokens {
-                usage.mergeLocalTodayTokens(localToday, promoteToAccountTotals: true)
-            }
-            if next.account.authMode == .apiKey,
-               let localDaily = usage.localDailyBuckets {
-                usage.mergeLocalDailyBuckets(localDaily, promoteToAccountTotals: true)
-            }
+            promoteDeviceLocalUsage(&usage)
             applyTokenVelocity(to: &usage, previous: previous.usage, sameAccount: isSameAccount)
             next.usage = usage
         }
@@ -523,6 +591,7 @@ final class PulseStore {
             next.currentTask = snapshot.currentTask
             next.recentTasks = snapshot.recentTasks
         }
+        next.rateLimits = preservingNewerRateLimits(next.rateLimits)
         next.connectionState = connectedStateForSyncHealth()
         next.updatedAt = Date()
         // 刷新期间设置可能被切换；以当前内存状态为准，避免旧快照覆盖新选择。
@@ -533,6 +602,9 @@ final class PulseStore {
         apply(next)
         if didRefreshAccount {
             isAccountTransitioning = false
+        }
+        if accountChanged {
+            scheduleAccountTransitionConfirmation(for: refreshAccountRevision)
         }
         evaluateAlerts(previous: previous, current: next)
 
@@ -939,6 +1011,7 @@ final class PulseStore {
         next.usage = usage
         next.updatedAt = reference
         smoothedTokenVelocity = nil
+        lastRealtimeVelocityAt = nil
         notifiedThresholds.removeAll()
         notifiedLongTaskIDs.removeAll()
         notifiedResetCardIDs.removeAll()
@@ -985,16 +1058,7 @@ final class PulseStore {
 
         var usage = await client.readLocalUsage(merging: snapshot.usage)
         guard didStart, isCurrentClient(client), currentDayKey == expectedDay else { return }
-        if shouldPromoteLocalToday(
-            usage: usage,
-            currentAccount: snapshot.account
-        ), let localToday = usage.localTodayTokens {
-            usage.mergeLocalTodayTokens(localToday, promoteToAccountTotals: true)
-        }
-        if snapshot.account.authMode == .apiKey,
-           let localDaily = usage.localDailyBuckets {
-            usage.mergeLocalDailyBuckets(localDaily, promoteToAccountTotals: true)
-        }
+        promoteDeviceLocalUsage(&usage)
 
         var next = snapshot
         next.usage = usage
@@ -1011,6 +1075,21 @@ final class PulseStore {
         previous: UsageStats,
         sameAccount: Bool
     ) {
+        if snapshot.account.authMode == .chatGPT {
+            let hasFreshRealtimeVelocity = lastRealtimeVelocityAt.map {
+                Date().timeIntervalSince($0) <= activeTaskEvidenceGraceInterval
+            } ?? false
+            if sameAccount, hasFreshRealtimeVelocity, hasActivelyRunningTask {
+                current.tokenVelocityPerMinute = current.tokenVelocityPerMinute
+                    ?? previous.tokenVelocityPerMinute
+                    ?? smoothedTokenVelocity.map { Int64(max(0, $0).rounded()) }
+            } else {
+                current.tokenVelocityPerMinute = nil
+                smoothedTokenVelocity = nil
+            }
+            return
+        }
+
         guard sameAccount,
               let previousLocal = previous.localTodayTokens,
               let currentLocal = current.localTodayTokens,
@@ -1053,8 +1132,8 @@ final class PulseStore {
             projectName: record.projectName,
             projectPath: record.projectPath,
             gitBranch: record.gitBranch,
-            model: record.model,
-            reasoningEffort: isSameTask ? existing.reasoningEffort : nil,
+            model: record.model ?? (isSameTask ? existing.model : nil),
+            reasoningEffort: record.reasoningEffort ?? (isSameTask ? existing.reasoningEffort : nil),
             startedAt: startedAt,
             state: state,
             currentStep: isSameTask ? existing.currentStep : nil,
@@ -1254,7 +1333,8 @@ final class PulseStore {
     }
 
     /// Session JSONL 是今日 Token 最直接的数据源。文件监听可能在一次响应中
-    /// 连续触发多次，120ms 防抖后只做本地增量读取，不等待额度/账户 RPC。
+    /// 连续触发多次，90ms 防抖后只读取当天 Token/缓存/成本，不等待额度、
+    /// 近 7 天、全历史或账户 RPC。
     private func scheduleLocalUsageRefresh() {
         localUsageRefreshTask?.cancel()
         localUsageRefreshRevision &+= 1
@@ -1265,7 +1345,7 @@ final class PulseStore {
 
         localUsageRefreshTask = Task { [weak self] in
             do {
-                try await Task.sleep(nanoseconds: 120_000_000)
+                try await Task.sleep(nanoseconds: 90_000_000)
             } catch {
                 return
             }
@@ -1274,25 +1354,18 @@ final class PulseStore {
                   self.didStart,
                   self.localUsageRefreshRevision == refreshRevision,
                   self.accountRevision == refreshAccountRevision,
+                  self.confirmedAccountRevision == refreshAccountRevision,
                   self.currentDayKey == refreshDayKey,
                   self.isCurrentClient(monitoredClient) else { return }
 
             let previous = self.snapshot
-            var usage = await monitoredClient.readLocalUsage(merging: previous.usage)
+            var usage = await monitoredClient.readRealtimeLocalUsage(merging: previous.usage)
             guard self.localUsageRefreshRevision == refreshRevision,
                   self.accountRevision == refreshAccountRevision,
+                  self.confirmedAccountRevision == refreshAccountRevision,
                   self.currentDayKey == refreshDayKey,
                   self.isCurrentClient(monitoredClient) else { return }
-            if self.shouldPromoteLocalToday(
-                usage: usage,
-                currentAccount: previous.account
-            ), let localToday = usage.localTodayTokens {
-                usage.mergeLocalTodayTokens(localToday, promoteToAccountTotals: true)
-            }
-            if previous.account.authMode == .apiKey,
-               let localDaily = usage.localDailyBuckets {
-                usage.mergeLocalDailyBuckets(localDaily, promoteToAccountTotals: true)
-            }
+            self.promoteDeviceLocalUsage(&usage)
             self.applyTokenVelocity(to: &usage, previous: previous.usage, sameAccount: true)
             guard usage != previous.usage else { return }
             var next = previous
@@ -1303,6 +1376,74 @@ final class PulseStore {
                 self.localUsageRefreshTask = nil
             }
         }
+    }
+
+    /// 活跃 Codex 进程会把本次响应附带的 rate_limits 写入 session JSONL。
+    /// 该值只更新当前账号已经由远端建立的桶，避免账号切换期间从历史会话自行建桶。
+    private func applyLocalRateLimitObservation(_ limits: RateLimitSnapshot) {
+        let observedAt = limits.updatedAt
+        guard observedAt != .distantPast, observedAt > lastLocalRateLimitEventAt else { return }
+
+        guard didStart,
+              !isAccountTransitioning,
+              confirmedAccountRevision == accountRevision,
+              snapshot.account.isLoggedIn,
+              snapshot.account.authMode == .chatGPT else {
+            return
+        }
+        lastLocalRateLimitEventAt = observedAt
+
+        // 启动时 session 文件事件可能比首次远端额度响应更早到达。先暂存，
+        // 等远端建立当前账号的桶后再按窗口和重置周期匹配，仍不允许本地自行建桶。
+        guard !snapshot.rateLimits.buckets.isEmpty else {
+            latestLocalRateLimitObservation = limits
+            return
+        }
+        guard let result = RateLimitFreshness.mergeLocal(
+            current: snapshot.rateLimits,
+            observation: limits
+        ) else {
+            return
+        }
+
+        latestLocalRateLimitObservation = result.acceptedObservation
+        let previous = snapshot
+        var next = previous
+        next.rateLimits = result.merged
+        next.updatedAt = Date()
+        apply(next)
+        evaluateAlerts(previous: previous, current: next)
+
+        let remaining = result.merged.primaryBucket.map {
+            String(format: "%.0f%%", $0.remainingPercent)
+        } ?? "—"
+        PulseLog.write("local session rateLimits applied: remaining=\(remaining)")
+    }
+
+    /// 若远端请求发起后又收到了本地 session 额度，慢响应不能把新百分比覆盖回旧值。
+    /// 一次在本地事件之后才发起、且返回了更新快照的远端请求则重新成为权威源。
+    private func reconciledRemoteRateLimits(_ remote: RateLimitSnapshot) -> RateLimitSnapshot {
+        guard let local = latestLocalRateLimitObservation else { return remote }
+        // App Server 会给刚完成的 RPC 写入一个新的 updatedAt，即使后端返回的
+        // usedPercent 仍来自旧缓存，因此不能拿响应时间判断数据一定更新。同一
+        // resetsAt 周期始终保持 usedPercent 单调递增；只有远端进入新周期或
+        // 返回更高用量时，下面的 merge 才会拒绝本地覆盖并恢复远端权威。
+        guard let result = RateLimitFreshness.mergeLocal(
+            current: remote,
+            observation: local
+        ) else {
+            // 远端已经进入更新的周期或百分比更高时，应恢复远端权威。
+            latestLocalRateLimitObservation = nil
+            return remote
+        }
+        return result.merged
+    }
+
+    /// refreshAll 在额度请求后还可能等待 usage；这段时间到达的事件必须保留下来。
+    private func preservingNewerRateLimits(_ candidate: RateLimitSnapshot) -> RateLimitSnapshot {
+        snapshot.rateLimits.updatedAt > candidate.updatedAt
+            ? snapshot.rateLimits
+            : candidate
     }
 
     private func listenEvents() {
@@ -1322,16 +1463,22 @@ final class PulseStore {
         switch event {
         case .accountUpdated:
             prepareForAccountTransition()
+            let revision = accountRevision
             await refreshAll(forceRemote: true)
+            scheduleAccountTransitionConfirmation(for: revision)
 
         case .authenticationChanged:
             PulseLog.write("authentication change detected; rebuilding app-server connection")
+            prepareForAccountTransition()
             connectionDetail = "正在应用新的登录账号…"
-            await reconnectCore()
+            // 当前回调运行在 eventTask 内；不能在这里直接重连并取消自身。
+            // 独立任务会先让事件循环退出本次回调，再安全地重建连接。
+            scheduleAuthenticationReconnect()
 
         case .rateLimitsUpdated(let limits):
-            guard !isAccountTransitioning else {
-                PulseLog.write("ignored rate-limit notification during account transition")
+            guard !isAccountTransitioning,
+                  confirmedAccountRevision == accountRevision else {
+                PulseLog.write("ignored rate-limit notification without confirmed account scope")
                 break
             }
             // Sparse update from notification — prefer merge by bucket id when non-empty
@@ -1361,6 +1508,9 @@ final class PulseStore {
                 )
             }
             if !limits.buckets.isEmpty {
+                // 通知也可能携带后端缓存值；与 RPC 使用同一套重置周期/单调规则，
+                // 防止本地刚更新到 4% 后又被同周期的 28% 通知覆盖。
+                next.rateLimits = reconciledRemoteRateLimits(next.rateLimits)
                 await updateRateLimitForecastOffMain(from: next.rateLimits)
             }
             next.primaryRateLimitForecast = settings.resolvedRateLimitForecastEnabled
@@ -1370,6 +1520,9 @@ final class PulseStore {
             next.updatedAt = Date()
             apply(next)
             evaluateAlerts(previous: previous, current: next)
+
+        case .localRateLimitsUpdated(let limits):
+            applyLocalRateLimitObservation(limits)
 
         case .threadsChanged:
             // App Server 通知及 session 文件写入统一走本地即时状态通道；
@@ -1391,6 +1544,7 @@ final class PulseStore {
                 _ = mergeRealtimeThreadTokenTotal(
                     threadID: record.id,
                     totalTokens: totalTokens,
+                    lastUsageTokens: record.lastTokenUsage,
                     into: &next.usage
                 )
             }
@@ -1586,6 +1740,8 @@ final class PulseStore {
         case .connectionLost(let msg):
             // 断线后线程累计值可能重置或错乱，重连时重新建立基线。
             threadTokenTotals.removeAll()
+            threadTokenSampleTimes.removeAll()
+            lastRealtimeVelocityAt = nil
             var next = snapshot
             next.connectionState = .error
             next.updatedAt = Date()
@@ -1613,47 +1769,152 @@ final class PulseStore {
     }
 
     /// App Server 通知与本地 JSONL 文件监听共享同一线程基线，避免同一批
-    /// token_count 被两个实时通道重复累加。首次只建立基线，之后只接受递增值；
-    /// 压缩导致计数器重置时由紧随其后的本地完整汇总校正。
+    /// token_count 被两个实时通道重复累加。首次只建立基线；本地事件优先使用
+    /// 单次 last usage，App Server 旧协议则保留单调差值，完整汇总负责最终校正。
     @discardableResult
     private func mergeRealtimeThreadTokenTotal(
         threadID: String,
         totalTokens: Int64,
+        lastUsageTokens: Int64? = nil,
         into usage: inout UsageStats
     ) -> Bool {
         guard totalTokens >= 0 else { return false }
+        let sampledAt = Date()
         guard let previousTotal = threadTokenTotals[threadID] else {
             threadTokenTotals[threadID] = totalTokens
+            threadTokenSampleTimes[threadID] = sampledAt
             return false
         }
-        if totalTokens < previousTotal {
-            // 上下文压缩会重置线程累计器；先切换到新基线，下一次写入即可继续实时累加。
-            threadTokenTotals[threadID] = totalTokens
-            return false
-        }
-        guard totalTokens > previousTotal else { return false }
+        guard totalTokens != previousTotal else { return false }
 
         threadTokenTotals[threadID] = totalTokens
-        let delta = totalTokens - previousTotal
-        let baseline = usage.todayTokens ?? 0
-        usage.mergeEventTodayTokens(baseline + delta)
-        if let total = usage.totalTokens {
-            usage.totalTokens = total + delta
+        let previousSampleAt = threadTokenSampleTimes[threadID]
+        threadTokenSampleTimes[threadID] = sampledAt
+        let delta: Int64
+        if let lastUsageTokens, lastUsageTokens >= 0 {
+            // 本地 JSONL 的单次增量比相邻累计值可靠：同一 session 可能交错
+            // 写入多个累计流，累计值向上/向下切换都不代表真实增量。
+            delta = lastUsageTokens
+        } else if totalTokens > previousTotal {
+            // App Server 事件尚未携带 last usage 时保留旧版单调差值兼容。
+            delta = totalTokens - previousTotal
+        } else {
+            // 旧版日志发生压缩重置时只切换基线，完整本地汇总随后校正。
+            return false
+        }
+        guard delta > 0 else { return false }
+        let todayBaseline = usage.localTodayTokens ?? usage.todayTokens ?? 0
+        let (nextToday, todayOverflow) = todayBaseline.addingReportingOverflow(delta)
+        let resolvedToday = todayOverflow ? Int64.max : nextToday
+        usage.localTodayTokens = resolvedToday
+        usage.mergeEventTodayTokens(resolvedToday)
+        if let localTotal = usage.localTotalTokens {
+            let (nextTotal, totalOverflow) = localTotal.addingReportingOverflow(delta)
+            let resolvedTotal = totalOverflow ? Int64.max : nextTotal
+            usage.localTotalTokens = resolvedTotal
+            usage.totalTokens = resolvedTotal
+        }
+        if let previousSampleAt {
+            let elapsed = sampledAt.timeIntervalSince(previousSampleAt)
+            if elapsed > 0, elapsed <= 5 * 60 {
+                let rawVelocity = Double(delta) * 60 / max(0.25, elapsed)
+                let smoothed = smoothedTokenVelocity.map {
+                    $0 * 0.55 + rawVelocity * 0.45
+                } ?? rawVelocity
+                smoothedTokenVelocity = smoothed
+                usage.tokenVelocityPerMinute = Int64(max(0, smoothed).rounded())
+                lastRealtimeVelocityAt = sampledAt
+            }
         }
         return true
+    }
+
+    /// 合并短时间内连续发生的认证文件变更，并始终在独立任务中重连。
+    /// 如果登录流程在第一次重连期间又写了一次 auth.json，循环会再重建一次，
+    /// 保证最终 app-server 使用的是最后稳定下来的认证内容。
+    private func scheduleAuthenticationReconnect() {
+        authenticationReconnectRequested = true
+        guard authenticationReconnectTask == nil else {
+            PulseLog.write("authentication reconnect coalesced")
+            return
+        }
+
+        authenticationReconnectTask = Task { [weak self] in
+            guard let self else { return }
+            while self.didStart, !Task.isCancelled, self.authenticationReconnectRequested {
+                self.authenticationReconnectRequested = false
+                await Task.yield()
+                guard self.didStart, !Task.isCancelled else { break }
+                await self.reconnectCore()
+            }
+
+            guard self.didStart, !Task.isCancelled else {
+                self.authenticationReconnectTask = nil
+                return
+            }
+            let revision = self.accountRevision
+            self.authenticationReconnectTask = nil
+            self.scheduleAccountTransitionConfirmation(for: revision)
+        }
+    }
+
+    /// 登录后端和本地 app-server 的切号可能存在很短的传播窗口。
+    /// 首次重连完成后至少再强制确认一次；仍缺账号/额度时做有限退避重试。
+    private func scheduleAccountTransitionConfirmation(for revision: Int) {
+        guard didStart, revision == accountRevision else { return }
+        accountTransitionRecoveryTask?.cancel()
+        accountTransitionRecoveryTask = Task { [weak self] in
+            guard let self else { return }
+            let retryDelays: [TimeInterval] = [0.75, 2, 5]
+
+            for (attempt, delay) in retryDelays.enumerated() {
+                do {
+                    try await Task.sleep(
+                        nanoseconds: UInt64(delay * 1_000_000_000)
+                    )
+                } catch {
+                    return
+                }
+                guard self.didStart,
+                      !Task.isCancelled,
+                      revision == self.accountRevision else { return }
+
+                if attempt > 0,
+                   self.confirmedAccountRevision == revision,
+                   !self.isAccountTransitioning,
+                   self.snapshot.account.isLoggedIn,
+                   !self.snapshot.rateLimits.buckets.isEmpty {
+                    break
+                }
+
+                PulseLog.write("confirming account-scoped data after authentication change")
+                await self.refreshAll(forceRemote: true)
+            }
+
+            if revision == self.accountRevision {
+                self.accountTransitionRecoveryTask = nil
+            }
+        }
     }
 
     private func prepareForAccountTransition() {
         accountRevision &+= 1
         isAccountTransitioning = true
+        confirmedAccountRevision = nil
+        accountTransitionRecoveryTask?.cancel()
+        accountTransitionRecoveryTask = nil
         client?.invalidateAccountScopedState()
         postTurnRefreshTask?.cancel()
         postTurnRefreshTask = nil
         localUsageRefreshTask?.cancel()
         localUsageRefreshTask = nil
         localUsageRefreshRevision &+= 1
+        latestLocalRateLimitObservation = nil
+        lastLocalRateLimitEventAt = .distantPast
         threadTokenTotals.removeAll()
+        threadTokenSampleTimes.removeAll()
         smoothedTokenVelocity = nil
+        lastRealtimeVelocityAt = nil
         isTokenSpikeActive = false
         lastTokenSpikeAlertAt = nil
         notifiedThresholds.removeAll()
@@ -1666,13 +1927,13 @@ final class PulseStore {
         var next = snapshot
         next.account = .empty
         next.rateLimits = .empty
-        next.usage = .empty
+        next.usage = deviceLocalUsage(from: snapshot.usage)
         next.primaryRateLimitForecast = nil
         next.updatedAt = Date()
         apply(next)
         lastError = nil
         connectionDetail = "已连接 · 正在切换账号…"
-        PulseLog.write("account update detected; cleared account-scoped snapshot")
+        PulseLog.write("account update detected; cleared quota and preserved device Token totals")
     }
 
     private func isCurrentClient(_ candidate: any CodexAppServerClient) -> Bool {
@@ -1691,13 +1952,46 @@ final class PulseStore {
             && normalized(lhs.workspaceName) == normalized(rhs.workspaceName)
     }
 
-    /// 今日标题数字是“本机当天全部 Codex session”口径。账号切换只隔离远端
-    /// 生命周期与历史桶，不应让今日值消失并要求用户重启应用。
-    private func shouldPromoteLocalToday(
-        usage: UsageStats,
-        currentAccount: AccountInfo
-    ) -> Bool {
-        usage.localTodayTokens != nil && currentAccount.isLoggedIn
+    /// Token 与登录账号解耦：日桶先落地，再用高频今日值覆盖当天，最后以
+    /// 全历史 session 汇总覆盖累计。额度与重置卡仍保持账号作用域。
+    private func promoteDeviceLocalUsage(_ usage: inout UsageStats) {
+        if let localDaily = usage.localDailyBuckets {
+            usage.mergeLocalDailyBuckets(localDaily, promoteToDisplayedUsage: true)
+        }
+        if let localToday = usage.localTodayTokens {
+            usage.mergeLocalTodayTokens(localToday, promoteToDisplayedUsage: true)
+        }
+        if let localTotal = usage.localTotalTokens {
+            usage.mergeLocalTotalTokens(localTotal, promoteToDisplayedUsage: true)
+        }
+        if let localCurrentStreak = usage.localCurrentStreakDays {
+            usage.mergeLocalStreak(
+                currentDays: localCurrentStreak,
+                longestDays: usage.localLongestStreakDays ?? localCurrentStreak,
+                promoteToDisplayedUsage: true
+            )
+        }
+    }
+
+    private func deviceLocalUsage(from usage: UsageStats) -> UsageStats {
+        var result = UsageStats.empty
+        result.localDailyBuckets = usage.localDailyBuckets
+        result.localTodayTokens = usage.localTodayTokens
+        result.localTotalTokens = usage.localTotalTokens
+        result.localCurrentStreakDays = usage.localCurrentStreakDays
+        result.localLongestStreakDays = usage.localLongestStreakDays
+        result.localTodayInputTokens = usage.localTodayInputTokens
+        result.localTodayCachedInputTokens = usage.localTodayCachedInputTokens
+        result.localTodayOutputTokens = usage.localTodayOutputTokens
+        result.localTodayEstimatedCostUSD = usage.localTodayEstimatedCostUSD
+        result.localTodayUncachedInputCostUSD = usage.localTodayUncachedInputCostUSD
+        result.localTodayCachedInputCostUSD = usage.localTodayCachedInputCostUSD
+        result.localTodayOutputCostUSD = usage.localTodayOutputCostUSD
+        result.localTotalEstimatedCostUSD = usage.localTotalEstimatedCostUSD
+        result.updatedAt = usage.updatedAt
+        promoteDeviceLocalUsage(&result)
+        result.tokenVelocityPerMinute = nil
+        return result
     }
 
     private func markRealConnectionRestored() {
@@ -1983,21 +2277,24 @@ final class PulseStore {
         guard didStart,
               !isRefreshing,
               !isAccountTransitioning,
+              confirmedAccountRevision == accountRevision,
               let monitoredClient = client,
               monitoredClient.isConnected else { return }
 
         let revision = accountRevision
         do {
-            let limits = try await monitoredClient.readRateLimits(forceRefresh: forceRemote)
+            let remoteLimits = try await monitoredClient.readRateLimits(forceRefresh: forceRemote)
             guard didStart,
                   revision == accountRevision,
                   isCurrentClient(monitoredClient),
-                  !limits.buckets.isEmpty else { return }
+                  !remoteLimits.buckets.isEmpty else { return }
 
+            var limits = reconciledRemoteRateLimits(remoteLimits)
             await updateRateLimitForecastOffMain(from: limits)
             guard didStart,
                   revision == accountRevision,
                   isCurrentClient(monitoredClient) else { return }
+            limits = preservingNewerRateLimits(limits)
 
             let previous = snapshot
             var next = previous

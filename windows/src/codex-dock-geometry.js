@@ -71,6 +71,56 @@ function rectangleDistance(left, right) {
   return Math.hypot(dx, dy);
 }
 
+function isFullscreenWindowBounds(windowBounds, displayBounds, tolerance = 4) {
+  if (!windowBounds || !displayBounds) return false;
+  const inset = Math.max(0, finiteNumber(tolerance) ?? 4);
+  return windowBounds.x <= displayBounds.x + inset
+    && windowBounds.y <= displayBounds.y + inset
+    && windowBounds.x + windowBounds.width
+      >= displayBounds.x + displayBounds.width - inset
+    && windowBounds.y + windowBounds.height
+      >= displayBounds.y + displayBounds.height - inset;
+}
+
+function fullscreenTopDockFrame(
+  windowBounds,
+  {
+    thickness = 44,
+    overlap = 16,
+    topInset = 24,
+    widthRatio = 0.46,
+    minimumWidth = 620,
+    maximumWidth = 960,
+    horizontalMargin = 24
+  } = {}
+) {
+  if (!windowBounds) return null;
+  const hostWidth = Math.max(1, Math.round(finiteNumber(windowBounds.width) ?? 1));
+  const margin = Math.max(0, finiteNumber(horizontalMargin) ?? 24);
+  const availableWidth = Math.max(420, hostWidth - margin * 2);
+  const proportionalWidth = hostWidth
+    * Math.max(0.1, finiteNumber(widthRatio) ?? 0.46);
+  const width = Math.round(Math.min(
+    availableWidth,
+    Math.max(
+      Math.max(420, finiteNumber(minimumWidth) ?? 620),
+      Math.min(
+        Math.max(420, finiteNumber(maximumWidth) ?? 960),
+        proportionalWidth
+      )
+    )
+  ));
+  return {
+    x: Math.round(windowBounds.x + (hostWidth - width) / 2),
+    y: Math.round(windowBounds.y + Math.max(0, finiteNumber(topInset) ?? 24)),
+    width,
+    height: Math.round(
+      Math.max(1, finiteNumber(thickness) ?? 44)
+        + Math.max(0, finiteNumber(overlap) ?? 16)
+    )
+  };
+}
+
 function attachedDockShape(width, height, edge = "bottom", overlap = 16) {
   const resolvedWidth = Math.max(1, Math.round(finiteNumber(width) ?? 1));
   const resolvedHeight = Math.max(1, Math.round(finiteNumber(height) ?? 1));
@@ -133,6 +183,8 @@ function detachedWindowBounds(pointer, windowBounds, visibleShape) {
 module.exports = {
   attachedDockShape,
   detachedWindowBounds,
+  fullscreenTopDockFrame,
+  isFullscreenWindowBounds,
   mediaSourceIdForWindowHandle,
   normalizeTrackedWindowBounds,
   visibleWindowBounds,

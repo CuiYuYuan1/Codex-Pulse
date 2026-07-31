@@ -1,6 +1,6 @@
 {
   "name": "codex-pulse-windows",
-  "version": "0.1.36",
+  "version": "0.1.37",
   "private": true,
   "description": "Codex-Pulse for Windows",
   "main": "src/main.js",
@@ -8,7 +8,7 @@
   "license": "UNLICENSED",
   "scripts": {
     "start": "electron .",
-    "test": "node tests/local-usage-history.test.js && node tests/pet-growth.test.js && node tests/codex-dock-geometry.test.js && node tests/codex-dock-interaction.test.js && node tests/mac-parity-contract.test.js",
+    "test": "node tests/local-usage-history.test.js && node tests/quota-freshness.test.js && node tests/account-switch-contract.test.js && node tests/dock-metrics.test.js && node tests/pet-growth.test.js && node tests/codex-dock-geometry.test.js && node tests/codex-dock-interaction.test.js && node tests/mac-parity-contract.test.js",
     "pack:win": "electron-builder --win nsis --x64",
     "pack:win:portable": "electron-builder --win portable --x64 --config.win.artifactName=CodexPulse-Windows-Portable-\\${version}-\\${arch}.\\${ext}"
   },

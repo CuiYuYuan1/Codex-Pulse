@@ -9,6 +9,8 @@ protocol CodexAppServerClient: AnyObject, Sendable {
     func readRateLimits(forceRefresh: Bool) async throws -> RateLimitSnapshot
     func readUsage(forceRefresh: Bool) async throws -> UsageStats
     func readLocalUsage(merging cached: UsageStats) async -> UsageStats
+    /// 只读取当天 session 的 Token、缓存与成本明细；不得等待近 7 天或全历史汇总。
+    func readRealtimeLocalUsage(merging cached: UsageStats) async -> UsageStats
     /// 登录账号/工作区变化后清除额度、用量缓存与失败退避。
     func invalidateAccountScopedState()
     func listRecentThreads(limit: Int) async throws -> [TaskRecord]
@@ -24,6 +26,8 @@ enum CodexServerEvent: Sendable {
     /// Store 收到后必须重建连接，而不是只重读 account/read。
     case authenticationChanged
     case rateLimitsUpdated(RateLimitSnapshot)
+    /// 活跃 Codex session 的 token_count.rate_limits；updatedAt 为 rollout 事件时间。
+    case localRateLimitsUpdated(RateLimitSnapshot)
     /// 线程活跃状态发生变化；具体任务以随后的 thread/list 为准。
     case threadsChanged
     /// 本机 session 文件写入后直接解析出的单线程状态，不经过全局 thread/list。

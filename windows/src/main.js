@@ -21,11 +21,18 @@ const { isDeepStrictEqual } = require("util");
 const {
   attachedDockShape,
   detachedWindowBounds,
+  fullscreenTopDockFrame,
+  isFullscreenWindowBounds,
   mediaSourceIdForWindowHandle,
   normalizeTrackedWindowBounds,
   visibleWindowBounds,
   rectangleDistance
 } = require("./codex-dock-geometry");
+const {
+  mergeNormalizedLimits,
+  normalizeLimits,
+  reconcileNormalizedLimits
+} = require("./rate-limit-utils");
 const APP_VERSION = require("../package.json").version;
 const processStartedAt = process.hrtime.bigint();
 
@@ -47,6 +54,11 @@ const CODEX_DOCK_VERTICAL_THICKNESS = 54;
 const CODEX_DOCK_OVERLAP = 16;
 const CODEX_DOCK_PROXIMITY = 30;
 const CODEX_DOCK_PREVIEW_RELEASE_DISTANCE = 42;
+const CODEX_DOCK_FULLSCREEN_TOP_INSET = 24;
+const CODEX_DOCK_FULLSCREEN_WIDTH_RATIO = 0.46;
+const CODEX_DOCK_FULLSCREEN_MIN_WIDTH = 620;
+const CODEX_DOCK_FULLSCREEN_MAX_WIDTH = 960;
+const CODEX_DOCK_FULLSCREEN_HORIZONTAL_MARGIN = 24;
 const USE_STABLE_DESKTOP_SURFACE = process.platform === "win32";
 const SETTINGS_FILE = () => path.join(app.getPath("userData"), "settings.json");
 const WEATHER_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -78,6 +90,10 @@ let tray;
 let rpc;
 let refreshTimer;
 let limitsRefreshInFlight = false;
+let limitsRefreshPromise = null;
+let limitsRefreshQueued = false;
+let lastAcceptedLimitsAt = 0;
+let limitsNotificationRefreshTimer;
 let usageRefreshInFlight = false;
 let lastLimitsRefreshAt = 0;
 let lastUsageRefreshAt = 0;
@@ -87,6 +103,8 @@ let sessionRescanTimer;
 let sessionRefreshTimer;
 let sessionCandidates = new Map();
 let localSessionSnapshot = null;
+let localActiveTaskIDs = new Set();
+let lastLocalRateLimitEventAt = 0;
 let pendingSessionPaths = new Set();
 let authWatcher;
 let authPollTimer;
@@ -96,8 +114,8 @@ let authIdentity = null;
 let accountReloadInFlight = false;
 let pendingAccountRestart = false;
 let accountGeneration = 0;
-// “今日 Token”采用本机当天全部 Codex session 的汇总。session 日志没有账号
-// 标识，因此账号切换后也要立即重新读取，不能等应用重启才恢复显示。
+// 本机 session 没有账号标识，因此今日、近 7 日和累计 Token 都采用设备口径；
+// 登录账号只影响额度与重置卡，不影响本地 Token 聚合。
 let localUsageDayKey = null;
 const localUsageCache = new Map();
 let localUsageRefreshPromise = null;
@@ -111,6 +129,14 @@ let localHistoryLastValue = null;
 let localUsageDayTimer;
 const LOCAL_HISTORY_MIN_REFRESH_MS = 1500;
 const localHistoryCache = new Map();
+let localTotalRefreshPromise = null;
+let localTotalLastReadAt = 0;
+let localTotalLastValue = null;
+const LOCAL_TOTAL_MIN_REFRESH_MS = 1500;
+const localTotalCache = new Map();
+const localThreadTokenSamples = new Map();
+let smoothedRealtimeTokenVelocity = null;
+let lastRealtimeTokenVelocityAt = 0;
 let weatherRefreshTimer;
 let updateRefreshTimer;
 let updateCheckInFlight = false;
@@ -132,6 +158,8 @@ let codexDockCandidate = null;
 let codexDockCandidateEdge = null;
 let codexDockAttached = false;
 let codexDockEdge = "bottom";
+let codexDockPreferredEdge = "bottom";
+let codexDockFullscreen = false;
 let codexDockRestorePending = false;
 let codexDockPreviousLayout = null;
 let codexDockLastZOrderAt = 0;
@@ -140,6 +168,8 @@ let codexDockTransitionTimer;
 let codexDockFollowTarget = null;
 let codexDockFollowTimer;
 let codexDockFollowLastAt = 0;
+let codexDockFollowPreviousTarget = null;
+let codexDockFollowPreviousTargetAt = 0;
 let codexDockPreviewSuppressUntil = 0;
 let petRoamGeneration = 0;
 let petRoamTimer;
@@ -156,9 +186,10 @@ let state = {
   modelProvider: null,
   account: { email: null, maskedEmail: "—", plan: "—", auth: "—" },
   limits: [],
+  limitsUpdatedAt: null,
   resetCards: [],
   usage: { today: 0, total: 0, daily: [] },
-  task: { state: "idle", label: "空闲", title: null, project: null, startedAt: null, threadID: null, conversation: [] },
+  task: { state: "idle", label: "空闲", title: null, project: null, model: null, reasoningEffort: null, startedAt: null, threadID: null, activeCount: 0, conversation: [] },
   informationBar: {
     enabled: false,
     location: null,
@@ -235,9 +266,19 @@ function normalizeWeatherSnapshot(value, location) {
   if (!Number.isFinite(temperature) || !Number.isInteger(code) || code < 0 || code > 99 || isDayValue === null) return null;
   const fetchedAt = Number(value.cachedAt || source.fetchedAt);
   if (!Number.isFinite(fetchedAt) || fetchedAt <= 0) return null;
+  const optionalNumber = (candidate) => {
+    const number = Number(candidate);
+    return Number.isFinite(number) ? number : null;
+  };
   return {
     temperature: Number.isFinite(temperature) ? temperature : null,
     unit: String(source.unit || "°C").slice(0, 12),
+    apparentTemperature: optionalNumber(source.apparentTemperature),
+    maximumTemperature: optionalNumber(source.maximumTemperature),
+    minimumTemperature: optionalNumber(source.minimumTemperature),
+    humidity: optionalNumber(source.humidity),
+    windSpeed: optionalNumber(source.windSpeed),
+    windUnit: String(source.windUnit || "km/h").slice(0, 12),
     code: Number.isFinite(code) ? code : null,
     isDay: isDayValue,
     timezone: String(source.timezone || location.timezone || "auto").slice(0, 80),
@@ -709,13 +750,19 @@ async function fetchWeather(location, force = false) {
   const params = new URLSearchParams({
     latitude: String(location.latitude),
     longitude: String(location.longitude),
-    current: "temperature_2m,weather_code,is_day",
+    current: "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code,is_day",
+    daily: "temperature_2m_max,temperature_2m_min",
     timezone: location.timezone && location.timezone !== "auto" ? location.timezone : "auto",
     forecast_days: "1"
   });
   const payload = await requestJSON(`https://api.open-meteo.com/v1/forecast?${params.toString()}`);
   const current = payload?.current || {};
   const temperature = Number(current.temperature_2m);
+  const apparentTemperature = Number(current.apparent_temperature);
+  const humidity = Number(current.relative_humidity_2m);
+  const windSpeed = Number(current.wind_speed_10m);
+  const maximumTemperature = Number(payload?.daily?.temperature_2m_max?.[0]);
+  const minimumTemperature = Number(payload?.daily?.temperature_2m_min?.[0]);
   const code = Number(current.weather_code);
   const isDayValue = Number(current.is_day);
   if (!Number.isFinite(temperature)
@@ -726,6 +773,12 @@ async function fetchWeather(location, force = false) {
   const weather = {
     temperature: Number.isFinite(temperature) ? temperature : null,
     unit: payload?.current_units?.temperature_2m || "°C",
+    apparentTemperature: Number.isFinite(apparentTemperature) ? apparentTemperature : null,
+    maximumTemperature: Number.isFinite(maximumTemperature) ? maximumTemperature : null,
+    minimumTemperature: Number.isFinite(minimumTemperature) ? minimumTemperature : null,
+    humidity: Number.isFinite(humidity) ? humidity : null,
+    windSpeed: Number.isFinite(windSpeed) ? windSpeed : null,
+    windUnit: payload?.current_units?.wind_speed_10m || "km/h",
     code,
     isDay: isDayValue === 1,
     timezone: String(payload?.timezone || location.timezone || "auto"),
@@ -1162,6 +1215,7 @@ function handleNotification(method, params = {}) {
       label: "思考中",
       title: "正在输出回复",
       threadID,
+      activeCount: Math.max(1, Number(state.task.activeCount) || 0),
       conversation,
       startedAt: state.task.startedAt || Date.now()
     } });
@@ -1171,22 +1225,37 @@ function handleNotification(method, params = {}) {
       ...state.task,
       state: "working",
       label: "思考中",
+      activeCount: Math.max(1, Number(state.task.activeCount) || 0),
       conversation: isTurnStart ? [] : (state.task.conversation || []),
       startedAt: state.task.startedAt || Date.now()
     } });
   } else if (lower.includes("approval") || lower.includes("request/userinput")) {
-    publish({ task: { ...state.task, state: "attention", label: "等待授权" } });
+    publish({ task: { ...state.task, state: "attention", label: "等待授权", activeCount: Math.max(1, Number(state.task.activeCount) || 0) } });
   } else if (lower.includes("turn/completed") || lower.includes("turn/aborted") || lower.includes("turn/failed")) {
-    publish({ task: { state: "idle", label: "空闲", title: null, project: null, startedAt: null, threadID: null, conversation: [] } });
+    publish({ task: { state: "idle", label: "空闲", title: null, project: null, model: null, reasoningEffort: null, startedAt: null, threadID: null, activeCount: 0, conversation: [] } });
     setTimeout(() => refreshAll(true), 120);
   } else if (lower.includes("account/updated")) {
     scheduleAccountTransition(false);
   } else if (lower.includes("ratelimits")) {
-    setTimeout(() => refreshLimits(), 100);
+    const snapshot = params?.rateLimits ?? params?.rate_limits;
+    if (snapshot && typeof snapshot === "object") {
+      const fallbackID = snapshot.limitId ?? snapshot.limit_id ?? "codex";
+      applyRateLimitPayload(
+        { rateLimitsByLimitId: { [fallbackID]: snapshot } },
+        { acceptedAt: Date.now(), merge: true }
+      );
+    }
+    scheduleRateLimitsRefresh(100);
   } else if (lower.includes("thread") && lower.includes("status")) {
     const next = notificationStatus(params);
     if (next === "working" || next === "attention") {
-      publish({ task: { ...state.task, state: next, label: next === "attention" ? "等待授权" : "思考中", startedAt: state.task.startedAt || Date.now() } });
+      publish({ task: {
+        ...state.task,
+        state: next,
+        label: next === "attention" ? "等待授权" : "思考中",
+        startedAt: state.task.startedAt || Date.now(),
+        activeCount: Math.max(1, Number(state.task.activeCount) || 0)
+      } });
     }
     // 独立 app-server 会把桌面端正在执行的线程标成 notLoaded；idle/notLoaded
     // 不能直接覆盖本机会话文件的实时状态，只作为触发本地复核的信号。
@@ -1215,52 +1284,79 @@ function normalizeAccount(result) {
   };
 }
 
-function normalizeLimits(result) {
-  const snapshots = [];
-  if (result.rateLimits) snapshots.push(result.rateLimits);
-  if (result.rateLimitsByLimitId) snapshots.push(...Object.values(result.rateLimitsByLimitId));
-  const seen = new Set();
-  const limits = [];
-  for (const snapshot of snapshots) {
-    for (const [kind, fallbackName] of [["primary", "每周用量"], ["secondary", "5 小时用量"]]) {
-      const item = snapshot?.[kind];
-      if (!item) continue;
-      const duration = numberValue(item.windowDurationMins);
-      const key = `${kind}-${Math.round(duration || 0)}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const used = Math.min(100, Math.max(0, numberValue(item.usedPercent) || 0));
-      limits.push({
-        id: key,
-        name: duration && duration <= 360 ? "5 小时用量" : (snapshot.limitName || fallbackName),
-        usedPercent: used,
-        remainingPercent: 100 - used,
-        resetsAt: numberValue(item.resetsAt)
-      });
-    }
-  }
-  limits.sort((a, b) => (b.resetsAt || 0) - (a.resetsAt || 0));
-  const creditSummary = result.rateLimitResetCredits || {};
-  const cards = Array.isArray(creditSummary.credits)
-    ? creditSummary.credits.map((card, index) => {
-        const rawTypes = card.applicableLimitTypes || card.applicable_limit_types
-          || card.resetType || card.reset_type || "codex_rate_limits";
-        return {
-          id: card.id || `card-${index}`,
-          available: String(card.status || "available").toLowerCase() === "available",
-          expiresAt: numberValue(card.expiresAt || card.expires_at),
-          applicableLimitTypes: Array.isArray(rawTypes) ? rawTypes.map(String) : [String(rawTypes)]
-        };
-      })
-    : Array.from({ length: numberValue(creditSummary.availableCount) || 0 }, (_, index) => ({
-        id: `card-${index}`, available: true, expiresAt: null, applicableLimitTypes: []
-      }));
-  return { limits, cards };
+function applyRateLimitPayload(result, {
+  acceptedAt = Date.now(),
+  merge = false
+} = {}) {
+  if (!result || acceptedAt < lastAcceptedLimitsAt) return false;
+  const normalized = normalizeLimits(result);
+  if (!normalized.limits.length) return false;
+  const limits = merge
+    ? mergeNormalizedLimits(state.limits, result)
+    : reconcileNormalizedLimits(state.limits, normalized.limits, false);
+  const patch = {
+    limits,
+    limitsUpdatedAt: acceptedAt
+  };
+  const hasCards = result.rateLimitResetCredits !== undefined
+    || result.rate_limit_reset_credits !== undefined;
+  if (!merge || hasCards) patch.resetCards = normalized.cards;
+  lastAcceptedLimitsAt = acceptedAt;
+  lastLimitsRefreshAt = Date.now();
+  return publish(patch);
+}
+
+function scheduleRateLimitsRefresh(delay = 100) {
+  clearTimeout(limitsNotificationRefreshTimer);
+  limitsNotificationRefreshTimer = setTimeout(() => {
+    limitsNotificationRefreshTimer = null;
+    void refreshLimits();
+  }, Math.max(0, Number(delay) || 0));
 }
 
 function dayKey(date) {
   const year = date.getFullYear();
   return `${year}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function calculateLocalUsageStreak(activeDayKeys, reference = new Date()) {
+  const normalized = new Set(
+    [...(activeDayKeys || [])]
+      .map((value) => String(value || "").slice(0, 10))
+      .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value))
+  );
+  const ordinals = [...normalized]
+    .map((value) => {
+      const [year, month, day] = value.split("-").map(Number);
+      return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
+    })
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+
+  let longestDays = 0;
+  let run = 0;
+  let previous = null;
+  for (const ordinal of ordinals) {
+    run = previous !== null && ordinal === previous + 1 ? run + 1 : 1;
+    longestDays = Math.max(longestDays, run);
+    previous = ordinal;
+  }
+
+  const today = new Date(reference);
+  today.setHours(12, 0, 0, 0);
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  let cursor = normalized.has(dayKey(today))
+    ? today
+    : normalized.has(dayKey(yesterday)) ? yesterday : null;
+  let currentDays = 0;
+  while (cursor && normalized.has(dayKey(cursor))) {
+    currentDays += 1;
+    const prior = new Date(cursor);
+    prior.setDate(prior.getDate() - 1);
+    cursor = prior;
+  }
+  return { currentDays, longestDays };
 }
 
 function normalizeUsage(result) {
@@ -1296,7 +1392,16 @@ function normalizeUsage(result) {
     ?? 0;
   const streakDays = numberValue(summary.currentStreakDays ?? summary.current_streak_days)
     ?? numberValue(summary.current_streak_days);
-  return { today, total, daily, streakDays };
+  return {
+    today,
+    total,
+    daily,
+    streakDays,
+    tokenVelocityPerMinute: numberValue(
+      nested.tokenVelocityPerMinute ?? nested.token_velocity_per_minute
+        ?? payload.tokenVelocityPerMinute ?? payload.token_velocity_per_minute
+    )
+  };
 }
 
 function filledLocalDailyBuckets(existing, reference = new Date()) {
@@ -1317,36 +1422,52 @@ function filledLocalDailyBuckets(existing, reference = new Date()) {
   return result;
 }
 
-// Merge the local session aggregate without pretending today's value is a
-// lifetime total. `account/usage/read` is commonly empty for API Key auth.
+// Device-local session totals are authoritative for Token metrics. Account
+// changes only replace quota/reset-card data and never change these values.
 function mergeLocalTodayUsage(usage, localToday, reference = new Date()) {
   const localRecord = localToday && typeof localToday === "object"
     ? localToday
     : { tokens: localToday, estimated: false };
   const local = numberValue(localRecord.tokens);
   if (local === null || local < 0) return usage;
+  // A completed filesystem scan is authoritative. It must be able to correct
+  // a persisted value inflated by an older parser; live deltas are merged by
+  // the session watcher and the next scan immediately reconciles them.
+  const resolvedLocal = local;
+  const localEstimated = localRecord.estimated === true;
   const today = new Date(reference);
   today.setHours(12, 0, 0, 0);
   const todayString = dayKey(today);
   const daily = filledLocalDailyBuckets(usage?.daily, today);
   const todayBucket = daily[daily.length - 1];
-  const remoteToday = numberValue(todayBucket.tokens) || 0;
-  todayBucket.tokens = Math.max(remoteToday, local);
-  const localWins = local > remoteToday;
+  todayBucket.tokens = resolvedLocal;
   return {
     ...usage,
-    today: Math.max(remoteToday, local),
-    todayEstimated: localWins ? localRecord.estimated === true : usage?.todayEstimated === true,
-    daily
+    today: resolvedLocal,
+    todayEstimated: localEstimated,
+    localToday: resolvedLocal,
+    localTodayEstimated: localEstimated,
+    localTodayInputTokens: Math.max(0, numberValue(localRecord.inputTokens) || 0),
+    localTodayCachedInputTokens: Math.min(
+      Math.max(0, numberValue(localRecord.inputTokens) || 0),
+      Math.max(0, numberValue(localRecord.cachedInputTokens) || 0)
+    ),
+    localTodayOutputTokens: Math.max(0, numberValue(localRecord.outputTokens) || 0),
+    localTodayEstimatedCostUSD: numberValue(localRecord.estimatedCostUSD),
+    localTodayUncachedInputCostUSD: numberValue(localRecord.uncachedInputCostUSD),
+    localTodayCachedInputCostUSD: numberValue(localRecord.cachedInputCostUSD),
+    localTodayOutputCostUSD: numberValue(localRecord.outputCostUSD),
+    daily,
+    sourceNote: "Token 来自本机全部 Codex session，包含本机使用过的所有账号"
   };
 }
 
 // Local session files expose cumulative counters rather than server-style day
-// buckets. Merge the per-day local values by taking the larger value for each
-// day so a server bucket and a local bucket cannot be double-counted.
+// buckets. Replace remote account buckets so the chart and headline share one
+// device-wide definition.
 function mergeLocalDailyUsage(usage, localDaily, reference = new Date()) {
   if (!Array.isArray(localDaily) || !localDaily.length) return usage;
-  const daily = filledLocalDailyBuckets(usage?.daily, reference);
+  const daily = filledLocalDailyBuckets(localDaily, reference);
   const byDate = new Map(localDaily.map((bucket) => [
     String(bucket?.date || "").slice(0, 10),
     {
@@ -1360,42 +1481,114 @@ function mergeLocalDailyUsage(usage, localDaily, reference = new Date()) {
     localSevenDayTokens = Math.min(Number.MAX_SAFE_INTEGER, localSevenDayTokens + bucket.tokens);
     localHistoryEstimated ||= bucket.estimated;
   }
-  const remoteToday = numberValue(daily[daily.length - 1]?.tokens) || 0;
-  for (const bucket of daily) {
-    if (!byDate.has(bucket.date)) continue;
-    bucket.tokens = Math.max(bucket.tokens, byDate.get(bucket.date).tokens);
-  }
-  const today = daily[daily.length - 1]?.tokens || 0;
+  const scannedToday = daily[daily.length - 1]?.tokens || 0;
+  const today = scannedToday;
+  if (daily.length) daily[daily.length - 1].tokens = today;
   const localToday = byDate.get(daily[daily.length - 1]?.date);
+  localSevenDayTokens = daily.reduce(
+    (sum, bucket) => Math.min(Number.MAX_SAFE_INTEGER, sum + Math.max(0, numberValue(bucket.tokens) || 0)),
+    0
+  );
   return {
     ...usage,
     today,
-    todayEstimated: localToday && localToday.tokens > remoteToday
-      ? localToday.estimated
-      : usage?.todayEstimated === true,
+    todayEstimated: localToday?.estimated === true,
+    localToday: today,
+    localTodayEstimated: localToday?.estimated === true,
     daily,
+    localDaily: daily.map((bucket) => ({
+      ...bucket,
+      estimated: byDate.get(bucket.date)?.estimated === true
+    })),
     localDailyAvailable: true,
     localSevenDayTokens,
-    localHistoryEstimated
+    localHistoryEstimated,
+    sourceNote: "Token 来自本机全部 Codex session，包含本机使用过的所有账号"
   };
 }
 
-// A failed or unavailable remote profile must never leave the headline at a
-// stale zero when Codex has already written usage into local session JSONL.
-// In this path both today's value and the local seven-day buckets become the
-// displayed fallback regardless of authentication mode.
-function mergeLocalSessionFallback(usage, localToday, localDaily, reference = new Date()) {
+function mergeLocalTotalUsage(usage, localTotal) {
+  const localRecord = localTotal && typeof localTotal === "object"
+    ? localTotal
+    : { tokens: localTotal, estimated: false };
+  const total = numberValue(localRecord.tokens);
+  if (total === null || total < 0) return usage;
+  const resolvedTotal = total;
+  const totalEstimated = localRecord.estimated === true;
+  const localStreakDays = numberValue(localRecord.streakDays);
+  const localLongestStreakDays = numberValue(localRecord.longestStreakDays);
+  return {
+    ...usage,
+    total: resolvedTotal,
+    localTotal: resolvedTotal,
+    localTotalEstimated: totalEstimated,
+    localTotalEstimatedCostUSD: numberValue(localRecord.estimatedCostUSD),
+    ...(localStreakDays === null ? {} : {
+      streakDays: Math.max(0, Math.round(localStreakDays)),
+      localStreakDays: Math.max(0, Math.round(localStreakDays))
+    }),
+    ...(localLongestStreakDays === null ? {} : {
+      longestStreakDays: Math.max(0, Math.round(localLongestStreakDays)),
+      localLongestStreakDays: Math.max(0, Math.round(localLongestStreakDays))
+    }),
+    sourceNote: "Token 来自本机全部 Codex session，包含本机使用过的所有账号"
+  };
+}
+
+function deviceLocalUsageSnapshot(usage, reference = new Date()) {
+  let snapshot = normalizeUsage({});
+  if (Array.isArray(usage?.localDaily) && usage.localDaily.length) {
+    snapshot = mergeLocalDailyUsage(snapshot, usage.localDaily, reference);
+  }
+  if (numberValue(usage?.localToday) !== null) {
+    snapshot = mergeLocalTodayUsage(snapshot, {
+      tokens: usage.localToday,
+      estimated: usage.localTodayEstimated === true,
+      inputTokens: usage.localTodayInputTokens,
+      cachedInputTokens: usage.localTodayCachedInputTokens,
+      outputTokens: usage.localTodayOutputTokens,
+      estimatedCostUSD: usage.localTodayEstimatedCostUSD,
+      uncachedInputCostUSD: usage.localTodayUncachedInputCostUSD,
+      cachedInputCostUSD: usage.localTodayCachedInputCostUSD,
+      outputCostUSD: usage.localTodayOutputCostUSD
+    }, reference);
+  }
+  if (numberValue(usage?.localTotal) !== null) {
+    snapshot = mergeLocalTotalUsage(snapshot, {
+      tokens: usage.localTotal,
+      estimated: usage.localTotalEstimated === true,
+      estimatedCostUSD: usage.localTotalEstimatedCostUSD,
+      streakDays: usage.localStreakDays,
+      longestStreakDays: usage.localLongestStreakDays
+    });
+  }
+  return snapshot;
+}
+
+// A failed or unavailable remote profile still displays the exact same local
+// device aggregates as a successful profile request.
+function mergeLocalSessionFallback(
+  usage,
+  localToday,
+  localDaily,
+  localTotal,
+  reference = new Date()
+) {
   let fallback = usage && typeof usage === "object" ? usage : normalizeUsage({});
+  if (Array.isArray(localDaily) && localDaily.length) {
+    fallback = mergeLocalDailyUsage(fallback, localDaily, reference);
+  }
   if (localToday !== null && localToday !== undefined) {
     fallback = mergeLocalTodayUsage(fallback, localToday, reference);
   }
-  if (Array.isArray(localDaily) && localDaily.length) {
-    fallback = mergeLocalDailyUsage(fallback, localDaily, reference);
+  if (localTotal !== null && localTotal !== undefined) {
+    fallback = mergeLocalTotalUsage(fallback, localTotal);
   }
   return {
     ...fallback,
     localSessionFallback: true,
-    sourceNote: "Token 远端统计失败，当前使用本机 Codex session 汇总"
+    localDaily: fallback.localDaily ?? (Array.isArray(localDaily) ? localDaily : null),
+    sourceNote: "Token 来自本机全部 Codex session，包含本机使用过的所有账号"
   };
 }
 
@@ -1442,7 +1635,17 @@ function resetLocalUsageDay(reference = new Date()) {
       usage: {
         ...state.usage,
         today: 0,
+        localToday: 0,
+        localTodayEstimated: false,
+        localTodayInputTokens: 0,
+        localTodayCachedInputTokens: 0,
+        localTodayOutputTokens: 0,
+        localTodayEstimatedCostUSD: 0,
+        localTodayUncachedInputCostUSD: 0,
+        localTodayCachedInputCostUSD: 0,
+        localTodayOutputCostUSD: 0,
         daily,
+        localDaily: state.usage?.localDailyAvailable ? daily.map((bucket) => ({ ...bucket })) : state.usage?.localDaily,
         localSevenDayTokens
       }
     });
@@ -1495,6 +1698,62 @@ function usageTokenTotal(usage) {
   if (direct !== null && direct > 0) return direct;
   if (parts > 0) return parts;
   return direct === 0 ? 0 : null;
+}
+
+function usageTokenComponents(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  const input = numberValue(usage.input_tokens ?? usage.inputTokens
+    ?? usage.prompt_tokens ?? usage.promptTokens);
+  const cachedInput = numberValue(usage.cached_input_tokens ?? usage.cachedInputTokens
+    ?? usage.input_tokens_details?.cached_tokens
+    ?? usage.inputTokensDetails?.cachedTokens);
+  const output = numberValue(usage.output_tokens ?? usage.outputTokens
+    ?? usage.completion_tokens ?? usage.completionTokens);
+  if (input === null && cachedInput === null && output === null) return null;
+  const normalizedInput = Math.max(0, input || 0);
+  return {
+    inputTokens: normalizedInput,
+    cachedInputTokens: Math.min(normalizedInput, Math.max(0, cachedInput || 0)),
+    outputTokens: Math.max(0, output || 0)
+  };
+}
+
+function tokenPriceForModel(rawModel) {
+  const model = String(rawModel || "").trim().toLowerCase();
+  if (!model.includes("gpt")) return null;
+  if (model.includes("5.6")) {
+    if (model.includes("luna")) return { input: 1, cached: .1, output: 6, longContext: 272_000 };
+    if (model.includes("terra")) return { input: 2.5, cached: .25, output: 15, longContext: 272_000 };
+    return { input: 5, cached: .5, output: 30, longContext: 272_000 };
+  }
+  if (model.includes("5.5-pro")) return { input: 30, cached: 30, output: 180 };
+  if (model.includes("5.5")) return { input: 5, cached: .5, output: 30, longContext: 272_000 };
+  if (model.includes("5.4-pro")) return { input: 30, cached: 30, output: 180, longContext: 272_000 };
+  if (model.includes("5.4-mini")) return { input: .75, cached: .075, output: 4.5 };
+  if (model.includes("5.4-nano")) return { input: .2, cached: .02, output: 1.25 };
+  if (model.includes("5.4")) return { input: 2.5, cached: .25, output: 15, longContext: 272_000 };
+  if (model.includes("gpt-5")) return { input: 1.25, cached: .125, output: 10 };
+  return null;
+}
+
+function estimatedAPICost(rawModel, components) {
+  const price = tokenPriceForModel(rawModel);
+  if (!price || !components) return null;
+  const input = Math.max(0, numberValue(components.inputTokens) || 0);
+  const cached = Math.min(input, Math.max(0, numberValue(components.cachedInputTokens) || 0));
+  const output = Math.max(0, numberValue(components.outputTokens) || 0);
+  const isLong = Number.isFinite(price.longContext) && input > price.longContext;
+  const inputMultiplier = isLong ? 2 : 1;
+  const outputMultiplier = isLong ? 1.5 : 1;
+  const uncachedInputCostUSD = (input - cached) / 1_000_000 * price.input * inputMultiplier;
+  const cachedInputCostUSD = cached / 1_000_000 * price.cached * inputMultiplier;
+  const outputCostUSD = output / 1_000_000 * price.output * outputMultiplier;
+  return {
+    estimatedCostUSD: uncachedInputCostUSD + cachedInputCostUSD + outputCostUSD,
+    uncachedInputCostUSD,
+    cachedInputCostUSD,
+    outputCostUSD
+  };
 }
 
 function responseUsageTotal(object) {
@@ -1555,6 +1814,24 @@ function estimateTextTokens(value) {
 }
 
 /**
+ * Forked subagents can replay the parent session into the new JSONL and stamp
+ * thousands of inherited token_count events into the first milliseconds. Only
+ * treat a dense prefix as replay so normal fast first responses remain intact.
+ */
+function importedSubagentTokenPrefixCount(events, subagentStartedAt) {
+  if (!Number.isFinite(subagentStartedAt)) return 0;
+  const replayEnd = subagentStartedAt + 2000;
+  let count = 0;
+  for (const event of events) {
+    if (!Number.isFinite(event.timestamp)
+        || event.timestamp < subagentStartedAt
+        || event.timestamp > replayEnd) break;
+    count += 1;
+  }
+  return count >= 8 ? count : 0;
+}
+
+/**
  * Prefer Codex cumulative token_count events, then provider response usage.
  * Some custom providers (including OpenAI-compatible DeepSeek gateways) leave
  * both sources at zero; in that case estimate only recorded user/assistant
@@ -1565,12 +1842,27 @@ function parseSessionDailyTokenText(text, startMs, endMs) {
   const deltaEvents = [];
   const estimatedEvents = [];
   const legacyEstimatedEvents = [];
+  let subagentStartedAt = null;
+  let currentModel = null;
   for (const line of String(text || "").split(/\r?\n/)) {
     if (!line) continue;
     let object;
     try { object = JSON.parse(line); }
     catch { continue; }
     const timestamp = Date.parse(object.timestamp || "");
+    const envelope = String(object?.type || "");
+    if (envelope === "turn_context" || envelope === "compacted") {
+      currentModel = object?.payload?.model
+        || object?.payload?.model_slug
+        || object?.payload?.modelSlug
+        || currentModel;
+    }
+    if (subagentStartedAt === null
+        && String(object?.type || "") === "session_meta"
+        && object?.payload?.source?.subagent
+        && Number.isFinite(timestamp)) {
+      subagentStartedAt = timestamp;
+    }
     if (!Number.isFinite(timestamp) || timestamp >= endMs) continue;
     const payload = object?.payload;
     const tokenCountEvent = String(object?.type || "") === "event_msg"
@@ -1579,7 +1871,18 @@ function parseSessionDailyTokenText(text, startMs, endMs) {
       const info = payload.info || payload.usage || {};
       const totalUsage = info.total_token_usage || info.totalTokenUsage || info;
       const tokens = usageTokenTotal(totalUsage);
-      if (tokens !== null && tokens >= 0) cumulativeEvents.push({ timestamp, tokens });
+      const lastUsage = info.last_token_usage || info.lastTokenUsage;
+      const lastTokens = usageTokenTotal(lastUsage);
+      const lastComponents = usageTokenComponents(lastUsage);
+      if (tokens !== null && tokens >= 0) {
+        cumulativeEvents.push({
+          timestamp,
+          tokens,
+          lastTokens: lastTokens !== null && lastTokens >= 0 ? lastTokens : null,
+          lastComponents,
+          model: currentModel
+        });
+      }
       continue;
     }
     const responseTokens = responseUsageTotal(object);
@@ -1599,22 +1902,69 @@ function parseSessionDailyTokenText(text, startMs, endMs) {
   const byDay = new Map();
   if (cumulativeEvents.some((event) => event.tokens > 0)) {
     cumulativeEvents.sort((left, right) => left.timestamp - right.timestamp);
+    const importedPrefixCount = importedSubagentTokenPrefixCount(
+      cumulativeEvents,
+      subagentStartedAt
+    );
     let previous = null;
-    for (const event of cumulativeEvents) {
+    const breakdown = {
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      estimatedCostUSD: 0,
+      uncachedInputCostUSD: 0,
+      cachedInputCostUSD: 0,
+      outputCostUSD: 0,
+      hasPricedUsage: false
+    };
+    for (const [index, event] of cumulativeEvents.entries()) {
+      if (index < importedPrefixCount) {
+        previous = event.tokens;
+        continue;
+      }
       if (event.timestamp < startMs) {
         // Keep the latest pre-window counter as the baseline. Unlike a max()
         // baseline this remains correct when a session counter was reset.
         previous = event.tokens;
         continue;
       }
-      const delta = previous === null
-        ? event.tokens
-        : event.tokens >= previous ? event.tokens - previous : event.tokens;
+      const delta = sessionTokenIncrement(previous, event.tokens, event.lastTokens);
       const date = dayKey(new Date(event.timestamp));
       byDay.set(date, Math.min(Number.MAX_SAFE_INTEGER, (byDay.get(date) || 0) + Math.max(0, delta)));
+      if (delta > 0 && event.lastComponents) {
+        breakdown.inputTokens = Math.min(
+          Number.MAX_SAFE_INTEGER,
+          breakdown.inputTokens + event.lastComponents.inputTokens
+        );
+        breakdown.cachedInputTokens = Math.min(
+          Number.MAX_SAFE_INTEGER,
+          breakdown.cachedInputTokens + event.lastComponents.cachedInputTokens
+        );
+        breakdown.outputTokens = Math.min(
+          Number.MAX_SAFE_INTEGER,
+          breakdown.outputTokens + event.lastComponents.outputTokens
+        );
+        const cost = estimatedAPICost(event.model, event.lastComponents);
+        if (cost) {
+          breakdown.estimatedCostUSD += cost.estimatedCostUSD;
+          breakdown.uncachedInputCostUSD += cost.uncachedInputCostUSD;
+          breakdown.cachedInputCostUSD += cost.cachedInputCostUSD;
+          breakdown.outputCostUSD += cost.outputCostUSD;
+          breakdown.hasPricedUsage = true;
+        }
+      }
       previous = event.tokens;
     }
     byDay.estimated = false;
+    byDay.breakdown = {
+      inputTokens: breakdown.inputTokens,
+      cachedInputTokens: Math.min(breakdown.inputTokens, breakdown.cachedInputTokens),
+      outputTokens: breakdown.outputTokens,
+      estimatedCostUSD: breakdown.hasPricedUsage ? breakdown.estimatedCostUSD : null,
+      uncachedInputCostUSD: breakdown.hasPricedUsage ? breakdown.uncachedInputCostUSD : null,
+      cachedInputCostUSD: breakdown.hasPricedUsage ? breakdown.cachedInputCostUSD : null,
+      outputCostUSD: breakdown.hasPricedUsage ? breakdown.outputCostUSD : null
+    };
     return byDay;
   }
 
@@ -1640,6 +1990,116 @@ function parseSessionTodayTokenText(text, startMs, endMs) {
   return total;
 }
 
+function parseSessionAllTimeTokenText(text) {
+  const cumulative = [];
+  const responseDeltas = [];
+  const estimatedMessages = [];
+  const legacyEstimatedMessages = [];
+  let subagentStartedAt = null;
+  let currentModel = null;
+  for (const line of String(text || "").split(/\r?\n/)) {
+    if (!line) continue;
+    let object;
+    try { object = JSON.parse(line); }
+    catch { continue; }
+    const timestamp = Date.parse(object.timestamp || "");
+    const envelope = String(object?.type || "");
+    if (envelope === "turn_context" || envelope === "compacted") {
+      currentModel = object?.payload?.model
+        || object?.payload?.model_slug
+        || object?.payload?.modelSlug
+        || currentModel;
+    }
+    if (subagentStartedAt === null
+        && String(object?.type || "") === "session_meta"
+        && object?.payload?.source?.subagent
+        && Number.isFinite(timestamp)) {
+      subagentStartedAt = timestamp;
+    }
+    const payload = object?.payload;
+    if (String(object?.type || "") === "event_msg"
+        && payload
+        && String(payload.type || "") === "token_count") {
+      const info = payload.info || payload.usage || {};
+      const totalUsage = info.total_token_usage || info.totalTokenUsage || info;
+      const tokens = usageTokenTotal(totalUsage);
+      const lastUsage = info.last_token_usage || info.lastTokenUsage;
+      const lastTokens = usageTokenTotal(lastUsage);
+      const lastComponents = usageTokenComponents(lastUsage);
+      if (tokens !== null && tokens >= 0) {
+        cumulative.push({
+          timestamp,
+          tokens,
+          lastTokens: lastTokens !== null && lastTokens >= 0 ? lastTokens : null,
+          lastComponents,
+          model: currentModel
+        });
+      }
+      continue;
+    }
+    const responseTokens = responseUsageTotal(object);
+    if (responseTokens !== null && responseTokens > 0) responseDeltas.push(responseTokens);
+    const messageTokens = estimateTextTokens(responseMessageText(object));
+    if (messageTokens > 0) estimatedMessages.push(messageTokens);
+    const legacyTokens = estimateTextTokens(legacyEventMessageText(object));
+    if (legacyTokens > 0) legacyEstimatedMessages.push(legacyTokens);
+  }
+
+  if (cumulative.some((event) => event.tokens > 0)) {
+    const importedPrefixCount = importedSubagentTokenPrefixCount(
+      cumulative,
+      subagentStartedAt
+    );
+    let previous = null;
+    let total = 0;
+    let estimatedCostUSD = 0;
+    let hasPricedUsage = false;
+    for (const [index, event] of cumulative.entries()) {
+      if (index < importedPrefixCount) {
+        previous = event.tokens;
+        continue;
+      }
+      const delta = sessionTokenIncrement(previous, event.tokens, event.lastTokens);
+      total = Math.min(Number.MAX_SAFE_INTEGER, total + Math.max(0, delta));
+      if (delta > 0 && event.lastComponents) {
+        const cost = estimatedAPICost(event.model, event.lastComponents);
+        if (cost) {
+          estimatedCostUSD += cost.estimatedCostUSD;
+          hasPricedUsage = true;
+        }
+      }
+      previous = event.tokens;
+    }
+    return {
+      tokens: total,
+      estimated: false,
+      ...(hasPricedUsage ? { estimatedCostUSD } : {})
+    };
+  }
+
+  const messageTokens = estimatedMessages.length ? estimatedMessages : legacyEstimatedMessages;
+  const deltas = responseDeltas.length ? responseDeltas : messageTokens;
+  if (!deltas.length) return null;
+  const total = deltas.reduce(
+    (sum, tokens) => Math.min(Number.MAX_SAFE_INTEGER, sum + Math.max(0, tokens)),
+    0
+  );
+  return { tokens: total, estimated: responseDeltas.length === 0 };
+}
+
+/**
+ * New Codex builds can interleave multiple cumulative counters in one JSONL.
+ * A changed cumulative value therefore is not itself a reliable delta. Prefer
+ * the per-event last usage and retain the legacy cumulative fallback for older
+ * session files that do not expose it.
+ */
+function sessionTokenIncrement(previous, total, lastUsage) {
+  if (previous !== null && total === previous) return 0;
+  if (lastUsage !== null && lastUsage !== undefined) return Math.max(0, lastUsage);
+  if (previous === null) return Math.max(0, total);
+  return total >= previous ? total - previous : Math.max(0, total);
+}
+
 async function discoverLocalUsageFiles(root, startMs, lookbackMs = SESSION_USAGE_LOOKBACK_MS) {
   const files = [];
   const visit = async (directory) => {
@@ -1657,7 +2117,7 @@ async function discoverLocalUsageFiles(root, startMs, lookbackMs = SESSION_USAGE
         const stat = await fs.promises.stat(file);
         // A resumed thread can live in an older date directory; mtime is the
         // reliable way to include it while avoiding reads of old log contents.
-        if (stat.mtimeMs >= startMs - lookbackMs) {
+        if (startMs === null || startMs === undefined || stat.mtimeMs >= startMs - lookbackMs) {
           files.push({ file, size: stat.size, modifiedAt: stat.mtimeMs });
         }
       } catch { /* 文件可能在扫描期间被轮换。 */ }
@@ -1672,6 +2132,14 @@ async function readLocalTodayTokens() {
   const day = resetLocalUsageDay();
   const files = await discoverLocalUsageFiles(codexSessionsRoot(), startMs, SESSION_USAGE_LOOKBACK_MS);
   let total = 0;
+  let inputTokens = 0;
+  let cachedInputTokens = 0;
+  let outputTokens = 0;
+  let estimatedCostUSD = 0;
+  let uncachedInputCostUSD = 0;
+  let cachedInputCostUSD = 0;
+  let outputCostUSD = 0;
+  let hasPricedUsage = false;
   let found = false;
   let estimated = false;
   for (const candidate of files) {
@@ -1692,7 +2160,11 @@ async function readLocalTodayTokens() {
         tokens = 0;
         for (const value of parsed.values()) tokens = Math.min(Number.MAX_SAFE_INTEGER, tokens + value);
       }
-      usage = tokens === null ? null : { tokens, estimated: parsed.estimated === true };
+      usage = tokens === null ? null : {
+        tokens,
+        estimated: parsed.estimated === true,
+        ...(parsed.breakdown || {})
+      };
       localUsageCache.set(candidate.file, {
         day,
         size: candidate.size,
@@ -1703,6 +2175,25 @@ async function readLocalTodayTokens() {
     if (!usage || usage.tokens === null || usage.tokens === undefined) continue;
     found = true;
     total = Math.min(Number.MAX_SAFE_INTEGER, total + Math.max(0, usage.tokens));
+    inputTokens = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      inputTokens + Math.max(0, numberValue(usage.inputTokens) || 0)
+    );
+    cachedInputTokens = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      cachedInputTokens + Math.max(0, numberValue(usage.cachedInputTokens) || 0)
+    );
+    outputTokens = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      outputTokens + Math.max(0, numberValue(usage.outputTokens) || 0)
+    );
+    if (Number.isFinite(Number(usage.estimatedCostUSD))) {
+      estimatedCostUSD += Number(usage.estimatedCostUSD);
+      uncachedInputCostUSD += Math.max(0, Number(usage.uncachedInputCostUSD) || 0);
+      cachedInputCostUSD += Math.max(0, Number(usage.cachedInputCostUSD) || 0);
+      outputCostUSD += Math.max(0, Number(usage.outputCostUSD) || 0);
+      hasPricedUsage = true;
+    }
     estimated ||= usage.estimated === true;
   }
   // Drop entries for files no longer in the current scan to keep long-running
@@ -1711,7 +2202,17 @@ async function readLocalTodayTokens() {
   for (const file of localUsageCache.keys()) {
     if (!currentPaths.has(file)) localUsageCache.delete(file);
   }
-  return found ? { tokens: total, estimated } : null;
+  return found ? {
+    tokens: total,
+    estimated,
+    inputTokens,
+    cachedInputTokens: Math.min(inputTokens, cachedInputTokens),
+    outputTokens,
+    estimatedCostUSD: hasPricedUsage ? estimatedCostUSD : null,
+    uncachedInputCostUSD: hasPricedUsage ? uncachedInputCostUSD : null,
+    cachedInputCostUSD: hasPricedUsage ? cachedInputCostUSD : null,
+    outputCostUSD: hasPricedUsage ? outputCostUSD : null
+  } : null;
 }
 
 function localHistoryBounds(reference = new Date()) {
@@ -1789,21 +2290,78 @@ async function readLocalDailyTokens(reference = new Date()) {
   return result;
 }
 
+async function readLocalTotalTokens(reference = new Date()) {
+  const files = await discoverLocalUsageFiles(codexSessionsRoot(), null);
+  let total = 0;
+  let estimatedCostUSD = 0;
+  let hasPricedUsage = false;
+  let found = false;
+  let estimated = false;
+  const activeDayKeys = new Set();
+  for (const candidate of files) {
+    const cached = localTotalCache.get(candidate.file);
+    let usage;
+    if (cached
+        && cached.size === candidate.size
+        && cached.modifiedAt === candidate.modifiedAt) {
+      usage = cached.usage;
+    } else {
+      let text;
+      try { text = await fs.promises.readFile(candidate.file, "utf8"); }
+      catch { continue; }
+      usage = parseSessionAllTimeTokenText(text);
+      if (usage) {
+        const daily = parseSessionDailyTokenText(text, 0, Number.MAX_SAFE_INTEGER);
+        usage.activeDayKeys = daily
+          ? [...daily.entries()]
+              .filter(([, tokens]) => Math.max(0, numberValue(tokens) || 0) > 0)
+              .map(([date]) => date)
+          : [];
+      }
+      localTotalCache.set(candidate.file, {
+        size: candidate.size,
+        modifiedAt: candidate.modifiedAt,
+        usage
+      });
+    }
+    if (!usage || usage.tokens === null || usage.tokens === undefined) continue;
+    found = true;
+    total = Math.min(Number.MAX_SAFE_INTEGER, total + Math.max(0, usage.tokens));
+    if (Number.isFinite(Number(usage.estimatedCostUSD))) {
+      estimatedCostUSD += Math.max(0, Number(usage.estimatedCostUSD));
+      hasPricedUsage = true;
+    }
+    estimated ||= usage.estimated === true;
+    for (const date of Array.isArray(usage.activeDayKeys) ? usage.activeDayKeys : []) {
+      activeDayKeys.add(String(date).slice(0, 10));
+    }
+  }
+  const currentPaths = new Set(files.map((candidate) => candidate.file));
+  for (const file of localTotalCache.keys()) {
+    if (!currentPaths.has(file)) localTotalCache.delete(file);
+  }
+  if (!found) return null;
+  const streak = calculateLocalUsageStreak(activeDayKeys, reference);
+  return {
+    tokens: total,
+    estimated,
+    estimatedCostUSD: hasPricedUsage ? estimatedCostUSD : null,
+    streakDays: streak.currentDays,
+    longestStreakDays: streak.longestDays
+  };
+}
+
 function isCustomModelProvider() {
   const provider = String(state.modelProvider || localSessionSnapshot?.modelProvider || "").trim().toLowerCase();
   return Boolean(provider) && provider !== "openai";
 }
 
 function shouldPromoteLocalTodayUsage() {
-  const auth = String(state.account?.auth || "");
-  return isCustomModelProvider() || (Boolean(auth) && auth !== "—");
+  return true;
 }
 
 function shouldPromoteLocalDailyUsage() {
-  // Session JSONL does not identify the ChatGPT account. Keep historical local
-  // buckets server-scoped for the native OpenAI+ChatGPT combination. API Key
-  // and custom providers use the complete local seven-day session history.
-  return isCustomModelProvider() || state.account?.auth !== "ChatGPT";
+  return true;
 }
 
 function currentAccountIdentity() {
@@ -1854,20 +2412,51 @@ async function refreshLocalDailyUsage(force = false) {
   return localHistoryRefreshPromise;
 }
 
+async function refreshLocalTotalUsage(force = false) {
+  if (localTotalRefreshPromise) return localTotalRefreshPromise;
+  if (!force
+      && localTotalLastReadAt > 0
+      && Date.now() - localTotalLastReadAt < LOCAL_TOTAL_MIN_REFRESH_MS) {
+    return localTotalLastValue;
+  }
+  const generation = localUsageGeneration;
+  localTotalRefreshPromise = readLocalTotalTokens()
+    .then((value) => {
+      if (generation !== localUsageGeneration) return null;
+      localTotalLastReadAt = Date.now();
+      localTotalLastValue = value;
+      return value;
+    })
+    .catch(() => null)
+    .finally(() => {
+      if (generation === localUsageGeneration) localTotalRefreshPromise = null;
+    });
+  return localTotalRefreshPromise;
+}
+
 async function publishLocalTodayUsage(force = false) {
-  if (!shouldPromoteLocalTodayUsage()) return;
   const day = resetLocalUsageDay();
   const accountIdentity = currentAccountIdentity();
   const generation = accountGeneration;
+  const isCurrentRefresh = () => generation === accountGeneration
+    && day === localUsageDayKey
+    && accountIdentity === currentAccountIdentity();
+
+  // Cache hit rate and today's estimated cost only need today's changed
+  // session files. Publish that fast path first instead of waiting for the
+  // all-history aggregate to walk the entire sessions tree.
   const localToday = await refreshLocalTodayUsage(force);
-  // Authentication can change while the filesystem scan is in flight. Recheck
-  // before publishing so a ChatGPT account switch cannot receive old logs.
-  if (localToday === null
-      || generation !== accountGeneration
-      || day !== localUsageDayKey
-      || accountIdentity !== currentAccountIdentity()
-      || !shouldPromoteLocalTodayUsage()) return;
-  publish({ usage: mergeLocalTodayUsage(state.usage, localToday) });
+  if (!isCurrentRefresh()) return;
+  if (localToday !== null) {
+    publish({ usage: mergeLocalTodayUsage(state.usage, localToday) });
+  }
+
+  // Total Token/cost is a background correction. Per-file metadata caches keep
+  // this inexpensive after startup, but it must never hold up the live metrics.
+  void refreshLocalTotalUsage(false).then((localTotal) => {
+    if (localTotal === null || !isCurrentRefresh()) return;
+    publish({ usage: mergeLocalTotalUsage(state.usage, localTotal) });
+  });
 }
 
 function mergeSessionConversation(snapshot) {
@@ -1888,15 +2477,21 @@ function mergeSessionConversation(snapshot) {
   return recorded.slice(-32);
 }
 
-function sessionTask(snapshot) {
+function sessionTask(snapshot, activeCount = 1) {
   const attention = snapshot.state === "attention";
+  const isSameThread = state.task?.threadID === snapshot.threadID;
   return {
     state: attention ? "attention" : "working",
     label: attention ? "等待授权" : "思考中",
     title: "Codex 正在处理",
     project: snapshot.cwd ? path.basename(snapshot.cwd) : null,
+    model: snapshot.model || (isSameThread ? state.task?.model : null) || null,
+    reasoningEffort: snapshot.reasoningEffort
+      || (isSameThread ? state.task?.reasoningEffort : null)
+      || null,
     startedAt: snapshot.startedAt || snapshot.modifiedAt || Date.now(),
     threadID: snapshot.threadID,
+    activeCount: Math.max(1, Number(activeCount) || 1),
     conversation: mergeSessionConversation(snapshot)
   };
 }
@@ -1923,6 +2518,13 @@ function parseSessionFile(file) {
     let runState = "working";
     let cwd = null;
     let modelProvider = null;
+    let model = null;
+    let reasoningEffort = null;
+    let totalTokens = null;
+    let lastUsageTokens = null;
+    let tokenObservedAt = 0;
+    let rateLimits = null;
+    let rateLimitsAt = 0;
     let threadID = path.basename(file, path.extname(file)).slice(-36);
     let conversation = [];
     let messageSequence = 0;
@@ -1960,6 +2562,11 @@ function parseSessionFile(file) {
       if (envelope === "session_meta") {
         cwd = payload.cwd || cwd;
         modelProvider = payload.model_provider || payload.modelProvider || modelProvider;
+        model = payload.model || payload.model_slug || payload.modelSlug || model;
+        reasoningEffort = payload.reasoning_effort
+          || payload.reasoningEffort
+          || payload.effort
+          || reasoningEffort;
         threadID = payload.id || threadID;
         continue;
       }
@@ -1968,10 +2575,40 @@ function parseSessionFile(file) {
         active = true;
         startedAt = startedAt || eventTime;
         cwd = payload.cwd || cwd;
+        model = payload.model || payload.model_slug || payload.modelSlug || model;
+        reasoningEffort = payload.reasoning_effort
+          || payload.reasoningEffort
+          || payload.effort
+          || reasoningEffort;
         runState = "working";
         continue;
       }
       if (envelope === "event_msg") {
+        if (payloadType === "token_count") {
+          const info = payload.info && typeof payload.info === "object"
+            ? payload.info
+            : payload.usage && typeof payload.usage === "object" ? payload.usage : {};
+          const totalUsage = info.total_token_usage || info.totalTokenUsage || info;
+          const nextTotalTokens = usageTokenTotal(totalUsage);
+          if (nextTotalTokens !== null && nextTotalTokens >= 0) {
+            totalTokens = nextTotalTokens;
+            const lastUsage = info.last_token_usage || info.lastTokenUsage;
+            const nextLastUsageTokens = usageTokenTotal(lastUsage);
+            lastUsageTokens = nextLastUsageTokens !== null && nextLastUsageTokens >= 0
+              ? nextLastUsageTokens
+              : null;
+            tokenObservedAt = eventTime || stat.mtimeMs;
+          }
+          const nextLimits = payload.rate_limits
+            ?? payload.rateLimits
+            ?? info.rate_limits
+            ?? info.rateLimits;
+          if (nextLimits && typeof nextLimits === "object") {
+            rateLimits = nextLimits;
+            rateLimitsAt = eventTime || stat.mtimeMs;
+          }
+          continue;
+        }
         if (["task_complete", "turn_complete", "turn_completed", "turn_aborted", "turn_failed"].includes(payloadType)) {
           recognized = true;
           active = false;
@@ -2073,6 +2710,13 @@ function parseSessionFile(file) {
       threadID,
       cwd,
       modelProvider,
+      model,
+      reasoningEffort,
+      totalTokens,
+      lastUsageTokens,
+      tokenObservedAt,
+      rateLimits,
+      rateLimitsAt,
       active,
       state: active ? runState : "idle",
       startedAt,
@@ -2089,7 +2733,73 @@ function parseSessionFile(file) {
   }
 }
 
-function applySessionSnapshot(snapshot) {
+function mergeRealtimeSessionUsage(snapshots) {
+  let usage = state.usage && typeof state.usage === "object"
+    ? { ...state.usage }
+    : normalizeUsage({});
+  let changed = false;
+  let velocityChanged = false;
+  let addedToday = 0;
+
+  for (const snapshot of snapshots) {
+    const total = numberValue(snapshot?.totalTokens);
+    if (total === null || total < 0) continue;
+    const key = String(snapshot.threadID || snapshot.file || "");
+    if (!key) continue;
+    const sampledAt = numberValue(snapshot.tokenObservedAt) || numberValue(snapshot.modifiedAt) || Date.now();
+    const previous = localThreadTokenSamples.get(key);
+    localThreadTokenSamples.set(key, { total, sampledAt });
+    if (!previous || total === previous.total) continue;
+
+    const lastUsage = numberValue(snapshot?.lastUsageTokens);
+    const delta = lastUsage !== null && lastUsage >= 0
+      ? lastUsage
+      : total > previous.total ? total - previous.total : 0;
+    if (delta <= 0) continue;
+    addedToday = Math.min(Number.MAX_SAFE_INTEGER, addedToday + delta);
+    changed = true;
+    const elapsedMs = sampledAt - previous.sampledAt;
+    if (elapsedMs > 0 && elapsedMs <= 5 * 60 * 1000) {
+      const raw = delta * 60_000 / Math.max(250, elapsedMs);
+      smoothedRealtimeTokenVelocity = smoothedRealtimeTokenVelocity === null
+        ? raw
+        : smoothedRealtimeTokenVelocity * 0.55 + raw * 0.45;
+      lastRealtimeTokenVelocityAt = Date.now();
+      velocityChanged = true;
+    }
+  }
+
+  if (!changed && !velocityChanged) return;
+  const daily = filledLocalDailyBuckets(usage.daily);
+  if (addedToday > 0) {
+    const localToday = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      Math.max(0, numberValue(usage.localToday) ?? numberValue(usage.today) ?? 0) + addedToday
+    );
+    usage.localToday = localToday;
+    usage.today = localToday;
+    if (daily.length) daily[daily.length - 1].tokens = localToday;
+    const localTotal = numberValue(usage.localTotal);
+    if (localTotal !== null) {
+      usage.localTotal = Math.min(Number.MAX_SAFE_INTEGER, localTotal + addedToday);
+      usage.total = usage.localTotal;
+    }
+  }
+  usage.daily = daily;
+  if (usage.localDailyAvailable) {
+    usage.localDaily = daily.map((bucket) => ({ ...bucket }));
+    usage.localSevenDayTokens = daily.reduce(
+      (sum, bucket) => Math.min(Number.MAX_SAFE_INTEGER, sum + Math.max(0, numberValue(bucket.tokens) || 0)),
+      0
+    );
+  }
+  if (velocityChanged) {
+    usage.tokenVelocityPerMinute = Math.max(0, Math.round(smoothedRealtimeTokenVelocity));
+  }
+  publish({ usage });
+}
+
+function applySessionSnapshot(snapshot, activeCount = localActiveTaskIDs.size) {
   if (!snapshot) return;
   const wasActiveFile = localSessionSnapshot?.active && localSessionSnapshot.file === snapshot.file;
   localSessionSnapshot = snapshot;
@@ -2097,9 +2807,9 @@ function applySessionSnapshot(snapshot) {
     publish({ modelProvider: snapshot.modelProvider });
   }
   if (snapshot.active) {
-    publish({ task: sessionTask(snapshot) });
+    publish({ task: sessionTask(snapshot, activeCount) });
   } else if (wasActiveFile || (state.task.state !== "idle" && Date.now() - snapshot.modifiedAt < 10_000)) {
-    publish({ task: { state: "idle", label: "空闲", title: null, project: null, startedAt: null, threadID: null, conversation: [] } });
+    publish({ task: { state: "idle", label: "空闲", title: null, project: null, model: null, reasoningEffort: null, startedAt: null, threadID: null, activeCount: 0, conversation: [] } });
   }
 }
 
@@ -2167,11 +2877,34 @@ async function refreshLocalSessionState(paths = null) {
     snapshots.push(snapshot);
   }
   const knownSnapshots = [...sessionCandidates.values()].map((item) => item.snapshot).filter(Boolean);
-  const active = knownSnapshots.filter((item) => item.active).sort((a, b) => b.modifiedAt - a.modifiedAt)[0];
-  if (active) applySessionSnapshot(active);
+  mergeRealtimeSessionUsage(knownSnapshots);
+  const activeSnapshots = knownSnapshots
+    .filter((item) => item.active)
+    .sort((a, b) => b.modifiedAt - a.modifiedAt);
+  localActiveTaskIDs = new Set(activeSnapshots.map((item) => item.threadID || item.file));
+
+  const newestRateLimits = knownSnapshots
+    .filter((item) => item.rateLimits && item.rateLimitsAt > lastLocalRateLimitEventAt)
+    .sort((left, right) => right.rateLimitsAt - left.rateLimitsAt)[0];
+  if (newestRateLimits) {
+    lastLocalRateLimitEventAt = newestRateLimits.rateLimitsAt;
+    const raw = newestRateLimits.rateLimits;
+    const payload = raw.rateLimits || raw.rate_limits || raw.rateLimitsByLimitId || raw.rate_limits_by_limit_id
+      ? raw
+      : raw.primary || raw.secondary
+        ? { rateLimitsByLimitId: { codex: raw } }
+        : { rateLimitsByLimitId: raw };
+    applyRateLimitPayload(payload, { acceptedAt: Date.now(), merge: true });
+  }
+
+  const active = activeSnapshots[0];
+  if (active) applySessionSnapshot(active, localActiveTaskIDs.size);
   else if (snapshots.length) {
     const completedActive = snapshots.find((item) => item.file === previousActiveFile && !item.active);
-    applySessionSnapshot(completedActive || snapshots.sort((a, b) => b.modifiedAt - a.modifiedAt)[0]);
+    applySessionSnapshot(
+      completedActive || snapshots.sort((a, b) => b.modifiedAt - a.modifiedAt)[0],
+      0
+    );
   }
 }
 
@@ -2185,7 +2918,7 @@ function scheduleSessionRefresh(file = null) {
     await refreshLocalSessionState(paths.length ? paths : null);
     // Session writes are the fastest signal for API-key usage; do not wait for
     // the next remote profile refresh to update today's local aggregate.
-    await publishLocalTodayUsage();
+    await publishLocalTodayUsage(paths.length > 0);
   }, 45);
 }
 
@@ -2202,7 +2935,7 @@ async function pollSessionCandidates() {
   }));
   if (changed.length) {
     await refreshLocalSessionState(changed);
-    await publishLocalTodayUsage();
+    await publishLocalTodayUsage(true);
   }
 }
 
@@ -2218,18 +2951,27 @@ function stopSessionMonitoring() {
   pendingSessionPaths.clear();
   sessionCandidates.clear();
   localSessionSnapshot = null;
+  localActiveTaskIDs = new Set();
+  lastLocalRateLimitEventAt = 0;
   // CODEX_HOME or account transitions can replace the session tree; never
-  // reuse a cached aggregate from the previous process/account context.
+  // reuse a cached aggregate if the underlying local tree changed.
   localUsageCache.clear();
   localHistoryCache.clear();
+  localTotalCache.clear();
   localUsageDayKey = null;
   localUsageGeneration += 1;
   localUsageRefreshPromise = null;
   localHistoryRefreshPromise = null;
+  localTotalRefreshPromise = null;
   localUsageLastReadAt = 0;
   localUsageLastValue = null;
   localHistoryLastReadAt = 0;
   localHistoryLastValue = null;
+  localTotalLastReadAt = 0;
+  localTotalLastValue = null;
+  localThreadTokenSamples.clear();
+  smoothedRealtimeTokenVelocity = null;
+  lastRealtimeTokenVelocityAt = 0;
 }
 
 async function startSessionMonitoring() {
@@ -2361,13 +3103,17 @@ async function performAccountTransition(restartRPC) {
   }
   accountReloadInFlight = true;
   accountGeneration += 1;
+  lastAcceptedLimitsAt = 0;
   clearTimeout(refreshTimer);
+  clearTimeout(limitsNotificationRefreshTimer);
   const cliPath = state.cliPath;
+  const localUsage = deviceLocalUsageSnapshot(state.usage);
   publish({
     account: { email: null, maskedEmail: "—", plan: "—", auth: "—" },
     limits: [],
+    limitsUpdatedAt: null,
     resetCards: [],
-    usage: normalizeUsage({}),
+    usage: localUsage,
     message: "检测到 Codex 账号切换，正在同步新账号…"
   });
 
@@ -2407,16 +3153,37 @@ function threadStatus(thread) {
 
 function normalizeTask(result) {
   const threads = result.data || result.threads || [];
-  const active = threads.find((thread) => threadStatus(thread) !== "idle");
-  if (!active) return { state: "idle", label: "空闲", title: null, project: null, startedAt: null };
+  const activeThreads = threads.filter((thread) => threadStatus(thread) !== "idle");
+  const active = activeThreads[0];
+  if (!active) {
+    return {
+      state: "idle",
+      label: "空闲",
+      title: null,
+      project: null,
+      model: null,
+      reasoningEffort: null,
+      startedAt: null,
+      threadID: null,
+      activeCount: 0,
+      activeThreadIDs: []
+    };
+  }
   const mode = threadStatus(active);
   const cwd = active.cwd?.value || active.cwd || "";
+  const activeThreadIDs = activeThreads.map((thread, index) =>
+    String(thread.id || thread.threadId || thread.thread_id || `remote-${index}`));
   return {
     state: mode,
     label: mode === "attention" ? "等待授权" : "思考中",
     title: active.name || active.preview || "Codex 正在处理",
     project: cwd ? path.basename(cwd) : null,
-    startedAt: (numberValue(active.createdAt) || numberValue(active.updatedAt) || Date.now() / 1000) * 1000
+    model: active.model || active.modelName || active.model_name || null,
+    reasoningEffort: active.effort || active.reasoningEffort || active.reasoning_effort || null,
+    startedAt: (numberValue(active.createdAt) || numberValue(active.updatedAt) || Date.now() / 1000) * 1000,
+    threadID: activeThreadIDs[0],
+    activeCount: activeThreadIDs.length,
+    activeThreadIDs
   };
 }
 
@@ -2430,36 +3197,71 @@ async function refreshAccount() {
     // previously observed account state, including an explicit logout.
     const hadKnownAccount = Boolean(state.account?.auth) && state.account.auth !== "—";
     const changed = hadKnownAccount && previousIdentity !== nextIdentity;
-    if (changed) accountGeneration += 1;
+    if (changed) {
+      accountGeneration += 1;
+      lastAcceptedLimitsAt = 0;
+    }
     publish(changed
-      ? { account, limits: [], resetCards: [], usage: normalizeUsage({}) }
+      ? {
+          account,
+          limits: [],
+          limitsUpdatedAt: null,
+          resetCards: [],
+          usage: deviceLocalUsageSnapshot(state.usage)
+        }
       : { account });
   }
   catch (error) { publish({ message: error.message }); }
 }
 
-async function refreshLimits() {
-  if (!rpc) return;
-  try {
-    const normalized = normalizeLimits(await rpc.request("account/rateLimits/read", {}, 25000));
-    publish({ limits: normalized.limits, resetCards: normalized.cards });
-  } catch (error) { publish({ message: `额度刷新失败：${error.message}` }); }
+function refreshLimits() {
+  if (!rpc) return Promise.resolve();
+  if (limitsRefreshPromise) {
+    limitsRefreshQueued = true;
+    return limitsRefreshPromise;
+  }
+
+  const client = rpc;
+  const generation = accountGeneration;
+  const requestedAt = Date.now();
+  limitsRefreshInFlight = true;
+  limitsRefreshPromise = (async () => {
+    try {
+      const result = await client.request("account/rateLimits/read", {}, 25000);
+      if (client !== rpc || generation !== accountGeneration) return;
+      applyRateLimitPayload(result, { acceptedAt: requestedAt, merge: false });
+    } catch (error) {
+      if (client === rpc && generation === accountGeneration) {
+        publish({ message: `额度刷新失败：${error.message}` });
+      }
+    }
+  })().finally(() => {
+    limitsRefreshPromise = null;
+    limitsRefreshInFlight = false;
+    if (limitsRefreshQueued) {
+      limitsRefreshQueued = false;
+      scheduleRateLimitsRefresh(0);
+    }
+  });
+  return limitsRefreshPromise;
 }
 
 async function refreshUsage() {
   const refreshDay = resetLocalUsageDay();
   const accountIdentity = currentAccountIdentity();
   const generation = accountGeneration;
+  const localPromise = Promise.all([
+    refreshLocalTodayUsage(true),
+    refreshLocalDailyUsage(true),
+    refreshLocalTotalUsage(true)
+  ]);
   if (!rpc) {
-    const [localToday, localDaily] = await Promise.all([
-      refreshLocalTodayUsage(true),
-      refreshLocalDailyUsage(false)
-    ]);
+    const [localToday, localDaily, localTotal] = await localPromise;
     if (generation !== accountGeneration
         || refreshDay !== localUsageDayKey
         || accountIdentity !== currentAccountIdentity()) return;
     publish({
-      usage: mergeLocalSessionFallback(state.usage, localToday, localDaily)
+      usage: mergeLocalSessionFallback(state.usage, localToday, localDaily, localTotal)
     });
     return;
   }
@@ -2469,44 +3271,31 @@ async function refreshUsage() {
     usage = normalizeUsage(await rpc.request("account/usage/read", {}, 25000));
   } catch (error) {
     remoteUsageFailed = true;
-    // Keep the last account-scoped snapshot during a transient RPC failure;
-    // account transitions clear it before requesting the new account.
+    // Device-local Token values survive a remote profile failure and account switch.
     usage = state.usage && typeof state.usage === "object"
       ? state.usage
       : normalizeUsage({});
     publish({ message: `Token 刷新失败：${error.message}` });
   }
 
-  // API Key accounts usually return no ChatGPT activity buckets. Merge the
-  // complete local-session history so the 7-day chart remains useful in that
-  // mode. The separate today reader remains the authoritative fast path for
-  // the headline while the history reader fills all seven buckets.
-  if (remoteUsageFailed) {
-    const [localToday, localDaily] = await Promise.all([
-      refreshLocalTodayUsage(true),
-      refreshLocalDailyUsage(false)
-    ]);
-    if (generation === accountGeneration
-        && accountIdentity === currentAccountIdentity()) {
-      usage = mergeLocalSessionFallback(usage, localToday, localDaily);
-    }
-  } else if (shouldPromoteLocalTodayUsage()) {
-    const [localToday, localDaily] = await Promise.all([
-      refreshLocalTodayUsage(true),
-      shouldPromoteLocalDailyUsage() ? refreshLocalDailyUsage(true) : Promise.resolve(null)
-    ]);
-    if (generation === accountGeneration
-        && accountIdentity === currentAccountIdentity()
-        && shouldPromoteLocalTodayUsage()) {
-      if (localToday !== null) usage = mergeLocalTodayUsage(usage, localToday);
-      if (localDaily !== null && shouldPromoteLocalDailyUsage()) {
-        usage = mergeLocalDailyUsage(usage, localDaily);
-      }
-    }
-  }
+  const [localToday, localDaily, localTotal] = await localPromise;
   if (generation !== accountGeneration
       || refreshDay !== localUsageDayKey
       || accountIdentity !== currentAccountIdentity()) return;
+  if (remoteUsageFailed) {
+    usage = mergeLocalSessionFallback(usage, localToday, localDaily, localTotal);
+  } else {
+    // Order matters: the cached seven-day scan lands first, then the fast today
+    // reader overwrites today's bucket, and finally the full-history total lands.
+    if (localDaily !== null) usage = mergeLocalDailyUsage(usage, localDaily);
+    if (localToday !== null) usage = mergeLocalTodayUsage(usage, localToday);
+    if (localTotal !== null) usage = mergeLocalTotalUsage(usage, localTotal);
+  }
+  const hasFreshRealtimeVelocity = Date.now() - lastRealtimeTokenVelocityAt <= 20_000;
+  const isTaskActive = state.task?.state === "working" || state.task?.state === "attention";
+  usage.tokenVelocityPerMinute = hasFreshRealtimeVelocity && isTaskActive
+    ? numberValue(state.usage?.tokenVelocityPerMinute)
+    : null;
   publish({ usage });
 }
 
@@ -2516,10 +3305,19 @@ async function refreshThreads() {
     const remoteTask = normalizeTask(await rpc.request("thread/list", { limit: 30, archived: false }, 5000));
     let task = remoteTask;
     if (localSessionSnapshot?.active) {
-      task = sessionTask(localSessionSnapshot);
-    } else if (localSessionSnapshot && Date.now() - localSessionSnapshot.modifiedAt < 10_000) {
+      const activeIDs = new Set([
+        ...(remoteTask.activeThreadIDs || []),
+        ...localActiveTaskIDs
+      ]);
+      task = sessionTask(localSessionSnapshot, Math.max(1, activeIDs.size));
+    } else if (remoteTask.activeCount === 0
+        && localSessionSnapshot
+        && Date.now() - localSessionSnapshot.modifiedAt < 10_000) {
       // final_answer/task_complete 比独立 app-server 的 thread/list 更新更及时。
-      task = { state: "idle", label: "空闲", title: null, project: null, startedAt: null, threadID: null, conversation: [] };
+      task = { state: "idle", label: "空闲", title: null, project: null, model: null, reasoningEffort: null, startedAt: null, threadID: null, activeCount: 0, conversation: [] };
+    } else {
+      const { activeThreadIDs: _activeThreadIDs, ...publicTask } = remoteTask;
+      task = publicTask;
     }
     publish({ task });
   }
@@ -2528,9 +3326,8 @@ async function refreshThreads() {
 
 async function refreshAll(forceUsage = false) {
   if (!rpc) return;
-  // Usage promotion depends on the authenticated account mode. Resolve the
-  // account before starting the parallel profile requests so an API Key switch
-  // cannot race with a stale "—" auth value.
+  // Resolve account identity first so quota/reset cards remain isolated. Token
+  // values are merged from device sessions independently inside refreshUsage().
   await refreshAccount();
   await Promise.allSettled([
     refreshLimits(),
@@ -2553,9 +3350,8 @@ function armRefreshLoop() {
     const limitsInterval = active ? 3_000 : 8_000;
     const usageInterval = active ? 5_000 : 12_000;
     if (!limitsRefreshInFlight && now - lastLimitsRefreshAt >= limitsInterval) {
-      limitsRefreshInFlight = true;
       lastLimitsRefreshAt = now;
-      void refreshLimits().finally(() => { limitsRefreshInFlight = false; });
+      void refreshLimits();
     }
     if (!usageRefreshInFlight && now - lastUsageRefreshAt >= usageInterval) {
       usageRefreshInFlight = true;
@@ -2615,8 +3411,7 @@ async function connect(customPath) {
     startAuthMonitoring();
     await startSessionMonitoring();
     await refreshAll(true);
-    // Populate local 7-day buckets immediately on startup; do not wait for the
-    // next session write/watch event before drawing the API Key history chart.
+    // Reconcile the fast today/lifetime paths once more after watchers start.
     await publishLocalTodayUsage();
     lastLimitsRefreshAt = Date.now();
     lastUsageRefreshAt = Date.now();
@@ -3032,11 +3827,13 @@ function startCodexWindowWatcher() {
     "    } | Sort-Object @{ Expression = { if ($_.ProcessName -eq 'Codex') { 0 } else { 1 } } } | Select-Object -First 1;",
     "    $h = if ($null -eq $p) { [IntPtr]::Zero } else { $p.MainWindowHandle };",
     "  }",
-    "  if ($h -eq [IntPtr]::Zero) { Write-Output 'null' } else {",
+    "  if ($h -eq [IntPtr]::Zero) { [Console]::Out.WriteLine('null') } else {",
     "    $physical = $false;",
     "    if (-not [PulseWindowRect]::IsIconic($h) -and [PulseWindowRect]::TryGetVisibleRect($h, [ref]$r, [ref]$physical)) {",
-    "      @{ handle=$h.ToInt64().ToString(); left=$r.Left; top=$r.Top; right=$r.Right; bottom=$r.Bottom; physical=$physical } | ConvertTo-Json -Compress",
-    "    } else { Write-Output 'null' }",
+    "      $json = @{ handle=$h.ToInt64().ToString(); left=$r.Left; top=$r.Top; right=$r.Right; bottom=$r.Bottom; physical=$physical } | ConvertTo-Json -Compress;",
+    "      [Console]::Out.WriteLine($json)",
+    "    } else { [Console]::Out.WriteLine('null') }",
+    "    [Console]::Out.Flush()",
     "  }",
     "  Start-Sleep -Milliseconds 8",
     "}"
@@ -3091,11 +3888,20 @@ function codexDockFrameForBounds(bounds = codexWindowBounds, edge = codexDockEdg
   const display = screen.getDisplayMatching(bounds);
   const full = display.bounds;
   const work = display.workArea;
-  const fillsDisplay = bounds.x <= full.x + 3
-    && bounds.y <= full.y + 3
-    && bounds.x + bounds.width >= full.x + full.width - 3
-    && bounds.y + bounds.height >= full.y + full.height - 3;
-  if (fillsDisplay) return null;
+  const fillsDisplay = isFullscreenWindowBounds(bounds, full, 4);
+  if (fillsDisplay) {
+    return edge === "top"
+      ? fullscreenTopDockFrame(bounds, {
+          thickness: CODEX_DOCK_HORIZONTAL_THICKNESS,
+          overlap: CODEX_DOCK_OVERLAP,
+          topInset: CODEX_DOCK_FULLSCREEN_TOP_INSET,
+          widthRatio: CODEX_DOCK_FULLSCREEN_WIDTH_RATIO,
+          minimumWidth: CODEX_DOCK_FULLSCREEN_MIN_WIDTH,
+          maximumWidth: CODEX_DOCK_FULLSCREEN_MAX_WIDTH,
+          horizontalMargin: CODEX_DOCK_FULLSCREEN_HORIZONTAL_MARGIN
+        })
+      : null;
+  }
   let frame;
   if (edge === "top") {
     frame = {
@@ -3134,6 +3940,13 @@ function codexDockFrameForBounds(bounds = codexWindowBounds, edge = codexDockEdg
 }
 
 function codexDockTargetsForBounds(bounds = codexWindowBounds) {
+  if (bounds && screen) {
+    const display = screen.getDisplayMatching(bounds);
+    if (isFullscreenWindowBounds(bounds, display.bounds, 4)) {
+      const frame = codexDockFrameForBounds(bounds, "top");
+      return frame ? [{ edge: "top", frame }] : [];
+    }
+  }
   return ["top", "bottom", "left", "right"].flatMap((edge) => {
     const frame = codexDockFrameForBounds(bounds, edge);
     return frame ? [{ edge, frame }] : [];
@@ -3200,10 +4013,20 @@ function stopCodexDockFollow() {
   codexDockFollowTimer = null;
   codexDockFollowTarget = null;
   codexDockFollowLastAt = 0;
+  codexDockFollowPreviousTarget = null;
+  codexDockFollowPreviousTargetAt = 0;
 }
 
-function applyAttachedCodexDockShape(width, height, edge = codexDockEdge) {
-  const shape = attachedDockShape(width, height, edge, CODEX_DOCK_OVERLAP);
+function applyAttachedCodexDockShape(
+  width,
+  height,
+  edge = codexDockEdge,
+  fullScreen = codexDockFullscreen
+) {
+  // 全屏顶部脊的透明重叠区位于上方，因此使用底部吸附的绘制/点击轮廓；
+  // 交互方向仍由实际的 top edge 决定。
+  const visualEdge = fullScreen ? "bottom" : edge;
+  const shape = attachedDockShape(width, height, visualEdge, CODEX_DOCK_OVERLAP);
   const signature = JSON.stringify([shape]);
   windowShapeBounds = shape;
   if (windowShapeSignature === signature) return;
@@ -3225,12 +4048,43 @@ function nextCodexDockCoordinate(current, target, alpha) {
 
 function followCodexDockFrame(target, immediate = false) {
   if (!windowRef || windowRef.isDestroyed() || !target) return;
-  codexDockFollowTarget = {
+  const sampledAt = performance.now();
+  const rawTarget = {
     x: Math.round(target.x),
     y: Math.round(target.y),
     width: Math.round(target.width),
     height: Math.round(target.height)
   };
+  const previousTarget = codexDockFollowPreviousTarget;
+  const previousTargetAt = codexDockFollowPreviousTargetAt;
+  codexDockFollowPreviousTarget = rawTarget;
+  codexDockFollowPreviousTargetAt = sampledAt;
+
+  // ReadDirectory/PowerShell coordinates arrive a few milliseconds after the
+  // native Codex frame moved. Lead only the translation axes by a fraction of
+  // the latest sample delta, then converge to the exact frame on the next
+  // stationary sample. This removes visible trailing without overshooting a
+  // resize or leaving the dock displaced after the drag stops.
+  const sampleElapsed = previousTargetAt > 0
+    ? sampledAt - previousTargetAt
+    : Number.POSITIVE_INFINITY;
+  const canPredict = !immediate
+    && previousTarget
+    && sampleElapsed > 0
+    && sampleElapsed <= 40
+    && previousTarget.width === rawTarget.width
+    && previousTarget.height === rawTarget.height;
+  const lead = (current, previous) => Math.max(
+    -12,
+    Math.min(12, Math.round((current - previous) * 0.42))
+  );
+  codexDockFollowTarget = canPredict
+    ? {
+        ...rawTarget,
+        x: rawTarget.x + lead(rawTarget.x, previousTarget.x),
+        y: rawTarget.y + lead(rawTarget.y, previousTarget.y)
+      }
+    : rawTarget;
   if (immediate) {
     clearTimeout(codexDockFollowTimer);
     codexDockFollowTimer = null;
@@ -3255,9 +4109,10 @@ function followCodexDockFrame(target, immediate = false) {
       ? Math.min(34, Math.max(4, now - codexDockFollowLastAt))
       : 8;
     codexDockFollowLastAt = now;
-    // A time-based spring-like low-pass removes the 16ms PowerShell
-    // staircase while staying close enough to the native Codex window.
-    const alpha = Math.min(0.68, Math.max(0.24, 1 - Math.exp(-elapsed / 22)));
+    // Keep just enough interpolation to hide sub-pixel sampling steps. The
+    // former 22ms low-pass visibly trailed the host window; this 7ms response
+    // reaches a new sample in one or two frames.
+    const alpha = Math.min(0.96, Math.max(0.64, 1 - Math.exp(-elapsed / 7)));
     const current = windowRef.getBounds();
     const next = {
       x: nextCodexDockCoordinate(current.x, codexDockFollowTarget.x, alpha),
@@ -3339,6 +4194,19 @@ function syncAttachedCodexDock(forceNotify = false) {
   if ((!codexDockAttached && !codexDockRestorePending)
       || !windowRef
       || windowRef.isDestroyed()) return;
+  const display = codexWindowBounds && screen
+    ? screen.getDisplayMatching(codexWindowBounds)
+    : null;
+  const nextFullscreen = Boolean(
+    codexWindowBounds
+      && display
+      && isFullscreenWindowBounds(codexWindowBounds, display.bounds, 4)
+  );
+  const nextEdge = nextFullscreen ? "top" : codexDockPreferredEdge;
+  const attachmentModeChanged = nextEdge !== codexDockEdge
+    || nextFullscreen !== codexDockFullscreen;
+  codexDockEdge = nextEdge;
+  codexDockFullscreen = nextFullscreen;
   const target = codexDockFrameForBounds(codexWindowBounds, codexDockEdge);
   if (!target) {
     stopCodexDockFollow();
@@ -3358,14 +4226,22 @@ function syncAttachedCodexDock(forceNotify = false) {
     restoringAttachment || currentWindowLayoutMode !== "codex-dock" || forceNotify
   );
   const currentBounds = windowRef.getContentBounds();
-  applyAttachedCodexDockShape(currentBounds.width, currentBounds.height, codexDockEdge);
-  if (currentWindowLayoutMode !== "codex-dock" || forceNotify) {
+  applyAttachedCodexDockShape(
+    currentBounds.width,
+    currentBounds.height,
+    codexDockEdge,
+    codexDockFullscreen
+  );
+  if (currentWindowLayoutMode !== "codex-dock"
+      || forceNotify
+      || attachmentModeChanged) {
     currentWindowLayoutMode = "codex-dock";
     windowRef.webContents.send("pulse:codex-dock-transition", {
       phase: "attached",
       width: target.width,
       height: target.height,
       edge: codexDockEdge,
+      fullscreen: codexDockFullscreen,
       restored: true
     });
   }
@@ -3388,9 +4264,20 @@ function attachCodexDock(frame = codexDockCandidate) {
   codexDockTransition = "attaching";
   codexDockRestorePending = false;
   codexDockEdge = codexDockCandidateEdge || "bottom";
+  codexDockPreferredEdge = codexDockEdge;
+  const display = codexWindowBounds && screen
+    ? screen.getDisplayMatching(codexWindowBounds)
+    : null;
+  codexDockFullscreen = Boolean(
+    codexWindowBounds
+      && display
+      && isFullscreenWindowBounds(codexWindowBounds, display.bounds, 4)
+  );
+  if (codexDockFullscreen) codexDockEdge = "top";
   writeSettings({
     codexDockAttached: true,
     codexDockEdge,
+    codexDockPreferredEdge,
     codexDockPreviousLayout
   });
   hideCodexDockPreview();
@@ -3399,7 +4286,8 @@ function attachCodexDock(frame = codexDockCandidate) {
     phase: "attaching",
     width: frame.width,
     height: frame.height,
-    edge: codexDockEdge
+    edge: codexDockEdge,
+    fullscreen: codexDockFullscreen
   });
   clearTimeout(codexDockTransitionTimer);
   codexDockTransitionTimer = setTimeout(() => {
@@ -3412,14 +4300,20 @@ function attachCodexDock(frame = codexDockCandidate) {
     currentWindowLayoutMode = "codex-dock";
     windowRef.setAlwaysOnTop(false);
     followCodexDockFrame(frame, true);
-    applyAttachedCodexDockShape(frame.width, frame.height, codexDockEdge);
+    applyAttachedCodexDockShape(
+      frame.width,
+      frame.height,
+      codexDockEdge,
+      codexDockFullscreen
+    );
     if (!windowRef.isVisible()) windowRef.showInactive();
     keepCodexDockVisible(true);
     windowRef.webContents.send("pulse:codex-dock-transition", {
       phase: "attached",
       width: frame.width,
       height: frame.height,
-      edge: codexDockEdge
+      edge: codexDockEdge,
+      fullscreen: codexDockFullscreen
     });
   }, 220);
   return true;
@@ -3481,13 +4375,16 @@ function detachCodexDock({ pointer = null, restoreSavedPosition = false } = {}) 
   windowRef.webContents.send("pulse:codex-dock-transition", {
     phase: "detaching",
     mode: previous?.mode || "collapsed",
-    edge: codexDockEdge
+    edge: codexDockEdge,
+    fullscreen: codexDockFullscreen
   });
   currentWindowLayoutMode = previous?.mode || "collapsed";
   windowRef.setBounds(target, false);
   windowShapeBounds = { x: 0, y: 0, width: target.width, height: target.height };
   windowShapeSignature = JSON.stringify([windowShapeBounds]);
   windowRef.setShape([windowShapeBounds]);
+  codexDockFullscreen = false;
+  codexDockEdge = codexDockPreferredEdge;
   if (!windowRef.isVisible()) windowRef.showInactive();
   clearTimeout(codexDockTransitionTimer);
   codexDockTransitionTimer = setTimeout(() => {
@@ -3649,6 +4546,14 @@ function createTray() {
 }
 
 ipcMain.handle("pulse:get-state", () => state);
+ipcMain.handle("pulse:refresh-limits", async () => {
+  await refreshLimits();
+  return {
+    limits: state.limits,
+    resetCards: state.resetCards,
+    limitsUpdatedAt: state.limitsUpdatedAt || null
+  };
+});
 ipcMain.handle("pulse:refresh", async () => {
   if (!rpc) await connect();
   else await refreshAll(true);
@@ -3686,8 +4591,13 @@ ipcMain.handle("pulse:set-information-location", (_event, location) => {
 ipcMain.handle("pulse:open-external", (_event, rawURL) => {
   try {
     const url = new URL(String(rawURL || ""));
-    const allowed = url.protocol === "https:"
-      && ["open-meteo.com", "www.open-meteo.com", "geonames.org", "www.geonames.org"].includes(url.hostname.toLowerCase());
+    const hostname = url.hostname.toLowerCase();
+    const allowedUsagePage = hostname === "chatgpt.com"
+      && url.pathname === "/codex/settings/usage";
+    const allowed = url.protocol === "https:" && (
+      allowedUsagePage
+      || ["open-meteo.com", "www.open-meteo.com", "geonames.org", "www.geonames.org"].includes(hostname)
+    );
     if (!allowed) return false;
     void shell.openExternal(url.toString());
     return true;
@@ -3974,9 +4884,18 @@ app.whenReady().then(() => {
   state.followCodexLaunch = startupSettings.followCodexLaunch === true;
   codexDockAttached = false;
   codexDockRestorePending = startupSettings.codexDockAttached === true;
-  codexDockEdge = ["top", "bottom", "left", "right"].includes(startupSettings.codexDockEdge)
+  codexDockPreferredEdge = [
+    "top",
+    "bottom",
+    "left",
+    "right"
+  ].includes(startupSettings.codexDockPreferredEdge)
+    ? startupSettings.codexDockPreferredEdge
+    : ["top", "bottom", "left", "right"].includes(startupSettings.codexDockEdge)
     ? startupSettings.codexDockEdge
     : "bottom";
+  codexDockEdge = codexDockPreferredEdge;
+  codexDockFullscreen = false;
   codexDockPreviousLayout = startupSettings.codexDockPreviousLayout || null;
   session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
     void desktopCapturer.getSources({
@@ -4002,6 +4921,7 @@ app.whenReady().then(() => {
   armLocalUsageDayTimer();
   powerMonitor.on("resume", () => {
     void handleLocalUsageDayBoundary(new Date()).finally(() => armLocalUsageDayTimer());
+    void refreshLimits();
     triggerAutomaticUpdateCheck(true);
     if (windowRef && !windowRef.isDestroyed()) {
       windowRef.webContents.send("pulse:system-resume");
@@ -4025,6 +4945,7 @@ app.on("before-quit", () => {
     codexDockPreviewRef.destroy();
   }
   clearTimeout(refreshTimer);
+  clearTimeout(limitsNotificationRefreshTimer);
   clearTimeout(localUsageDayTimer);
   clearTimeout(weatherRefreshTimer);
   clearTimeout(updateRefreshTimer);

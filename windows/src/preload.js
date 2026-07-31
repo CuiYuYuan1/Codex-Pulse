@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 contextBridge.exposeInMainWorld("pulse", {
   getState: () => ipcRenderer.invoke("pulse:get-state"),
   refresh: () => ipcRenderer.invoke("pulse:refresh"),
+  refreshLimits: () => ipcRenderer.invoke("pulse:refresh-limits"),
   checkForUpdates: () => ipcRenderer.invoke("pulse:check-update"),
   notifyNetworkOnline: () => ipcRenderer.send("pulse:network-online"),
   performUpdate: () => ipcRenderer.invoke("pulse:perform-update"),

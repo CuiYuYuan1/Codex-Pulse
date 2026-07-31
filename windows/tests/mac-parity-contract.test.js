@@ -40,6 +40,10 @@ const menuBarPanel = fs.readFileSync(
   path.join(root, "CodexPulse/Views/MenuBar/MenuBarPanelView.swift"),
   "utf8"
 );
+const dashboard = fs.readFileSync(
+  path.join(root, "CodexPulse/Views/Dashboard/DashboardView.swift"),
+  "utf8"
+);
 const settingsStore = fs.readFileSync(path.join(root, "Shared/Storage/SettingsStore.swift"), "utf8");
 const petGrowthSwift = fs.readFileSync(path.join(root, "Shared/Utilities/PetGrowth.swift"), "utf8");
 const snapshotStore = fs.readFileSync(path.join(root, "Shared/Storage/SnapshotStore.swift"), "utf8");
@@ -164,6 +168,26 @@ includes(
 );
 includes(
   capsuleController,
+  "let edge: CodexDockEdge = isFullScreen ? .top : preferredEdge",
+  "macOS full-screen Codex always migrates an existing dock to the top"
+);
+includes(
+  capsuleController,
+  "windowFrame.width\n                * codexDockFullScreenWidthRatio",
+  "macOS full-screen dock width adapts to the Codex window"
+);
+includes(
+  capsuleController,
+  "UserDefaults.standard.set(savedEdge.rawValue, forKey: codexDockPreferredEdgeKey)",
+  "macOS remembers the pre-full-screen dock edge"
+);
+includes(
+  swift,
+  "isCodexDockFullScreen ? .bottom : codexDockEdge",
+  "macOS full-screen dock grows downward from the Codex top bar"
+);
+includes(
+  capsuleController,
   "panel.level = .normal",
   "macOS attached dock uses the Codex window level"
 );
@@ -184,7 +208,26 @@ includes(swift, '@AppStorage("pulse.codexDock.order")', "macOS Codex dock order 
 includes(swift, "struct CodexDockExtensionShape: Shape", "macOS Codex dock extension shoulder");
 includes(swift, "enum CodexDockEdge: String, CaseIterable", "macOS four-edge dock model");
 includes(swift, "if vertical {", "macOS side dock hides metric labels");
+includes(
+  swift,
+  "codexDockVerticalFocusedContent(focusedMetric, at: date)",
+  "macOS side dock exposes the selected metric detail"
+);
+includes(
+  swift,
+  "let primaryInset: CGFloat = codexDockEdge.isVertical ? 10 : 14",
+  "macOS dock tap mapping follows both horizontal and vertical content insets"
+);
+assert(
+  !swift.includes("guard isCodexDockAttached, !codexDockEdge.isVertical else { return }"),
+  "macOS side dock taps must not be discarded"
+);
 includes(capsuleController, "panel.order(.below", "macOS dock overlaps behind Codex");
+includes(
+  capsuleController,
+  "onCodexDockInteractionBegan?()",
+  "macOS reasserts Codex window ordering before drawing a clicked dock frame"
+);
 includes(
   capsuleController,
   "x: windowFrame.minX,",
@@ -231,8 +274,23 @@ includes(main, "windowRef.setAlwaysOnTop(true);", "Windows detached capsule rest
 includes(main, 'ipcMain.handle("pulse:codex-dock-detach"', "Windows Codex dock reverse transition");
 includes(
   main,
-  "function applyAttachedCodexDockShape(width, height, edge = codexDockEdge)",
+  "function applyAttachedCodexDockShape(",
   "Windows main process owns the attached seam-clipped shape policy"
+);
+includes(
+  main,
+  'const nextEdge = nextFullscreen ? "top" : codexDockPreferredEdge;',
+  "Windows full-screen Codex always migrates an existing dock to the top"
+);
+includes(
+  main,
+  "fullscreenTopDockFrame(bounds, {",
+  "Windows full-screen dock uses adaptive in-window geometry"
+);
+includes(
+  css,
+  'html[data-codex-dock-fullscreen="true"] .codex-dock',
+  "Windows full-screen dock grows downward from the Codex top bar"
 );
 includes(
   main,
@@ -273,8 +331,8 @@ includes(
 );
 includes(
   main,
-  "1 - Math.exp(-elapsed / 22)",
-  "Windows Codex dock follows host movement with time-based interpolation"
+  "1 - Math.exp(-elapsed / 7)",
+  "Windows Codex dock follows host movement with low-latency interpolation"
 );
 includes(
   main,
@@ -296,13 +354,13 @@ includes(
 );
 includes(
   capsuleController,
-  "seam.level = .floating",
-  "macOS aurora seam keeps a stable non-flickering visual level"
+  "seam.level = .normal",
+  "macOS aurora seam shares the Codex normal window level"
 );
 includes(
   capsuleController,
-  ".map(CodexDesktopWindowLocator.isCodexApplication) ?? false",
-  "macOS aurora seam never floats over an inactive Codex window"
+  "seam.order(.above, relativeTo: Int(window.id))",
+  "macOS aurora seam remains visible above Codex without becoming globally topmost"
 );
 includes(
   capsuleController,
@@ -314,6 +372,49 @@ assert(
   "macOS dock surface must not offset the aurora into its content"
 );
 includes(css, '.codex-dock-metric small {\n  display: none;', "Windows side dock hides metric labels");
+includes(
+  renderer,
+  "const next = codexDockMetricIds.includes(metric)",
+  "Windows side dock accepts metric focus clicks"
+);
+includes(
+  swift,
+  'case trend',
+  "macOS Codex dock includes the seven-day Token trend metric"
+);
+includes(
+  html,
+  'data-metric="trend"',
+  "Windows Codex dock includes the seven-day Token trend metric"
+);
+includes(
+  swift,
+  'Text("编程 IQ")',
+  "macOS Token focus exposes the model programming index"
+);
+includes(
+  html,
+  '编程 IQ <strong id="codexDockTokenProgrammingIQ"',
+  "Windows Token focus exposes the model programming index"
+);
+includes(
+  renderer,
+  "codexDockProgrammingIndex(state.task?.model, state.task?.reasoningEffort)",
+  "Windows programming IQ resolves a model variant instead of displaying effort"
+);
+includes(
+  css,
+  'html[data-codex-dock-edge="left"] .codex-dock-focus-panel',
+  "Windows side dock has a compact focused layout"
+);
+assert(
+  !css.includes(
+    'html[data-codex-dock-edge="left"] .codex-dock-focus,\n'
+      + 'html[data-codex-dock-edge="right"] .codex-dock-focus {\n'
+      + '  display: none !important;'
+  ),
+  "Windows side dock focus must remain visible"
+);
 includes(preload, "onCodexDockTransition", "Windows Codex dock transition bridge");
 includes(
   capsuleController,
@@ -821,14 +922,56 @@ includes(main, "function mergeLocalSessionFallback", "Windows remote Token failu
 includes(main, "if (remoteUsageFailed) {", "Windows remote failure enters local session fallback path");
 includes(main, "if (!rpc) {", "Windows unavailable RPC still reads local session usage");
 includes(pulseStore, "private let activePollingInterval: TimeInterval = 5", "macOS live quota polling cadence");
-includes(pulseStore, "try await Task.sleep(nanoseconds: 120_000_000)", "macOS local token debounce");
+includes(pulseStore, "try await Task.sleep(nanoseconds: 90_000_000)", "macOS local token debounce");
+includes(
+  pulseStore,
+  "readRealtimeLocalUsage(merging: previous.usage)",
+  "macOS live cache/cost refresh avoids history aggregation"
+);
 includes(pulseStore, "for delay in [0.75, 2.5]", "macOS post-turn profile refresh");
 includes(appServerClient, "private let rateLimitsCacheTTL: TimeInterval = 4", "macOS quota cache cadence");
 includes(appServerClient, "private let usageCacheTTL: TimeInterval = 10", "macOS usage cache cadence");
-includes(appServerClient, "promoteToDisplayedUsage: true", "macOS remote Token failure promotes local session usage");
+includes(appServerClient, "return await mergingLocalUsage(into: fallback)", "macOS fallback refreshes all device-local Token aggregates");
+includes(appServerClient, "LocalCodexUsageReader.shared.allTimeSummary", "macOS scans all local sessions for lifetime Token and streak");
+includes(appServerClient, "merged.mergeLocalStreak(", "macOS promotes the device-local session streak");
+includes(pulseStore, "private func promoteDeviceLocalUsage", "macOS promotes device-local Token for every account type");
+includes(pulseStore, "result.localCurrentStreakDays = usage.localCurrentStreakDays", "macOS account switches preserve the local streak");
+includes(pulseStore, "next.usage = deviceLocalUsage(from: snapshot.usage)", "macOS account switches preserve device Token totals");
 includes(formatters, 'return "刚刚"', "macOS immediate sync wording");
 includes(formatters, "static func liveTokens", "macOS live Token precision");
 includes(formatters, 'return String(format: "%.1fM"', "macOS compact live Token precision");
+includes(formatters, 'return String(format: "%.1fB"', "macOS dashboard Token units switch to billions");
+includes(formatters, 'return String(format: "%.1fT"', "macOS dashboard Token units switch to trillions");
+includes(dashboard, 'Text("缓存命中率")', "macOS usage overview displays cache hit rate");
+includes(dashboard, '"缓存"', "macOS usage overview displays cached Token volume");
+includes(dashboard, '"未缓存"', "macOS usage overview displays uncached Token volume");
+includes(dashboard, '"今日成本"', "macOS usage overview displays today's estimated cost");
+includes(dashboard, '"累计成本"', "macOS usage overview displays lifetime estimated cost");
+assert(
+  !swift.includes("accountDetails(snapshot.account)"),
+  "macOS expanded capsule must not repeat account and plan details below its header"
+);
+includes(swift, 'metric("缓存命中率", cacheHitRate)', "macOS detail displays cache hit rate");
+includes(swift, 'metric("缓存 Token"', "macOS detail displays cached Token volume");
+includes(swift, 'metric("未缓存 Token"', "macOS detail displays uncached Token volume");
+includes(swift, 'metric("成本"', "macOS detail displays today's estimated cost");
+includes(swift, 'metric("累计成本"', "macOS detail displays lifetime estimated cost");
+includes(html, 'id="cacheHitDetail"', "Windows detail displays cache hit rate");
+includes(html, 'id="cachedTokensDetail"', "Windows detail displays cached Token volume");
+includes(html, 'id="uncachedTokensDetail"', "Windows detail displays uncached Token volume");
+includes(html, 'id="todayCostDetail"', "Windows detail displays today's estimated cost");
+includes(html, 'id="totalCostDetail"', "Windows detail displays lifetime estimated cost");
+includes(
+  localUsageReader,
+  "estimatedCostUSD: hasPricedUsage ? estimatedCostUSD : nil",
+  "macOS lifetime session aggregation preserves model-aware estimated cost"
+);
+includes(localUsageReader, "lastTokenUsage", "macOS Token aggregation uses per-event usage");
+includes(
+  capsuleController,
+  "stabilizeAttachedWindowLevel",
+  "macOS keeps the attached panel below Codex after click-driven state updates"
+);
 includes(swift, ".numericText(countsDown: false)", "macOS upward live Token roll");
 includes(swift, "showsIdleContent: mode == .idle || mode == .offline", "macOS offline API time remains an idle presentation");
 includes(swift, "store.snapshot.account.authMode != .apiKey", "macOS active pet quota excludes API Key sessions");

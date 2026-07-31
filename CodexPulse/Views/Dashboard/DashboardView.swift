@@ -352,47 +352,158 @@ struct DashboardView: View {
     }
 
     private var tokenSummary: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("今日 TOKEN")
-                    .font(.system(size: 10, weight: .bold))
-                    .tracking(1.1)
-                    .foregroundStyle(.tertiary)
-                Text(PulseFormatters.tokens(store.snapshot.usage.todayTokens))
-                    .font(.system(size: 35, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(chartAccent)
-                    .contentTransition(.numericText())
-                if let velocity = store.snapshot.usage.tokenVelocityPerMinute {
-                    Label(
-                        "\(PulseFormatters.tokens(velocity))/分钟",
-                        systemImage: "speedometer"
-                    )
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(tokenVelocityColor(velocity))
+        let usage = store.snapshot.usage
+        let input = usage.localTodayInputTokens
+        let cached = usage.localTodayCachedInputTokens
+        let uncached = input.map { max(0, $0 - (cached ?? 0)) }
+        let cacheHitRate = usage.localTodayCacheHitRate
+
+        return VStack(alignment: .leading, spacing: 11) {
+            HStack(alignment: .top, spacing: 22) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("今日 TOKEN")
+                        .font(.system(size: 10, weight: .bold))
+                        .tracking(1.1)
+                        .foregroundStyle(.tertiary)
+                    Text(PulseFormatters.tokens(usage.todayTokens))
+                        .font(.system(size: 35, weight: .bold, design: .rounded))
                         .monospacedDigit()
+                        .foregroundStyle(chartAccent)
+                        .contentTransition(.numericText())
+                    if let velocity = usage.tokenVelocityPerMinute {
+                        Label(
+                            "\(PulseFormatters.tokens(velocity))/分钟",
+                            systemImage: "speedometer"
+                        )
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(tokenVelocityColor(velocity))
+                            .monospacedDigit()
+                    }
                 }
-                if store.snapshot.account.authMode == .apiKey {
-                    Label(
-                        "API Key 今日值来自本机全部 session",
-                        systemImage: "desktopcomputer"
-                    )
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .help("API Key 不提供 ChatGPT 活跃汇总；这里汇总本机当天全部 session 的 token_count，日志无法区分账号。账单与成本以 OpenAI API Usage / Costs 为准。")
+                .frame(width: 118, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .lastTextBaseline, spacing: 7) {
+                        Text("缓存命中率")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Text(cacheHitText(cacheHitRate))
+                            .font(.system(size: 18, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(PulseTheme.green)
+                            .contentTransition(.numericText())
+                    }
+
+                    GeometryReader { proxy in
+                        ZStack(alignment: .leading) {
+                            Capsule()
+                                .fill(Color.primary.opacity(0.09))
+                            Capsule()
+                                .fill(
+                                    LinearGradient(
+                                        colors: [
+                                            PulseTheme.green.opacity(0.72),
+                                            PulseTheme.green
+                                        ],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                                .frame(
+                                    width: proxy.size.width
+                                        * CGFloat(min(1, max(0, cacheHitRate ?? 0)))
+                                )
+                                .shadow(
+                                    color: PulseTheme.green.opacity(0.22),
+                                    radius: 4
+                                )
+                        }
+                    }
+                    .frame(height: 5)
+
+                    HStack(alignment: .top, spacing: 8) {
+                        cacheCostMetric(
+                            "缓存",
+                            PulseFormatters.tokens(cached)
+                        )
+                        cacheCostMetric(
+                            "未缓存",
+                            PulseFormatters.tokens(uncached)
+                        )
+                        cacheCostMetric(
+                            "今日成本",
+                            dashboardCurrency(usage.localTodayEstimatedCostUSD),
+                            tint: Color(hex: 0x159D9A)
+                        )
+                        cacheCostMetric(
+                            "累计成本",
+                            dashboardCurrency(usage.localTotalEstimatedCostUSD),
+                            tint: Color(hex: 0x159D9A)
+                        )
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            Rectangle()
+                .fill(separatorColor)
+                .frame(height: 1)
+
             HStack(spacing: 0) {
-                tokenMetric("昨日", PulseFormatters.tokens(store.snapshot.usage.yesterdayTokens))
+                tokenMetric("昨日", PulseFormatters.tokens(usage.yesterdayTokens))
                 metricDivider
-                tokenMetric("近 7 天", PulseFormatters.tokens(store.snapshot.usage.last7DaysTokens))
+                tokenMetric("近 7 天", PulseFormatters.tokens(usage.last7DaysTokens))
                 metricDivider
-                tokenMetric("累计", PulseFormatters.tokens(store.snapshot.usage.totalTokens))
+                tokenMetric("累计 Token", PulseFormatters.tokens(usage.totalTokens))
                 metricDivider
-                tokenMetric("连续", store.snapshot.usage.currentStreakDays.map { "\($0) 天" } ?? "—")
+                tokenMetric("连续", usage.currentStreakDays.map { "\($0) 天" } ?? "—")
             }
         }
+        .frame(minHeight: 154, alignment: .top)
+    }
+
+    private func cacheCostMetric(
+        _ label: String,
+        _ value: String,
+        tint: Color = .primary
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.system(size: 8.5, weight: .medium))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            Text(value)
+                .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                .foregroundStyle(tint)
+                .monospacedDigit()
+                .contentTransition(.numericText())
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func cacheHitText(_ rate: Double?) -> String {
+        guard let rate, rate.isFinite else { return "—" }
+        return String(format: "%.1f%%", min(1, max(0, rate)) * 100)
+    }
+
+    private func dashboardCurrency(_ value: Double?) -> String {
+        guard let value, value.isFinite else { return "—" }
+        let normalized = max(0, value)
+        if normalized >= 1_000 {
+            return String(format: "$%.2fK", normalized / 1_000)
+        }
+        if normalized >= 100 {
+            return String(format: "$%.1f", normalized)
+        }
+        if normalized >= 1 {
+            return String(format: "$%.2f", normalized)
+        }
+        if normalized >= 0.01 {
+            return String(format: "$%.3f", normalized)
+        }
+        return String(format: "$%.4f", normalized)
     }
 
     private func tokenMetric(_ label: String, _ value: String) -> some View {
@@ -417,8 +528,8 @@ struct DashboardView: View {
     private var metricDivider: some View {
         Rectangle()
             .fill(separatorColor)
-            .frame(width: 1, height: 34)
-            .padding(.horizontal, 10)
+            .frame(width: 1, height: 28)
+            .padding(.horizontal, 8)
     }
 
     // MARK: - Workspace

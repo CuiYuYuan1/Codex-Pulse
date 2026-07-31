@@ -8,6 +8,7 @@ extension Notification.Name {
     static let pulseCapsuleToggleMini = Notification.Name("com.codexpulse.capsule.toggle-mini")
     static let pulseCatRoamingActivityChanged = Notification.Name("com.codexpulse.cat-roaming.activity")
     static let pulseCodexDockReorder = Notification.Name("com.codexpulse.codex-dock.reorder")
+    static let pulseCodexDockTap = Notification.Name("com.codexpulse.codex-dock.tap")
     static let pulseCodexDockDetachmentProgress = Notification.Name("com.codexpulse.codex-dock.detachment-progress")
 }
 
@@ -19,6 +20,11 @@ struct CodexDockReorderUpdate: Sendable {
     let startX: CGFloat
     let currentX: CGFloat
     let ended: Bool
+}
+
+struct CodexDockTapUpdate: Sendable {
+    /// Position along the dock's content axis, measured from its visual leading edge.
+    let primaryPosition: CGFloat
 }
 
 private struct CodexDesktopWindow {
@@ -110,6 +116,7 @@ private enum CodexDesktopWindowLocator {
 
 private struct CodexDockAttachmentPreviewView: View {
     let edge: CodexDockEdge
+    var fullScreen = false
 
     var body: some View {
         ZStack {
@@ -137,9 +144,11 @@ private struct CodexDockAttachmentPreviewView: View {
                 startPoint: .leading,
                 endPoint: .trailing
             )
-            .frame(height: 1.5)
+            .frame(height: 0.8)
         }
-        .clipShape(CodexDockExtensionShape(edge: edge))
+        .clipShape(
+            CodexDockExtensionShape(edge: fullScreen ? .bottom : edge)
+        )
     }
 }
 
@@ -184,29 +193,29 @@ private struct CodexDockSeamOverlayView: View {
     private func auroraBand(length: CGFloat, vertical: Bool) -> some View {
         let start: UnitPoint = vertical ? .top : .leading
         let end: UnitPoint = vertical ? .bottom : .trailing
-        let glowWidth = vertical ? 3.6 : length
-        let glowHeight = vertical ? length : 3.6
-        let coreWidth = vertical ? 1.45 : length
-        let coreHeight = vertical ? length : 1.45
-        let highlightWidth = vertical ? 0.28 : length
-        let highlightHeight = vertical ? length : 0.28
+        let glowWidth = vertical ? 2.4 : length
+        let glowHeight = vertical ? length : 2.4
+        let coreWidth = vertical ? 0.72 : length
+        let coreHeight = vertical ? length : 0.72
+        let highlightWidth = vertical ? 0.14 : length
+        let highlightHeight = vertical ? length : 0.14
 
         return ZStack {
             LinearGradient(gradient: gradient, startPoint: start, endPoint: end)
                 .frame(width: glowWidth, height: glowHeight)
-                .blur(radius: 1.25)
-                .opacity(0.62)
+                .blur(radius: 0.8)
+                .opacity(0.56)
             LinearGradient(gradient: gradient, startPoint: start, endPoint: end)
                 .frame(
-                    width: vertical ? 2.0 : length,
-                    height: vertical ? length : 2.0
+                    width: vertical ? 1.1 : length,
+                    height: vertical ? length : 1.1
                 )
-                .blur(radius: 0.32)
-                .opacity(0.92)
+                .blur(radius: 0.18)
+                .opacity(0.88)
             LinearGradient(gradient: gradient, startPoint: start, endPoint: end)
                 .frame(width: coreWidth, height: coreHeight)
-                .shadow(color: Color.cyan.opacity(0.52), radius: 0.9)
-                .shadow(color: Color.purple.opacity(0.45), radius: 1.25)
+                .shadow(color: Color.cyan.opacity(0.48), radius: 0.5)
+                .shadow(color: Color.purple.opacity(0.40), radius: 0.75)
             LinearGradient(
                 colors: [
                     .clear,
@@ -254,11 +263,14 @@ private final class InteractiveCapsulePanel: NSPanel {
     var onManualDragMoved: ((NSPoint) -> Void)?
     var onManualDragEnded: ((NSPoint) -> Void)?
     var onCodexDockReorder: ((_ startX: CGFloat, _ currentX: CGFloat, _ ended: Bool) -> Void)?
+    var onCodexDockInteractionBegan: (() -> Void)?
+    var onCodexDockTap: ((_ primaryPosition: CGFloat) -> Void)?
     var onCodexDockDetach: ((_ pointer: NSPoint, _ translation: CGSize, _ ended: Bool) -> Void)?
     var usesCompactHitRegion = false
     var usesOrbCircularHitRegion = false
     var usesCodexDockInteraction = false
     var codexDockIsVertical = false
+    var codexDockIsFullScreen = false
     var compactHitRegionSize = CGSize(width: 240, height: 153.6)
     private var capsuleMouseDownScreenLocation: NSPoint?
     private var capsuleMouseDownFrameOrigin: NSPoint?
@@ -390,6 +402,10 @@ private final class InteractiveCapsulePanel: NSPanel {
                 super.sendEvent(event)
                 return
             }
+            // A click can transiently raise a nonactivating panel above the
+            // foreign Codex window before the next tracking tick. Reassert the
+            // attached ordering before AppKit gets a chance to draw that frame.
+            onCodexDockInteractionBegan?()
             capsuleMouseDownScreenLocation = NSEvent.mouseLocation
             capsuleMouseDownFrameOrigin = frame.origin
             capsuleMouseDownAt = event.timestamp
@@ -437,6 +453,10 @@ private final class InteractiveCapsulePanel: NSPanel {
                 width: pointer.x - start.x,
                 height: pointer.y - start.y
             )
+            let isShortTap = codexDockDragAxis == nil
+                && hypot(delta.width, delta.height) <= 3
+                && capsuleMouseDownAt.map { event.timestamp - $0 <= 0.8 } == true
+                && isInsideCapsule(event)
             switch codexDockDragAxis {
             case .reorder:
                 onCodexDockReorder?(
@@ -448,6 +468,16 @@ private final class InteractiveCapsulePanel: NSPanel {
                 onCodexDockDetach?(pointer, delta, true)
             case nil:
                 break
+            }
+            if isShortTap {
+                onCodexDockTap?(
+                    codexDockIsVertical
+                        ? frame.maxY - pointer.y
+                        : pointer.x - frame.minX
+                )
+                // SwiftUI 会在 tap 通知后重绘展开内容，AppKit 可能因此把无激活
+                // 面板短暂抬到宿主窗口上方。让控制器在状态提交后继续稳定层级。
+                onCodexDockInteractionBegan?()
             }
             codexDockDragAxis = nil
             clearCapsuleClickCandidate()
@@ -462,7 +492,16 @@ private final class InteractiveCapsulePanel: NSPanel {
         let point = contentView.convert(event.locationInWindow, from: nil)
         let bounds = contentView.bounds
         if usesCodexDockInteraction {
-            return bounds.insetBy(dx: 1, dy: 1).contains(point)
+            var hitBounds = bounds.insetBy(dx: 1, dy: 1)
+            if codexDockIsFullScreen {
+                // 全屏状态脊的顶部 16px 与 Codex 工具栏重叠但完全透明。
+                // 排除该区域，避免拦截宿主工具栏的点击。
+                if contentView.isFlipped {
+                    hitBounds.origin.y += 16
+                }
+                hitBounds.size.height = max(0, hitBounds.height - 16)
+            }
+            return hitBounds.contains(point)
         }
         if isCompactInteractionActive {
             if usesOrbCircularHitRegion {
@@ -574,9 +613,16 @@ final class FloatingCapsuleController {
     private let codexDockWidthKey = "pulse.codexDock.width"
     private let codexDockHeightKey = "pulse.codexDock.height"
     private let codexDockEdgeKey = "pulse.codexDock.edge"
+    private let codexDockPreferredEdgeKey = "pulse.codexDock.preferredEdge"
+    private let codexDockFullScreenKey = "pulse.codexDock.fullScreen"
     private let codexDockHorizontalThickness: CGFloat = 44
     private let codexDockVerticalThickness: CGFloat = 54
     private let codexDockOverlap: CGFloat = 16
+    private let codexDockFullScreenTopInset: CGFloat = 24
+    private let codexDockFullScreenWidthRatio: CGFloat = 0.46
+    private let codexDockFullScreenMinimumWidth: CGFloat = 620
+    private let codexDockFullScreenMaximumWidth: CGFloat = 960
+    private let codexDockFullScreenHorizontalMargin: CGFloat = 24
     private let codexDockSeamSurfaceThickness: CGFloat = 8
     private let codexDockProximity: CGFloat = 30
     private var codexDockPreviewPanel: NSPanel?
@@ -587,6 +633,7 @@ final class FloatingCapsuleController {
     private var codexDockCandidateWindow: CodexDesktopWindow?
     private var attachedCodexWindow: CodexDesktopWindow?
     private var codexDockTrackingTask: Task<Void, Never>?
+    private var codexDockOrderingTask: Task<Void, Never>?
     private var codexLaunchObserver: NSObjectProtocol?
     private var codexDockPreviousContentSize: CGSize?
     private var isCodexDockTransitioning = false
@@ -711,6 +758,18 @@ final class FloatingCapsuleController {
                     currentX: currentX,
                     ended: ended
                 )
+            )
+        }
+        panel.onCodexDockInteractionBegan = { [weak self] in
+            guard let self,
+                  let panel = self.panel,
+                  let window = self.attachedCodexWindow else { return }
+            self.stabilizeAttachedWindowLevel(panel, below: window)
+        }
+        panel.onCodexDockTap = { primaryPosition in
+            NotificationCenter.default.post(
+                name: .pulseCodexDockTap,
+                object: CodexDockTapUpdate(primaryPosition: primaryPosition)
             )
         }
         panel.onCodexDockDetach = { [weak self] pointer, translation, ended in
@@ -861,6 +920,8 @@ final class FloatingCapsuleController {
     func hide() {
         stopCatRoaming()
         stopCodexDockTracking()
+        codexDockOrderingTask?.cancel()
+        codexDockOrderingTask = nil
         hideCodexDockPreview()
         hideCodexDockSeam(immediately: true)
         framePersistenceTask?.cancel()
@@ -885,6 +946,8 @@ final class FloatingCapsuleController {
     func prepareForTermination() {
         stopCatRoaming()
         stopCodexDockTracking()
+        codexDockOrderingTask?.cancel()
+        codexDockOrderingTask = nil
         hideCodexDockPreview()
         hideCodexDockSeam(immediately: true)
         if let codexLaunchObserver {
@@ -1524,10 +1587,16 @@ final class FloatingCapsuleController {
         codexDockCandidateWindow = closest.window
         codexDockCandidateFrame = closest.target.frame
         codexDockCandidateEdge = closest.target.edge
-        showCodexDockPreview(target: closest.target)
+        showCodexDockPreview(
+            target: closest.target,
+            fullScreen: isFullScreenCodexWindow(closest.window.frame)
+        )
     }
 
-    private func showCodexDockPreview(target: CodexDockTarget) {
+    private func showCodexDockPreview(
+        target: CodexDockTarget,
+        fullScreen: Bool
+    ) {
         let frame = target.frame
         if let preview = codexDockPreviewPanel {
             if abs(preview.frame.minX - frame.minX) > 0.5
@@ -1537,7 +1606,10 @@ final class FloatingCapsuleController {
                 preview.setFrame(frame, display: true)
             }
             preview.contentView = NSHostingView(
-                rootView: CodexDockAttachmentPreviewView(edge: target.edge)
+                rootView: CodexDockAttachmentPreviewView(
+                    edge: target.edge,
+                    fullScreen: fullScreen
+                )
             )
             if preview.alphaValue < 1 {
                 preview.animator().alphaValue = 1
@@ -1558,7 +1630,10 @@ final class FloatingCapsuleController {
         preview.ignoresMouseEvents = true
         preview.hidesOnDeactivate = false
         preview.contentView = NSHostingView(
-            rootView: CodexDockAttachmentPreviewView(edge: target.edge)
+            rootView: CodexDockAttachmentPreviewView(
+                edge: target.edge,
+                fullScreen: fullScreen
+            )
         )
         preview.alphaValue = 0
         preview.orderFrontRegardless()
@@ -1607,19 +1682,24 @@ final class FloatingCapsuleController {
         codexDockCandidateEdge = nil
         codexDockCandidateWindow = nil
         attachedCodexWindow = window
+        let isFullScreen = isFullScreenCodexWindow(window.frame)
+        let effectiveEdge: CodexDockEdge = isFullScreen ? .top : edge
         // Remove the guide before the real surface starts morphing; keeping both
         // panels visible created the "two stacked capsules" freeze.
         hideCodexDockPreview(immediately: true)
         UserDefaults.standard.set(dockFrame.width, forKey: codexDockWidthKey)
         UserDefaults.standard.set(dockFrame.height, forKey: codexDockHeightKey)
-        UserDefaults.standard.set(edge.rawValue, forKey: codexDockEdgeKey)
+        UserDefaults.standard.set(edge.rawValue, forKey: codexDockPreferredEdgeKey)
+        UserDefaults.standard.set(effectiveEdge.rawValue, forKey: codexDockEdgeKey)
+        UserDefaults.standard.set(isFullScreen, forKey: codexDockFullScreenKey)
         UserDefaults.standard.set(true, forKey: codexDockAttachedKey)
-        showCodexDockSeam(for: window, edge: edge)
+        showCodexDockSeam(for: window, edge: effectiveEdge)
         configureAttachedWindowLevel(panel, above: window)
         panel.isMovableByWindowBackground = false
         if let interactive = panel as? InteractiveCapsulePanel {
             interactive.usesCodexDockInteraction = true
-            interactive.codexDockIsVertical = edge.isVertical
+            interactive.codexDockIsVertical = effectiveEdge.isVertical
+            interactive.codexDockIsFullScreen = isFullScreen
             interactive.usesCompactHitRegion = false
         }
         panel.contentView?.layoutSubtreeIfNeeded()
@@ -1656,10 +1736,14 @@ final class FloatingCapsuleController {
         }
         attachedCodexWindow = window
         let savedEdge = CodexDockEdge(
-            rawValue: UserDefaults.standard.string(forKey: codexDockEdgeKey) ?? ""
+            rawValue: UserDefaults.standard.string(forKey: codexDockPreferredEdgeKey)
+                ?? UserDefaults.standard.string(forKey: codexDockEdgeKey)
+                ?? ""
         ) ?? .bottom
+        let isFullScreen = isFullScreenCodexWindow(window.frame)
+        let effectiveEdge: CodexDockEdge = isFullScreen ? .top : savedEdge
         let availableTargets = codexDockTargets(for: window.frame)
-        guard let target = availableTargets.first(where: { $0.edge == savedEdge })
+        guard let target = availableTargets.first(where: { $0.edge == effectiveEdge })
             ?? availableTargets.first else {
             UserDefaults.standard.set(false, forKey: codexDockAttachedKey)
             return
@@ -1668,12 +1752,15 @@ final class FloatingCapsuleController {
         UserDefaults.standard.set(dockFrame.width, forKey: codexDockWidthKey)
         UserDefaults.standard.set(dockFrame.height, forKey: codexDockHeightKey)
         UserDefaults.standard.set(target.edge.rawValue, forKey: codexDockEdgeKey)
+        UserDefaults.standard.set(savedEdge.rawValue, forKey: codexDockPreferredEdgeKey)
+        UserDefaults.standard.set(isFullScreen, forKey: codexDockFullScreenKey)
         showCodexDockSeam(for: window, edge: target.edge, animated: false)
         configureAttachedWindowLevel(panel, above: window)
         panel.isMovableByWindowBackground = false
         if let interactive = panel as? InteractiveCapsulePanel {
             interactive.usesCodexDockInteraction = true
             interactive.codexDockIsVertical = target.edge.isVertical
+            interactive.codexDockIsFullScreen = isFullScreen
             interactive.usesCompactHitRegion = false
         }
         panel.setFrame(dockFrame, display: true)
@@ -1690,11 +1777,16 @@ final class FloatingCapsuleController {
                   UserDefaults.standard.bool(forKey: self.codexDockAttachedKey),
                   let panel = self.panel {
                 let current = panel.frame
-                let edge = CodexDockEdge(
+                let storedEdge = CodexDockEdge(
                     rawValue: UserDefaults.standard.string(
                         forKey: self.codexDockEdgeKey
                     ) ?? ""
                 ) ?? .bottom
+                let preferredEdge = CodexDockEdge(
+                    rawValue: UserDefaults.standard.string(
+                        forKey: self.codexDockPreferredEdgeKey
+                    ) ?? ""
+                ) ?? storedEdge
                 let trackedWindow: CodexDesktopWindow?
                 if let attached = self.attachedCodexWindow {
                     trackedWindow = CodexDesktopWindowLocator.window(
@@ -1705,15 +1797,51 @@ final class FloatingCapsuleController {
                     trackedWindow = self.codexWindows(forceRefresh: true).min(by: {
                         self.rectDistance(
                             current,
-                            self.codexDockFrame($0.frame, edge: edge)
+                            self.codexDockFrame($0.frame, edge: storedEdge)
                         ) < self.rectDistance(
                             current,
-                            self.codexDockFrame($1.frame, edge: edge)
+                            self.codexDockFrame($1.frame, edge: storedEdge)
                         )
                     })
                 }
                 if let window = trackedWindow {
                     self.attachedCodexWindow = window
+                    let isFullScreen = self.isFullScreenCodexWindow(window.frame)
+                    let edge: CodexDockEdge = isFullScreen ? .top : preferredEdge
+                    if isFullScreen,
+                       UserDefaults.standard.object(
+                           forKey: self.codexDockPreferredEdgeKey
+                       ) == nil {
+                        UserDefaults.standard.set(
+                            storedEdge.rawValue,
+                            forKey: self.codexDockPreferredEdgeKey
+                        )
+                    }
+                    let modeChanged = edge != storedEdge
+                        || UserDefaults.standard.bool(
+                            forKey: self.codexDockFullScreenKey
+                        ) != isFullScreen
+                    if modeChanged {
+                        UserDefaults.standard.set(
+                            edge.rawValue,
+                            forKey: self.codexDockEdgeKey
+                        )
+                        UserDefaults.standard.set(
+                            isFullScreen,
+                            forKey: self.codexDockFullScreenKey
+                        )
+                        if let interactive = panel as? InteractiveCapsulePanel {
+                            interactive.codexDockIsVertical = edge.isVertical
+                            interactive.codexDockIsFullScreen = isFullScreen
+                        }
+                        self.showCodexDockSeam(
+                            for: window,
+                            edge: edge,
+                            animated: false
+                        )
+                        self.configureAttachedWindowLevel(panel, above: window)
+                        panel.contentView?.layoutSubtreeIfNeeded()
+                    }
                     if !self.isCodexDockAvailable(window.frame, edge: edge) {
                         self.detachCodexDock(
                             at: NSPoint(x: current.midX, y: current.midY),
@@ -1771,11 +1899,44 @@ final class FloatingCapsuleController {
         if panel.level != .normal {
             panel.level = .normal
         }
+        if isFullScreenCodexWindow(window.frame) {
+            // 全屏没有窗口外侧空间，状态脊必须进入 Codex 顶栏安全区。
+            // 仅此模式位于宿主上层；普通四边吸附仍保持与 Codex 同级且在其下方。
+            panel.order(.above, relativeTo: Int(window.id))
+            updateCodexDockSeamVisibility(for: window)
+            return
+        }
         // The attachment surface extends behind Codex. Ordering it underneath
         // lets the real Codex corner mask the overlap and removes the two
         // transparent shoulder wedges without painting over the host window.
         panel.order(.below, relativeTo: Int(window.id))
         updateCodexDockSeamVisibility(for: window)
+    }
+
+    /// 点击后的 SwiftUI 状态提交可能跨越几个显示帧，并在提交期间重新排序
+    /// nonactivating panel。连续几帧把信息栏压回 Codex 下层，确保 16px 肩部
+    /// 始终由真实 Codex 窗口遮罩，而不会在点击时闪到上层。
+    private func stabilizeAttachedWindowLevel(
+        _ panel: NSPanel,
+        below window: CodexDesktopWindow
+    ) {
+        codexDockOrderingTask?.cancel()
+        configureAttachedWindowLevel(panel, above: window)
+        codexDockOrderingTask = Task { @MainActor [weak self, weak panel] in
+            let frameDelays: [UInt64] = [8_333_333, 16_666_667, 50_000_000]
+            for delay in frameDelays {
+                try? await Task.sleep(nanoseconds: delay)
+                guard !Task.isCancelled,
+                      let self,
+                      let panel,
+                      self.panel === panel,
+                      self.attachedCodexWindow?.id == window.id,
+                      UserDefaults.standard.bool(forKey: self.codexDockAttachedKey) else {
+                    return
+                }
+                self.configureAttachedWindowLevel(panel, above: window)
+            }
+        }
     }
 
     private func showCodexDockSeam(
@@ -1790,7 +1951,7 @@ final class FloatingCapsuleController {
                 rootView: CodexDockSeamOverlayView(edge: edge)
             )
             seam.setFrame(frame, display: true)
-            seam.level = .floating
+            seam.level = .normal
             updateCodexDockSeamVisibility(for: window)
             if seam.isVisible, seam.alphaValue < 1 {
                 seam.animator().alphaValue = 1
@@ -1807,7 +1968,7 @@ final class FloatingCapsuleController {
         seam.isOpaque = false
         seam.backgroundColor = .clear
         seam.hasShadow = false
-        seam.level = .floating
+        seam.level = .normal
         seam.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         seam.ignoresMouseEvents = true
         seam.hidesOnDeactivate = false
@@ -1845,20 +2006,15 @@ final class FloatingCapsuleController {
 
     private func updateCodexDockSeamVisibility(for window: CodexDesktopWindow) {
         guard let seam = codexDockSeamPanel else { return }
-        // Electron can briefly report a helper process as the foreground app.
-        // Match the Codex application family instead of requiring the foreground
-        // PID to equal the WindowServer owner PID, otherwise the seam is hidden
-        // even though the attached Codex window is still active.
-        let codexIsFrontmost = NSWorkspace.shared.frontmostApplication
-            .map(CodexDesktopWindowLocator.isCodexApplication) ?? false
-        let shouldShow = codexIsFrontmost
-            && panel?.isVisible == true
+        let shouldShow = panel?.isVisible == true
             && UserDefaults.standard.bool(forKey: codexDockAttachedKey)
         if shouldShow {
-            if !seam.isVisible {
-                seam.alphaValue = 1
-                seam.orderFrontRegardless()
-            }
+            // Keep the light strip directly above the Codex host at the normal
+            // window level. It remains visible while the attached navigation is
+            // clicked, but stays behind unrelated foreground applications.
+            if seam.level != .normal { seam.level = .normal }
+            seam.alphaValue = 1
+            seam.order(.above, relativeTo: Int(window.id))
         } else if seam.isVisible {
             seam.orderOut(nil)
         }
@@ -1894,6 +2050,16 @@ final class FloatingCapsuleController {
     ) -> NSRect {
         let thickness = codexDockSeamSurfaceThickness
         let half = thickness * 0.5
+        if isFullScreenCodexWindow(windowFrame), edge == .top {
+            let dock = codexDockFrame(windowFrame, edge: .top)
+            let connectionY = dock.maxY - codexDockOverlap
+            return NSRect(
+                x: dock.minX,
+                y: connectionY - half,
+                width: dock.width,
+                height: thickness
+            )
+        }
         switch edge {
         case .bottom:
             return NSRect(
@@ -2015,6 +2181,13 @@ final class FloatingCapsuleController {
         let target = NSRect(origin: targetOrigin, size: restoredSize)
         // Switch the SwiftUI surface and contract the same visible panel. Never
         // drop alpha to zero: that caused the blank frame captured by the user.
+        let preferredEdge = UserDefaults.standard.string(
+            forKey: codexDockPreferredEdgeKey
+        )
+        if let preferredEdge {
+            UserDefaults.standard.set(preferredEdge, forKey: codexDockEdgeKey)
+        }
+        UserDefaults.standard.set(false, forKey: codexDockFullScreenKey)
         UserDefaults.standard.set(false, forKey: codexDockAttachedKey)
         panel.contentView?.layoutSubtreeIfNeeded()
 
@@ -2036,6 +2209,7 @@ final class FloatingCapsuleController {
                 if let interactive = panel as? InteractiveCapsulePanel {
                     interactive.usesCodexDockInteraction = false
                     interactive.codexDockIsVertical = false
+                    interactive.codexDockIsFullScreen = false
                 }
                 self.isCodexDockTransitioning = false
                 NotificationCenter.default.post(
@@ -2060,6 +2234,28 @@ final class FloatingCapsuleController {
         _ windowFrame: NSRect,
         edge: CodexDockEdge
     ) -> NSRect {
+        if isFullScreenCodexWindow(windowFrame), edge == .top {
+            let availableWidth = max(
+                420,
+                windowFrame.width - codexDockFullScreenHorizontalMargin * 2
+            )
+            let proportionalWidth = windowFrame.width
+                * codexDockFullScreenWidthRatio
+            let width = min(
+                availableWidth,
+                max(
+                    codexDockFullScreenMinimumWidth,
+                    min(codexDockFullScreenMaximumWidth, proportionalWidth)
+                )
+            )
+            let height = codexDockHorizontalThickness + codexDockOverlap
+            return NSRect(
+                x: windowFrame.midX - width / 2,
+                y: windowFrame.maxY - codexDockFullScreenTopInset - height,
+                width: width,
+                height: height
+            )
+        }
         switch edge {
         case .bottom:
             return NSRect(
@@ -2105,8 +2301,10 @@ final class FloatingCapsuleController {
         _ frame: NSRect,
         edge: CodexDockEdge
     ) -> Bool {
-        guard !isFullScreenCodexWindow(frame),
-              let screen = NSScreen.screens.first(where: {
+        if isFullScreenCodexWindow(frame) {
+            return edge == .top
+        }
+        guard let screen = NSScreen.screens.first(where: {
                   $0.frame.intersection(frame).width * $0.frame.intersection(frame).height
                       >= frame.width * frame.height * 0.7
               }) else {
@@ -2244,6 +2442,7 @@ private struct FloatingCapsuleRoot: View {
     var body: some View {
         FloatingCapsuleView()
             .environment(store)
+            .environment(ArtificialAnalysisLeaderboardStore.shared)
             .environment(AppUpdateService.shared)
             .environment(\.pulseVisualTheme, store.settings.resolvedVisualTheme)
             .tint(store.settings.resolvedVisualTheme.accent)

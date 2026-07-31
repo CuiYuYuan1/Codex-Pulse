@@ -1,11 +1,19 @@
 const elements = Object.fromEntries([
-  "codexDock", "codexDockQuota", "codexDockTokens", "codexDockReset", "codexDockWeather", "codexDockTime",
+  "codexDock", "codexDockQuota", "codexDockTokens", "codexDockCacheHit", "codexDockCost", "codexDockTrendTotal", "codexDockTrendArea", "codexDockTrendLine", "codexDockTaskCount",
+  "codexDockFocus", "codexDockFocusQuota", "codexDockFocusQuotaFill", "codexDockFocusQuotaReset", "codexDockFocusTaskCount",
+  "codexDockQuotaCards", "codexDockQuotaCardCount", "codexDockCardPrevious", "codexDockCardTitle", "codexDockCardExpiry", "codexDockCardOpen", "codexDockCardPage", "codexDockCardNext",
+  "codexDockTokenStatus", "codexDockFocusTokens", "codexDockTokenCacheHit", "codexDockTokenCost", "codexDockTokenProgrammingIQ", "codexDockTokenTotal",
+  "codexDockFocusCacheHit", "codexDockFocusCacheHitFill", "codexDockCacheTokens", "codexDockUncachedTokens", "codexDockInputTokens",
+  "codexDockFocusCost", "codexDockUncachedCost", "codexDockCachedCost", "codexDockOutputCost",
+  "codexDockFocusTrendTotal", "codexDockFocusTrendArea", "codexDockFocusTrendLine", "codexDockFocusTrendToday", "codexDockFocusTrendPeak",
   "capsule", "detail", "miniCapsule", "miniRingProgress", "miniValue", "miniValuePrevious", "petAnimation", "petAnimationNext", "petCatCanvas", "petBlackHoleCanvas", "petBlackHoleCode", "petOrbProgress", "weatherScene", "weatherAnimation", "weatherSpacer", "statusDot", "quotaRing", "quotaArc", "remaining", "todayTokens", "todayTokensPrevious", "chevron",
   "informationStrip", "informationWeatherContent", "informationTaskContent", "informationTaskStatus", "informationTaskSummary", "weatherMiniIcon", "weatherSummary", "informationLocation", "informationWeekday", "informationTime",
   "conversationDetail", "conversationMessages", "conversationLiveLabel", "conversationClose",
   "email", "plan", "taskBadge", "connectionMessage", "chooseCodex", "resetTime",
   "limitTitle", "progressTrack", "progressFill", "secondaryLimit", "cardsToggle", "cardsSummary", "cardsNearest", "cardsChevron",
-  "cardsList", "tokenChart", "chartValue", "todayDetail", "totalTokens", "totalMetricLabel", "taskElapsed", "taskMetricLabel",
+  "cardsList", "tokenChart", "chartValue", "todayDetail", "totalTokens", "totalMetricLabel",
+  "cachedTokensDetail", "uncachedTokensDetail", "cacheHitDetail", "todayCostDetail", "totalCostDetail",
+  "taskElapsed", "taskMetricLabel",
   "cliInfo", "refresh", "quit", "taskTunnel", "taskTunnelCanvas", "tunnelOutputLabel",
   "activityBandToggle", "activityBandPicker", "activityBandStyle", "activityBandStyleLabel", "activityBandStyleMenu",
   "themePicker", "themeStyle", "themeStyleLabel", "themeStyleMenu",
@@ -77,6 +85,10 @@ let codexDockEdge = "bottom";
 let codexDockPointer = null;
 let codexDockRestoreTimer;
 const codexDockInteraction = window.CodexDockInteraction;
+const codexDockMetrics = window.CodexDockMetrics;
+let codexDockFocusedMetric = null;
+let codexDockResetCardIndex = 0;
+const codexDockRollAnimations = new WeakMap();
 
 const exactNumber = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 });
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -152,25 +164,33 @@ const petCharacterLabels = Object.freeze({
 let petCharacterPreference = loadPetPreference();
 let activePreferenceMenu = null;
 const codexDockOrderKey = "codexPulse.codexDockOrder";
-const codexDockMetricIds = Object.freeze(["quota", "tokens", "reset", "weather", "time"]);
+const codexDockMetricIds = Object.freeze(["quota", "tokens", "cacheHit", "cost", "trend"]);
 let codexDockOrder = loadCodexDockOrder();
 
 function loadCodexDockOrder() {
   try {
     const saved = JSON.parse(localStorage.getItem(codexDockOrderKey) || "[]");
     const valid = Array.isArray(saved)
-      ? saved.filter((item, index) => codexDockMetricIds.includes(item) && saved.indexOf(item) === index)
+      ? saved.filter((item, index) =>
+          item !== "trend"
+          && codexDockMetricIds.includes(item)
+          && saved.indexOf(item) === index)
       : [];
-    return [...valid, ...codexDockMetricIds.filter((item) => !valid.includes(item))];
+    return [
+      ...valid,
+      ...codexDockMetricIds.filter((item) => item !== "trend" && !valid.includes(item)),
+      "trend"
+    ];
   } catch {
     return [...codexDockMetricIds];
   }
 }
 
 function applyCodexDockOrder() {
+  const focus = elements.codexDockFocus;
   for (const metric of codexDockOrder) {
     const item = elements.codexDock.querySelector(`[data-metric="${metric}"]`);
-    if (item) elements.codexDock.appendChild(item);
+    if (item) elements.codexDock.insertBefore(item, focus || null);
   }
   const hint = elements.codexDock.querySelector(".codex-dock-detach-hint");
   if (hint) elements.codexDock.appendChild(hint);
@@ -543,6 +563,7 @@ applyPetPreference();
 function formatTokens(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
+  if (Math.abs(number) >= 1_000_000_000_000) return `${(number / 1_000_000_000_000).toFixed(1)}T`;
   if (Math.abs(number) >= 1_000_000_000) return `${(number / 1_000_000_000).toFixed(1)}B`;
   if (Math.abs(number) >= 1_000_000) return `${(number / 1_000_000).toFixed(1)}M`;
   if (Math.abs(number) >= 1_000) return `${(number / 1_000).toFixed(1)}K`;
@@ -555,7 +576,7 @@ function formatUsageTokens(value) {
 
 function splitCompactTokenUnit(value) {
   const text = String(value);
-  const match = text.match(/^(.+?)([KMB])$/);
+  const match = text.match(/^(.+?)([KMBT])$/);
   return match
     ? { number: match[1], unit: match[2] }
     : { number: text, unit: "" };
@@ -564,6 +585,7 @@ function splitCompactTokenUnit(value) {
 function formatLiveUsageTokens(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
+  if (Math.abs(number) >= 1_000_000_000_000) return `${(number / 1_000_000_000_000).toFixed(1)}T`;
   if (Math.abs(number) >= 1_000_000_000) return `${(number / 1_000_000_000).toFixed(1)}B`;
   if (Math.abs(number) >= 1_000_000) return `${(number / 1_000_000).toFixed(1)}M`;
   if (Math.abs(number) >= 1_000) return `${(number / 1_000).toFixed(1)}K`;
@@ -589,6 +611,136 @@ function usesLocalUsageState(state) {
 function setText(element, value) {
   const text = String(value);
   if (element.textContent !== text) element.textContent = text;
+}
+
+function settleDockRollingText(element) {
+  const animations = codexDockRollAnimations.get(element) || [];
+  animations.forEach((animation) => animation.cancel());
+  codexDockRollAnimations.delete(element);
+  for (const slot of element.querySelectorAll(".codex-dock-roll-glyph")) {
+    const value = slot.dataset.value || "";
+    const glyph = document.createElement("span");
+    glyph.className = "codex-dock-roll-current";
+    glyph.textContent = value;
+    slot.replaceChildren(glyph);
+  }
+}
+
+function resetDockRollingText(element, text) {
+  const fragment = document.createDocumentFragment();
+  for (const character of Array.from(text)) {
+    const slot = document.createElement("span");
+    slot.className = "codex-dock-roll-glyph";
+    slot.dataset.value = character;
+    const glyph = document.createElement("span");
+    glyph.className = "codex-dock-roll-current";
+    glyph.textContent = character;
+    slot.appendChild(glyph);
+    fragment.appendChild(slot);
+  }
+  element.replaceChildren(fragment);
+  element.dataset.rollText = text;
+}
+
+function setDockRollingText(element, value, animated = true) {
+  if (!element) return;
+  const nextText = String(value);
+  const oldText = element.dataset.rollText ?? element.textContent ?? "";
+  if (oldText === nextText) return;
+  settleDockRollingText(element);
+  const oldCharacters = Array.from(oldText);
+  const nextCharacters = Array.from(nextText);
+  const slots = [...element.querySelectorAll(".codex-dock-roll-glyph")];
+  if (!slots.length || slots.length !== nextCharacters.length || oldCharacters.length !== nextCharacters.length) {
+    resetDockRollingText(element, nextText);
+    return;
+  }
+
+  const animations = [];
+  for (let index = 0; index < nextCharacters.length; index += 1) {
+    if (oldCharacters[index] === nextCharacters[index]) continue;
+    const slot = slots[index];
+    const outgoing = slot.firstElementChild;
+    const incoming = document.createElement("span");
+    incoming.className = "codex-dock-roll-current";
+    incoming.textContent = nextCharacters[index];
+    slot.dataset.value = nextCharacters[index];
+    slot.appendChild(incoming);
+    if (!animated || reduceMotion) {
+      outgoing?.remove();
+      continue;
+    }
+    const timing = {
+      duration: 210,
+      easing: "cubic-bezier(.2,.78,.3,1)",
+      fill: "both"
+    };
+    if (outgoing) {
+      animations.push(outgoing.animate([
+        { transform: "translateY(0)", opacity: 1 },
+        { transform: "translateY(-105%)", opacity: 0 }
+      ], timing));
+    }
+    animations.push(incoming.animate([
+      { transform: "translateY(105%)", opacity: 0 },
+      { transform: "translateY(0)", opacity: 1 }
+    ], timing));
+  }
+  element.dataset.rollText = nextText;
+  if (!animations.length) {
+    settleDockRollingText(element);
+    return;
+  }
+  codexDockRollAnimations.set(element, animations);
+  Promise.allSettled(animations.map((animation) => animation.finished)).then(() => {
+    if (codexDockRollAnimations.get(element) !== animations) return;
+    settleDockRollingText(element);
+  });
+}
+
+function codexDockPrimaryLimit(state) {
+  const limits = Array.isArray(state?.limits) ? state.limits : [];
+  return limits.find((limit) => limit?.headline === true)
+    || limits.find((limit) => Math.abs(Number(limit?.windowDurationMins) - 10_080) <= 5)
+    || limits[0];
+}
+
+function codexDockTaskCount(state) {
+  const explicit = Number(state?.task?.activeCount);
+  if (Number.isFinite(explicit)) return Math.max(0, Math.round(explicit));
+  return state?.task?.state === "working" || state?.task?.state === "attention" ? 1 : 0;
+}
+
+function sortedCodexDockResetCards(state) {
+  return [...(state?.resetCards || [])].sort((left, right) => {
+    if (left.available !== right.available) return left.available ? -1 : 1;
+    return (left.expiresAt || Number.MAX_SAFE_INTEGER) - (right.expiresAt || Number.MAX_SAFE_INTEGER);
+  });
+}
+
+function codexDockCardExpiration(card) {
+  if (!card?.expiresAt) return "到期时间 —";
+  const date = new Date(card.expiresAt * 1000);
+  return `${date.getMonth() + 1}/${date.getDate()}到期`;
+}
+
+function setCodexDockFocus(metric) {
+  const next = codexDockMetricIds.includes(metric)
+    && codexDockFocusedMetric !== metric
+    ? metric
+    : null;
+  codexDockFocusedMetric = next;
+  elements.codexDock.classList.toggle("is-focused", Boolean(next));
+  elements.codexDock.dataset.focusedMetric = next || "";
+  elements.codexDockFocus.hidden = !next;
+  elements.codexDockFocus.dataset.dockMetric = next || "";
+  for (const panel of elements.codexDockFocus.querySelectorAll("[data-focus-panel]")) {
+    panel.hidden = panel.dataset.focusPanel !== next;
+  }
+  if (next === "quota") {
+    if (typeof window.pulse.refreshLimits === "function") void window.pulse.refreshLimits();
+  }
+  if (currentState) renderCodexDock(currentState);
 }
 
 let tokenRollGeneration = 0;
@@ -733,6 +885,73 @@ function usageColor(remaining) {
   return "var(--green)";
 }
 
+function codexDockProgressColor(remaining) {
+  return Number.isFinite(remaining) && remaining <= 20 ? "var(--red)" : "var(--text)";
+}
+
+const CODEX_PROGRAMMING_INDEX = Object.freeze({
+  "gpt56sol|low": 69.7,
+  "gpt56sol|medium": 76.3,
+  "gpt56sol|high": 77.2,
+  "gpt56sol|xhigh": 78.3,
+  "gpt56sol|max": 77.4,
+  "gpt56sol|nonreasoning": 65.1,
+  "gpt56terra|low": 58.1,
+  "gpt56terra|medium": 64.7,
+  "gpt56terra|high": 67.1,
+  "gpt56terra|xhigh": 70.6,
+  "gpt56terra|max": 76.7,
+  "gpt56terra|nonreasoning": 52.3,
+  "gpt56luna|low": 44.2,
+  "gpt56luna|medium": 50.7,
+  "gpt56luna|high": 63.3,
+  "gpt56luna|xhigh": 68.6,
+  "gpt56luna|max": 71.4,
+  "gpt56luna|nonreasoning": 39.3,
+  "gpt55|low": 60.9,
+  "gpt55|medium": 71.5,
+  "gpt55|high": 71.6,
+  "gpt55|xhigh": 74.9,
+  "gpt55|nonreasoning": 56.5,
+  "gpt54|xhigh": 71.1,
+  "gpt54mini|xhigh": 56.1,
+  "gpt54nano|xhigh": 56.1,
+  "gpt5|high": 37.8,
+  "gpt5mini|high": 15.6,
+  "gptoss120b|low": 21.2,
+  "gptoss120b|high": 30.4,
+  "gptoss20b|high": 20.7
+});
+
+function codexDockProgrammingIndex(model, reasoningEffort) {
+  const normalize = (value) => String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+  const effortAliases = {
+    maximum: "max",
+    extrahigh: "xhigh",
+    none: "nonreasoning"
+  };
+  const suffixes = [
+    "nonreasoning", "minimal", "medium", "xhigh",
+    "high", "low", "maximum", "max"
+  ];
+  let modelKey = normalize(model);
+  let embeddedEffort = null;
+  for (const suffix of suffixes) {
+    if (modelKey.endsWith(suffix)) {
+      modelKey = modelKey.slice(0, -suffix.length);
+      embeddedEffort = effortAliases[suffix] || suffix;
+      break;
+    }
+  }
+  const effortKey = embeddedEffort
+    || effortAliases[normalize(reasoningEffort)]
+    || normalize(reasoningEffort);
+  const value = CODEX_PROGRAMMING_INDEX[`${modelKey}|${effortKey}`];
+  return Number.isFinite(value) ? value.toFixed(1) : "—";
+}
+
 function orbQuotaColor(remaining) {
   if (!Number.isFinite(remaining)) return "#8e8e93";
   if (remaining >= 80) return "#30d158";
@@ -780,28 +999,253 @@ function updateInformationClock() {
   setText(elements.informationTime, parts.time);
 }
 
+function codexDockResetDate(timestamp, now = new Date()) {
+  if (!timestamp) return "—";
+  const date = new Date(Number(timestamp) * 1000);
+  if (Number.isNaN(date.getTime())) return "—";
+  if (date.toDateString() === now.toDateString()) {
+    return new Intl.DateTimeFormat("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false
+    }).format(date).replace(/^24:/, "00:");
+  }
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
+}
+
+function codexDockWeatherUpdated(weather, now = new Date()) {
+  const fetchedAt = Number(weather?.fetchedAt);
+  if (!Number.isFinite(fetchedAt)) return "—";
+  const seconds = Math.max(0, Math.round((now.getTime() - fetchedAt) / 1000));
+  if (seconds < 60) return "刚刚更新";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}分钟前更新`;
+  return `${Math.floor(seconds / 3600)}小时前更新`;
+}
+
+function codexDockTrendBuckets(state) {
+  const raw = Array.isArray(state?.usage?.daily) ? state.usage.daily.slice(-7) : [];
+  if (raw.length >= 7) {
+    return raw.map((bucket) => ({
+      date: String(bucket?.date || bucket?.startDate || ""),
+      tokens: Math.max(0, Number(bucket?.tokens) || 0)
+    }));
+  }
+  return [
+    ...Array.from({ length: Math.max(0, 7 - raw.length) }, () => ({ date: "", tokens: 0 })),
+    ...raw.map((bucket) => ({
+      date: String(bucket?.date || bucket?.startDate || ""),
+      tokens: Math.max(0, Number(bucket?.tokens) || 0)
+    }))
+  ];
+}
+
+function codexDockTrendSummary(state) {
+  const buckets = codexDockTrendBuckets(state);
+  const values = buckets.map((bucket) => bucket.tokens);
+  return {
+    buckets,
+    total: values.reduce((sum, value) => Math.min(Number.MAX_SAFE_INTEGER, sum + value), 0),
+    peak: values.length ? Math.max(...values) : 0,
+    today: values.at(-1) || 0
+  };
+}
+
+function renderCodexDockSparkline(areaElement, lineElement, buckets) {
+  if (!areaElement || !lineElement) return;
+  const values = buckets.map((bucket) => Math.max(0, Number(bucket?.tokens) || 0));
+  const ceiling = Math.max(1, ...values);
+  const width = 100;
+  const height = 24;
+  const horizontalPadding = 2;
+  const verticalPadding = 2;
+  const usableWidth = width - horizontalPadding * 2;
+  const usableHeight = height - verticalPadding * 2;
+  const points = values.map((value, index) => {
+    const x = horizontalPadding + usableWidth * (values.length <= 1 ? 0.5 : index / (values.length - 1));
+    const y = height - verticalPadding - usableHeight * (value / ceiling);
+    return [x, y];
+  });
+  lineElement.setAttribute(
+    "points",
+    points.map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" ")
+  );
+  if (!points.length) {
+    areaElement.setAttribute("d", "");
+    return;
+  }
+  const baseline = height - verticalPadding;
+  const [firstX] = points[0];
+  const [lastX] = points[points.length - 1];
+  areaElement.setAttribute(
+    "d",
+    `M ${firstX.toFixed(2)} ${baseline} L ${points.map(([x, y]) => `${x.toFixed(2)} ${y.toFixed(2)}`).join(" L ")} L ${lastX.toFixed(2)} ${baseline} Z`
+  );
+}
+
+function renderCodexDockFocus(state, primary, now) {
+  if (!codexDockFocusedMetric) return;
+  const remaining = Number(primary?.remainingPercent);
+  const taskCount = codexDockTaskCount(state);
+  const cards = sortedCodexDockResetCards(state);
+  codexDockResetCardIndex = Math.min(
+    Math.max(0, codexDockResetCardIndex),
+    Math.max(0, cards.length - 1)
+  );
+
+  setDockRollingText(
+    elements.codexDockFocusQuota,
+    Number.isFinite(remaining) ? `${Math.round(remaining)}%` : "—"
+  );
+  elements.codexDockFocusQuotaFill.style.width =
+    `${Number.isFinite(remaining) ? Math.max(0, Math.min(100, remaining)) : 0}%`;
+  elements.codexDockFocusQuotaFill.style.background = codexDockProgressColor(remaining);
+  setText(
+    elements.codexDockFocusQuotaReset,
+    primary?.resetsAt ? `${codexDockResetDate(primary.resetsAt, now)}重置` : "重置 —"
+  );
+  elements.codexDockFocusTaskCount.hidden = taskCount <= 0;
+  setText(elements.codexDockFocusTaskCount, taskCount > 0 ? `● ${taskCount} 个任务执行中` : "");
+
+  elements.codexDockQuotaCards.hidden = cards.length === 0;
+  if (cards.length) {
+    const card = cards[codexDockResetCardIndex];
+    const availableCount = cards.filter((item) => item.available !== false).length;
+    setText(elements.codexDockQuotaCardCount, `重置卡 ${availableCount || cards.length}张`);
+    setText(
+      elements.codexDockCardTitle,
+      card?.title || card?.applicableLimitTypes?.[0] || "Full reset"
+    );
+    setText(elements.codexDockCardExpiry, codexDockCardExpiration(card));
+    setText(elements.codexDockCardPage, `${codexDockResetCardIndex + 1}/${cards.length}`);
+    elements.codexDockCardPrevious.disabled = cards.length <= 1;
+    elements.codexDockCardNext.disabled = cards.length <= 1;
+  }
+
+  const live = state.task?.state === "working" || state.task?.state === "attention";
+  setText(elements.codexDockTokenStatus, live ? "● 思考中 · 今日 Token" : "今日 Token");
+  setDockRollingText(
+    elements.codexDockFocusTokens,
+    state.connection === "connected" ? codexDockMetrics.formatTokens(state.usage?.today) : "—"
+  );
+  const cacheHit = codexDockMetrics.cacheHitRate(
+    state.usage?.localTodayInputTokens,
+    state.usage?.localTodayCachedInputTokens
+  );
+  setDockRollingText(
+    elements.codexDockTokenCacheHit,
+    codexDockMetrics.formatPercentRatio(cacheHit)
+  );
+  setDockRollingText(
+    elements.codexDockTokenCost,
+    codexDockMetrics.formatUSD(state.usage?.localTodayEstimatedCostUSD)
+  );
+  setText(
+    elements.codexDockTokenProgrammingIQ,
+    codexDockProgrammingIndex(state.task?.model, state.task?.reasoningEffort)
+  );
+  setDockRollingText(
+    elements.codexDockTokenTotal,
+    Number.isFinite(Number(state.usage?.total))
+      ? codexDockMetrics.formatTokens(state.usage.total)
+      : "—"
+  );
+
+  const cachedInput = Number(state.usage?.localTodayCachedInputTokens);
+  const input = Number(state.usage?.localTodayInputTokens);
+  const uncachedInput = Number.isFinite(input) && Number.isFinite(cachedInput)
+    ? Math.max(0, input - cachedInput)
+    : null;
+  setDockRollingText(
+    elements.codexDockFocusCacheHit,
+    codexDockMetrics.formatPercentRatio(cacheHit)
+  );
+  elements.codexDockFocusCacheHitFill.style.width =
+    `${cacheHit === null ? 0 : Math.max(0, Math.min(100, cacheHit * 100))}%`;
+  setDockRollingText(
+    elements.codexDockCacheTokens,
+    Number.isFinite(cachedInput) ? codexDockMetrics.formatTokens(cachedInput) : "—"
+  );
+  setDockRollingText(
+    elements.codexDockUncachedTokens,
+    uncachedInput === null ? "—" : codexDockMetrics.formatTokens(uncachedInput)
+  );
+  setDockRollingText(
+    elements.codexDockInputTokens,
+    Number.isFinite(input) ? codexDockMetrics.formatTokens(input) : "—"
+  );
+
+  setDockRollingText(
+    elements.codexDockFocusCost,
+    codexDockMetrics.formatUSD(state.usage?.localTodayEstimatedCostUSD)
+  );
+  setDockRollingText(
+    elements.codexDockUncachedCost,
+    codexDockMetrics.formatUSD(state.usage?.localTodayUncachedInputCostUSD)
+  );
+  setDockRollingText(
+    elements.codexDockCachedCost,
+    codexDockMetrics.formatUSD(state.usage?.localTodayCachedInputCostUSD)
+  );
+  setDockRollingText(
+    elements.codexDockOutputCost,
+    codexDockMetrics.formatUSD(state.usage?.localTodayOutputCostUSD)
+  );
+
+  const trend = codexDockTrendSummary(state);
+  setDockRollingText(
+    elements.codexDockFocusTrendTotal,
+    codexDockMetrics.formatTokens(trend.total)
+  );
+  setDockRollingText(
+    elements.codexDockFocusTrendToday,
+    codexDockMetrics.formatTokens(trend.today)
+  );
+  setDockRollingText(
+    elements.codexDockFocusTrendPeak,
+    codexDockMetrics.formatTokens(trend.peak)
+  );
+  renderCodexDockSparkline(
+    elements.codexDockFocusTrendArea,
+    elements.codexDockFocusTrendLine,
+    trend.buckets
+  );
+}
+
 function renderCodexDock(state, now = new Date()) {
   if (!state || !elements.codexDock) return;
-  const primary = state.limits?.[0];
+  const primary = codexDockPrimaryLimit(state);
   const remaining = Number(primary?.remainingPercent);
-  const weather = state.informationBar?.weather;
-  const temperature = Number(weather?.temperature);
-  const dateParts = informationDateParts(state.informationBar, now);
   const quota = Number.isFinite(remaining) ? `${Math.round(remaining)}%` : "—";
   const tokens = state.connection === "connected"
-    ? formatUsageTokens(state.usage?.today)
+    ? codexDockMetrics.formatTokens(state.usage?.today)
     : "—";
-  const reset = primary?.resetsAt ? formatCountdown(primary.resetsAt).replace(" 后重置", "") : "—";
-  const weatherValue = Number.isFinite(temperature)
-    ? `${weatherLabel(weather?.code, weather?.isDay !== false)} ${Math.round(temperature)}${weather?.unit || "°C"}`
-    : "—";
-  setText(elements.codexDockQuota, quota);
-  setText(elements.codexDockTokens, tokens);
-  setText(elements.codexDockReset, reset);
-  setText(elements.codexDockWeather, weatherValue);
-  setText(elements.codexDockTime, dateParts.time || "--:--");
+  const trend = codexDockTrendSummary(state);
+  const cacheHit = codexDockMetrics.cacheHitRate(
+    state.usage?.localTodayInputTokens,
+    state.usage?.localTodayCachedInputTokens
+  );
+  setDockRollingText(elements.codexDockQuota, quota);
+  setDockRollingText(elements.codexDockTokens, tokens);
+  setDockRollingText(elements.codexDockCacheHit, codexDockMetrics.formatPercentRatio(cacheHit));
+  setDockRollingText(
+    elements.codexDockCost,
+    codexDockMetrics.formatUSD(state.usage?.localTodayEstimatedCostUSD)
+  );
+  setDockRollingText(
+    elements.codexDockTrendTotal,
+    codexDockMetrics.formatTokens(trend.total)
+  );
+  renderCodexDockSparkline(
+    elements.codexDockTrendArea,
+    elements.codexDockTrendLine,
+    trend.buckets
+  );
+  const taskCount = codexDockTaskCount(state);
+  elements.codexDockTaskCount.hidden = taskCount <= 0;
+  setText(elements.codexDockTaskCount, taskCount > 0 ? `● ${taskCount}` : "");
   const quotaItem = elements.codexDock.querySelector('[data-metric="quota"]');
   if (quotaItem) quotaItem.style.setProperty("--dock-quota-color", usageColor(remaining));
+  renderCodexDockFocus(state, primary, now);
 }
 
 function nextCatIdleState(nowMs) {
@@ -1919,21 +2363,53 @@ function render(state) {
   setText(elements.todayDetail, connected
     ? formatUsageTokens(state.usage?.today, state.usage?.todayEstimated === true)
     : "—");
-  const hasLocalDaily = state.usage?.localDailyAvailable === true;
-  setText(elements.totalTokens, localUsageMode
-    ? hasLocalDaily
-      ? formatUsageTokens(state.usage?.localSevenDayTokens, state.usage?.localHistoryEstimated === true)
+  setText(elements.totalTokens, connected
+    ? formatUsageTokens(state.usage?.total, state.usage?.localTotalEstimated === true)
+    : "—");
+  setText(elements.totalMetricLabel, "累计 Token");
+  elements.totalTokens.title = "本机全部 Codex session 的历史累计 Token，包含本机使用过的所有账号";
+  const inputTokens = numberValue(state.usage?.localTodayInputTokens);
+  const cachedTokens = numberValue(state.usage?.localTodayCachedInputTokens);
+  const normalizedCachedTokens = cachedTokens === null
+    ? null
+    : Math.max(0, Math.min(Math.max(0, inputTokens || 0), cachedTokens));
+  const uncachedTokens = inputTokens === null
+    ? null
+    : Math.max(0, inputTokens - (normalizedCachedTokens || 0));
+  const cacheHitRate = inputTokens !== null && inputTokens > 0 && normalizedCachedTokens !== null
+    ? normalizedCachedTokens / inputTokens
+    : null;
+  setText(
+    elements.cachedTokensDetail,
+    connected ? formatUsageTokens(normalizedCachedTokens) : "—"
+  );
+  setText(
+    elements.uncachedTokensDetail,
+    connected ? formatUsageTokens(uncachedTokens) : "—"
+  );
+  setText(
+    elements.cacheHitDetail,
+    connected && cacheHitRate !== null
+      ? `${(cacheHitRate * 100).toFixed(1)}%`
       : "—"
-    : connected ? formatTokens(state.usage?.total) : "—");
-  setText(elements.totalMetricLabel, localUsageMode ? "本机近 7 日" : "累计");
-  elements.totalTokens.title = localUsageMode
-    ? "本机 Codex session 近 7 日汇总，不是 OpenAI 账户累计或账单"
-    : "账户累计 Token";
-  const usageSource = localUsageMode
-    ? state.usage?.todayEstimated
-      ? "第三方模型未提供 usage；当前数字来自本机 session 文本估算，不是服务商账单"
-      : "第三方/API Key 模式：今日与近 7 日来自本机全部 session 的真实 token_count/usage 汇总"
-    : "今日 Token 取 Codex App Server 与本机当天全部 session 汇总中的较大值；切换账号后立即更新";
+  );
+  setText(
+    elements.todayCostDetail,
+    connected
+      ? codexDockMetrics.formatUSD(state.usage?.localTodayEstimatedCostUSD)
+      : "—"
+  );
+  setText(
+    elements.totalCostDetail,
+    connected
+      ? codexDockMetrics.formatUSD(state.usage?.localTotalEstimatedCostUSD)
+      : "—"
+  );
+  elements.todayCostDetail.title = "公开 API 单价的等价估算，不代表 ChatGPT 套餐账单";
+  elements.totalCostDetail.title = "本机全部可识别模型 session 的 API 等价累计估算";
+  const usageSource = state.usage?.todayEstimated
+    ? "当前数字来自本机 session 文本估算，不是服务商账单"
+    : "今日与累计 Token 来自本机全部 Codex session；切换账号不会清空或替换";
   elements.todayTokens.title = usageSource;
   elements.todayDetail.title = usageSource;
 
@@ -3024,17 +3500,22 @@ function codexDockIsVertical() {
 }
 
 function reorderCodexDockMetric(metric, coordinate) {
+  if (metric === "trend") return;
   const dragged = elements.codexDock.querySelector(`[data-metric="${metric}"]`);
   if (!dragged) return;
   const siblings = [...elements.codexDock.querySelectorAll(".codex-dock-metric")]
-    .filter((item) => item !== dragged);
+    .filter((item) => item !== dragged && item.dataset.metric !== "trend");
   const before = siblings.find((item) => {
     const bounds = item.getBoundingClientRect();
     return coordinate < (codexDockIsVertical()
       ? bounds.top + bounds.height / 2
       : bounds.left + bounds.width / 2);
   });
-  elements.codexDock.insertBefore(dragged, before || elements.codexDock.querySelector(".codex-dock-detach-hint"));
+  const trend = elements.codexDock.querySelector('[data-metric="trend"]');
+  elements.codexDock.insertBefore(
+    dragged,
+    before || trend || elements.codexDock.querySelector(".codex-dock-detach-hint")
+  );
   codexDockOrder = [...elements.codexDock.querySelectorAll(".codex-dock-metric")]
     .map((item) => item.dataset.metric)
     .filter(Boolean);
@@ -3042,19 +3523,21 @@ function reorderCodexDockMetric(metric, coordinate) {
 
 elements.codexDock.addEventListener("pointerdown", (event) => {
   if (!codexDockAttached || event.button !== 0) return;
+  if (event.target.closest(".codex-dock-control")) return;
   const metric = event.target.closest(".codex-dock-metric");
-  if (!metric) return;
+  const focusPanel = event.target.closest(".codex-dock-focus-panel");
+  if (!metric && !focusPanel) return;
   event.preventDefault();
   codexDockPointer = {
     id: event.pointerId,
-    metric: metric.dataset.metric,
+    metric: metric?.dataset.metric || codexDockFocusedMetric,
+    source: focusPanel ? "focus" : "metric",
     startX: event.screenX,
     startY: event.screenY,
     axis: null,
     progress: 0,
     direction: 1
   };
-  metric.classList.add("dragging");
   elements.codexDock.setPointerCapture(event.pointerId);
 });
 
@@ -3065,8 +3548,14 @@ elements.codexDock.addEventListener("pointermove", (event) => {
   if (!codexDockPointer.axis) {
     codexDockPointer.axis = codexDockInteraction.dragAxis(codexDockEdge, dx, dy);
     if (!codexDockPointer.axis) return;
+    if (codexDockPointer.source === "metric") {
+      elements.codexDock
+        .querySelector(`[data-metric="${codexDockPointer.metric}"]`)
+        ?.classList.add("dragging");
+    }
   }
   if (codexDockPointer.axis === "reorder") {
+    if (codexDockPointer.source === "focus") return;
     reorderCodexDockMetric(
       codexDockPointer.metric,
       codexDockIsVertical() ? event.clientY : event.clientX
@@ -3111,7 +3600,11 @@ function finishCodexDockPointer(event, cancelled = false) {
     elements.codexDock.releasePointerCapture(event.pointerId);
   }
   if (pointer.axis === "reorder") {
-    saveCodexDockOrder();
+    if (pointer.source === "metric") saveCodexDockOrder();
+    return;
+  }
+  if (!pointer.axis && !cancelled) {
+    setCodexDockFocus(pointer.metric);
     return;
   }
   setCodexDockDetachmentProgress(0, false, pointer.direction);
@@ -3119,6 +3612,23 @@ function finishCodexDockPointer(event, cancelled = false) {
 
 elements.codexDock.addEventListener("pointerup", (event) => finishCodexDockPointer(event));
 elements.codexDock.addEventListener("pointercancel", (event) => finishCodexDockPointer(event, true));
+elements.codexDockCardPrevious.addEventListener("click", () => {
+  const cards = sortedCodexDockResetCards(currentState);
+  if (cards.length <= 1) return;
+  codexDockResetCardIndex =
+    (Math.min(codexDockResetCardIndex, cards.length - 1) - 1 + cards.length) % cards.length;
+  renderCodexDock(currentState);
+});
+elements.codexDockCardNext.addEventListener("click", () => {
+  const cards = sortedCodexDockResetCards(currentState);
+  if (cards.length <= 1) return;
+  codexDockResetCardIndex =
+    (Math.min(codexDockResetCardIndex, cards.length - 1) + 1) % cards.length;
+  renderCodexDock(currentState);
+});
+elements.codexDockCardOpen.addEventListener("click", () => {
+  void window.pulse.openExternal("https://chatgpt.com/codex/settings/usage");
+});
 
 if (typeof window.pulse.onCodexDockTransition === "function") {
   window.pulse.onCodexDockTransition((transition = {}) => {
@@ -3128,6 +3638,9 @@ if (typeof window.pulse.onCodexDockTransition === "function") {
         ? transition.edge
         : "bottom";
       root.dataset.codexDockEdge = codexDockEdge;
+      root.dataset.codexDockFullscreen = transition.fullscreen === true
+        ? "true"
+        : "false";
       root.classList.remove("codex-dock-restored", "codex-dock-detaching");
       root.classList.add("codex-dock-attaching");
       return;
@@ -3139,6 +3652,9 @@ if (typeof window.pulse.onCodexDockTransition === "function") {
         ? transition.edge
         : codexDockEdge;
       root.dataset.codexDockEdge = codexDockEdge;
+      root.dataset.codexDockFullscreen = transition.fullscreen === true
+        ? "true"
+        : "false";
       applyCodexDockOrder();
       setCodexDockDetachmentProgress(0, true);
       elements.codexDock.hidden = false;
@@ -3149,7 +3665,11 @@ if (typeof window.pulse.onCodexDockTransition === "function") {
     }
     if (transition.phase === "detaching") {
       codexDockAttached = false;
+      root.dataset.codexDockFullscreen = transition.fullscreen === true
+        ? "true"
+        : "false";
       codexDockPointer = null;
+      setCodexDockFocus(null);
       root.classList.remove("codex-dock-attached", "codex-dock-attaching");
       root.classList.add("codex-dock-detaching", "codex-dock-restored");
       elements.codexDock.hidden = true;
@@ -3160,7 +3680,9 @@ if (typeof window.pulse.onCodexDockTransition === "function") {
     if (transition.phase === "detached") {
       codexDockAttached = false;
       delete root.dataset.codexDockEdge;
+      delete root.dataset.codexDockFullscreen;
       codexDockPointer = null;
+      setCodexDockFocus(null);
       root.classList.remove("codex-dock-attached", "codex-dock-attaching", "codex-dock-detaching");
       root.classList.add("codex-dock-restored");
       elements.codexDock.hidden = true;

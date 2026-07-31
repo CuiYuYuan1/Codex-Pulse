@@ -149,14 +149,21 @@ private final class CodexAuthenticationFileWatcher: @unchecked Sendable {
         let size: UInt64
         let modifiedAt: TimeInterval
         let fileNumber: UInt64
+        /// auth.json 可能被同长度内容原位覆盖，单看文件元数据会漏检。
+        /// 这里只保留不可逆向使用的内存指纹，不记录或输出任何认证内容。
+        let contentFingerprint: UInt64
+    }
+
+    private struct FileState: Equatable {
+        let signature: Signature?
     }
 
     private let queue = DispatchQueue(label: "com.codexpulse.auth-watcher", qos: .utility)
     private let onChange: @Sendable () -> Void
     private var timer: DispatchSourceTimer?
     private var authURL: URL?
-    private var lastSignature: Signature?
-    private var hasBaseline = false
+    private var lastState: FileState?
+    private var pendingState: FileState?
 
     init(onChange: @escaping @Sendable () -> Void) {
         self.onChange = onChange
@@ -175,14 +182,14 @@ private final class CodexAuthenticationFileWatcher: @unchecked Sendable {
             let url = URL(fileURLWithPath: expandedRoot, isDirectory: true)
                 .appendingPathComponent("auth.json", isDirectory: false)
             self.authURL = url
-            self.lastSignature = self.signature(of: url)
-            self.hasBaseline = true
+            self.lastState = FileState(signature: self.signature(of: url))
+            self.pendingState = nil
 
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(
-                deadline: .now() + .seconds(1),
-                repeating: .seconds(1),
-                leeway: .milliseconds(150)
+                deadline: .now() + .milliseconds(250),
+                repeating: .milliseconds(500),
+                leeway: .milliseconds(80)
             )
             timer.setEventHandler { [weak self] in
                 self?.poll()
@@ -201,33 +208,56 @@ private final class CodexAuthenticationFileWatcher: @unchecked Sendable {
         timer?.cancel()
         timer = nil
         authURL = nil
-        lastSignature = nil
-        hasBaseline = false
+        lastState = nil
+        pendingState = nil
     }
 
     private func poll() {
         guard let authURL else { return }
-        let next = signature(of: authURL)
-        guard hasBaseline else {
-            lastSignature = next
-            hasBaseline = true
+        let next = FileState(signature: signature(of: authURL))
+        guard let lastState else {
+            self.lastState = next
             return
         }
-        guard next != lastSignature else { return }
-        lastSignature = next
+        guard next != lastState else {
+            pendingState = nil
+            return
+        }
+
+        // 登录流程可能先截断再重写 auth.json。要求连续两次采样完全一致，
+        // 既避免用半写入文件重启，也能在约 0.5–1 秒内稳定识别切号。
+        guard pendingState == next else {
+            pendingState = next
+            return
+        }
+
+        self.lastState = next
+        pendingState = nil
         PulseLog.write("authentication file changed; requesting app-server restart")
         onChange()
     }
 
     private func signature(of url: URL) -> Signature? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
             return nil
         }
         return Signature(
             size: (attributes[.size] as? NSNumber)?.uint64Value ?? 0,
             modifiedAt: (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0,
-            fileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+            fileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0,
+            contentFingerprint: Self.fingerprint(data)
         )
+    }
+
+    /// FNV-1a 仅用于变更比较；认证内容不会离开当前进程。
+    private static func fingerprint(_ data: Data) -> UInt64 {
+        var value: UInt64 = 14_695_981_039_346_656_037
+        for byte in data {
+            value ^= UInt64(byte)
+            value &*= 1_099_511_628_211
+        }
+        return value
     }
 }
 #else
@@ -278,6 +308,9 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
     private var recentThreadIDs: [String] = []
     private var rateLimitsRetryAfter: Date?
     private var rateLimitsFailureCount = 0
+    /// 高频今日指标与全历史汇总使用独立 actor，避免首次历史扫描占住串行队列，
+    /// 导致缓存命中率和今日成本虽然已收到文件事件却迟迟不能显示。
+    private let realtimeLocalUsageReader = LocalCodexUsageReader()
     private lazy var sessionFileWatcher = CodexSessionFileWatcher { [weak self] url in
         guard let self else { return }
         self.handleSessionFileChange(url)
@@ -488,8 +521,8 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
 
     func readUsage(forceRefresh: Bool) async throws -> UsageStats {
         if !forceRefresh, let cached = cachedUsage(maxAge: usageCacheTTL) {
-            PulseLog.write("usage cache hit; refreshing local today only")
-            return await mergingLocalToday(into: cached)
+            PulseLog.write("usage cache hit; refreshing device-local session totals")
+            return await mergingLocalUsage(into: cached)
         }
 
         do {
@@ -513,15 +546,15 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
                    let alt = try? JSONDecoder().decode(WireGetAccountTokenUsageResponse.self, from: re) {
                     let mapped = ProtocolMapper.usage(from: alt)
                     storeUsageCache(mapped)
-                    return await mergingLocalToday(into: mapped)
+                    return await mergingLocalUsage(into: mapped)
                 }
                 let fallback = ProtocolMapper.emptyUsage(note: "Token 数据解析失败")
                 // 解析/网络瞬时失败不能占用 60 秒成功缓存，否则后续轮询一直命中空数据。
-                return await mergingLocalToday(into: fallback, promoteToDisplayedUsage: true)
+                return await mergingLocalUsage(into: fallback)
             }
             let mapped = ProtocolMapper.usage(from: wire)
             storeUsageCache(mapped)
-            let stats = await mergingLocalToday(into: mapped)
+            let stats = await mergingLocalUsage(into: mapped)
             PulseLog.write(
                 "usage mapped total=\(stats.totalTokens.map(String.init) ?? "nil") today=\(stats.todayTokens.map(String.init) ?? "nil") buckets=\(stats.dailyBuckets.count)"
             )
@@ -530,7 +563,7 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
             if var cached = cachedUsage(maxAge: .greatestFiniteMagnitude) {
                 cached.sourceNote = "Token 远端统计刷新失败，已保留最近数据：\(error.localizedDescription)"
                 PulseLog.write("usage remote fail; using cached summary: \(error.localizedDescription)")
-                return await mergingLocalToday(into: cached, promoteToDisplayedUsage: true)
+                return await mergingLocalUsage(into: cached)
             }
             // API-key / 无权限：软失败并带说明，避免整页 Token 全是 —
             if case CodexServerError.rpcError(_, let msg) = error {
@@ -542,24 +575,43 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
                     )
                     // 明确不支持/无权限属于稳定结果，可以短期缓存避免重复打接口。
                     storeUsageCache(fallback)
-                    return await mergingLocalToday(into: fallback, promoteToDisplayedUsage: true)
+                    return await mergingLocalUsage(into: fallback)
                 }
                 let fallback = ProtocolMapper.emptyUsage(note: "Token 统计 RPC 失败：\(msg)")
-                return await mergingLocalToday(into: fallback, promoteToDisplayedUsage: true)
+                return await mergingLocalUsage(into: fallback)
             }
             if case CodexServerError.timeout = error {
                 let fallback = ProtocolMapper.emptyUsage(note: "Token 统计请求超时")
-                return await mergingLocalToday(into: fallback, promoteToDisplayedUsage: true)
+                return await mergingLocalUsage(into: fallback)
             }
             let fallback = ProtocolMapper.emptyUsage(
                 note: "Token 统计暂不可用：\(error.localizedDescription)"
             )
-            return await mergingLocalToday(into: fallback, promoteToDisplayedUsage: true)
+            return await mergingLocalUsage(into: fallback)
         }
     }
 
     func readLocalUsage(merging cached: UsageStats) async -> UsageStats {
-        await mergingLocalToday(into: cached, promoteToDisplayedUsage: true)
+        await mergingLocalUsage(into: cached)
+    }
+
+    func readRealtimeLocalUsage(merging cached: UsageStats) async -> UsageStats {
+        var merged = cached
+        if let localToday = await realtimeLocalUsageReader.todayUsageSummary(
+            codexHome: serverCodexHome
+        ) {
+            merged.mergeLocalTodayTokens(localToday.totalTokens)
+            merged.mergeLocalTodayBreakdown(
+                inputTokens: localToday.inputTokens,
+                cachedInputTokens: localToday.cachedInputTokens,
+                outputTokens: localToday.outputTokens,
+                estimatedCostUSD: localToday.estimatedCostUSD,
+                uncachedInputCostUSD: localToday.uncachedInputCostUSD,
+                cachedInputCostUSD: localToday.cachedInputCostUSD,
+                outputCostUSD: localToday.outputCostUSD
+            )
+        }
+        return merged
     }
 
     func invalidateAccountScopedState() {
@@ -598,21 +650,37 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
         }
     }
 
-    private func mergingLocalToday(
-        into usage: UsageStats,
-        promoteToDisplayedUsage: Bool = false
-    ) async -> UsageStats {
+    private func mergingLocalUsage(into usage: UsageStats) async -> UsageStats {
         var merged = usage
-        async let localTodayTask = LocalCodexUsageReader.shared.todayTokens(codexHome: serverCodexHome)
+        async let localTodayTask = LocalCodexUsageReader.shared.todayUsageSummary(
+            codexHome: serverCodexHome
+        )
         async let localDailyTask = LocalCodexUsageReader.shared.last7DaysBuckets(codexHome: serverCodexHome)
+        async let localHistoryTask = LocalCodexUsageReader.shared.allTimeSummary(codexHome: serverCodexHome)
         if let localToday = await localTodayTask {
-            merged.mergeLocalTodayTokens(
-                localToday,
-                promoteToAccountTotals: promoteToDisplayedUsage
+            merged.mergeLocalTodayTokens(localToday.totalTokens)
+            merged.mergeLocalTodayBreakdown(
+                inputTokens: localToday.inputTokens,
+                cachedInputTokens: localToday.cachedInputTokens,
+                outputTokens: localToday.outputTokens,
+                estimatedCostUSD: localToday.estimatedCostUSD,
+                uncachedInputCostUSD: localToday.uncachedInputCostUSD,
+                cachedInputCostUSD: localToday.cachedInputCostUSD,
+                outputCostUSD: localToday.outputCostUSD
             )
         }
         if let localDaily = await localDailyTask {
             merged.mergeLocalDailyBuckets(localDaily)
+        }
+        if let localHistory = await localHistoryTask {
+            merged.mergeLocalTotalTokens(
+                localHistory.totalTokens,
+                estimatedCostUSD: localHistory.estimatedCostUSD
+            )
+            merged.mergeLocalStreak(
+                currentDays: localHistory.streak.currentDays,
+                longestDays: localHistory.streak.longestDays
+            )
         }
         return merged
     }
@@ -841,6 +909,10 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
                     task.runState = local.state
                 }
                 task.projectPath = task.projectPath ?? local.cwd
+                task.model = task.model ?? local.model
+                task.reasoningEffort = task.reasoningEffort ?? local.reasoningEffort
+                task.tokenUsage = local.totalTokens ?? task.tokenUsage
+                task.lastTokenUsage = local.lastUsageTokens
                 task.finishedAt = max(task.finishedAt, local.modifiedAt)
                 task.startedAt = local.startedAt ?? task.startedAt
                 task.conversation = local.conversation
@@ -860,7 +932,7 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
             projectName: path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Codex",
             projectPath: path,
             gitBranch: nil,
-            model: nil,
+            model: local.model,
             tokenUsage: local.totalTokens,
             durationSeconds: 0,
             succeeded: true,
@@ -870,7 +942,9 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
             runState: local.state,
             activeFlags: nil,
             startedAt: local.startedAt,
-            conversation: local.conversation
+            conversation: local.conversation,
+            reasoningEffort: local.reasoningEffort,
+            lastTokenUsage: local.lastUsageTokens
         )
     }
 
@@ -880,6 +954,9 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
             if let activity = await LocalCodexActivityReader.shared.activitySnapshot(at: url) {
                 let record = self.localTaskRecord(activity)
                 self.queue.async {
+                    if let limits = activity.rateLimits {
+                        self.eventContinuation?.yield(.localRateLimitsUpdated(limits))
+                    }
                     self.eventContinuation?.yield(.localTaskStateChanged(record))
                 }
             } else {

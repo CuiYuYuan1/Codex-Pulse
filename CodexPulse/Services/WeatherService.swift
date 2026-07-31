@@ -71,6 +71,11 @@ enum WeatherCondition: String, Codable, Equatable, Sendable {
 
 struct WeatherSnapshot: Codable, Equatable, Sendable {
     let temperature: Double
+    let apparentTemperature: Double?
+    let maximumTemperature: Double?
+    let minimumTemperature: Double?
+    let relativeHumidity: Double?
+    let windSpeed: Double?
     let condition: WeatherCondition
     let isDay: Bool
     let observedAt: Date
@@ -110,17 +115,34 @@ private struct OpenMeteoGeocodingResponse: Decodable {
 private struct OpenMeteoForecastResponse: Decodable {
     struct Current: Decodable {
         let temperature2m: Double
+        let apparentTemperature: Double?
+        let relativeHumidity2m: Double?
+        let windSpeed10m: Double?
         let weatherCode: Int
         let isDay: Int
 
         enum CodingKeys: String, CodingKey {
             case temperature2m = "temperature_2m"
+            case apparentTemperature = "apparent_temperature"
+            case relativeHumidity2m = "relative_humidity_2m"
+            case windSpeed10m = "wind_speed_10m"
             case weatherCode = "weather_code"
             case isDay = "is_day"
         }
     }
 
+    struct Daily: Decodable {
+        let temperature2mMax: [Double]?
+        let temperature2mMin: [Double]?
+
+        enum CodingKeys: String, CodingKey {
+            case temperature2mMax = "temperature_2m_max"
+            case temperature2mMin = "temperature_2m_min"
+        }
+    }
+
     let current: Current?
+    let daily: Daily?
 }
 
 /// 无需 API Key 的 Open-Meteo 客户端。地理编码和天气接口均为免费公共接口，
@@ -188,7 +210,11 @@ actor OpenMeteoClient {
         components.queryItems = [
             URLQueryItem(name: "latitude", value: String(format: "%.6f", locale: Locale(identifier: "en_US_POSIX"), location.latitude)),
             URLQueryItem(name: "longitude", value: String(format: "%.6f", locale: Locale(identifier: "en_US_POSIX"), location.longitude)),
-            URLQueryItem(name: "current", value: "temperature_2m,weather_code,is_day"),
+            URLQueryItem(
+                name: "current",
+                value: "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code,is_day"
+            ),
+            URLQueryItem(name: "daily", value: "temperature_2m_max,temperature_2m_min"),
             URLQueryItem(name: "timezone", value: location.timezone),
             URLQueryItem(name: "forecast_days", value: "1")
         ]
@@ -213,6 +239,11 @@ actor OpenMeteoClient {
 
         let snapshot = WeatherSnapshot(
             temperature: current.temperature2m,
+            apparentTemperature: current.apparentTemperature,
+            maximumTemperature: response.daily?.temperature2mMax?.first,
+            minimumTemperature: response.daily?.temperature2mMin?.first,
+            relativeHumidity: current.relativeHumidity2m,
+            windSpeed: current.windSpeed10m,
             condition: WeatherCondition(wmoCode: current.weatherCode),
             isDay: current.isDay == 1,
             observedAt: Date()
