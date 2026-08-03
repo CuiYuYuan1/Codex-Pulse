@@ -2156,14 +2156,12 @@ function modeFor(state) {
 
 function updateTaskMetric(state, mode = modeFor(state)) {
   const hasActiveTask = mode === "working" || mode === "attention";
-  setText(elements.taskMetricLabel, hasActiveTask ? "任务时间" : "在线天数");
+  setText(elements.taskMetricLabel, "任务时间");
   setText(
     elements.taskElapsed,
     hasActiveTask
       ? formatElapsed(state.task?.startedAt)
-      : state.connection === "connected" && Number.isFinite(Number(state.usage?.streakDays))
-        ? `${Math.max(0, Math.round(Number(state.usage.streakDays)))}天`
-        : "—"
+      : "—"
   );
 }
 

@@ -119,6 +119,31 @@ enum RateLimitFreshnessSmoke {
             RateLimitFreshness.mergeLocal(current: .empty, observation: parsed) == nil,
             "local session data must not establish account-scoped buckets after an account switch"
         )
+
+        let whamUsage = """
+        {
+          "rate_limits_by_limit_id": {
+            "codex": {
+              "limit_id": "codex",
+              "limit_name": "Codex",
+              "primary": {
+                "used_percent": 9,
+                "window_minutes": 10080,
+                "resets_at": 1785903155
+              }
+            }
+          },
+          "rate_limit_reset_credits": {
+            "available_count": 1
+          }
+        }
+        """
+        let whamWire = try RateLimitsWireParser.parse(Data(whamUsage.utf8))
+        let wham = ProtocolMapper.rateLimits(from: whamWire)
+        precondition(wham.primaryBucket?.usedPercent == 9)
+        precondition(wham.primaryBucket?.remainingPercent == 91)
+        precondition(wham.availableResetCardCount == 1)
+
         print("Rate limit freshness smoke: PASS")
     }
 

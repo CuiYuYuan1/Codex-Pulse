@@ -14,6 +14,7 @@ const {
 } = require("electron");
 const { spawn, execFile } = require("child_process");
 const fs = require("fs");
+const https = require("https");
 const path = require("path");
 const readline = require("readline");
 const crypto = require("crypto");
@@ -1289,7 +1290,9 @@ function applyRateLimitPayload(result, {
   merge = false
 } = {}) {
   if (!result || acceptedAt < lastAcceptedLimitsAt) return false;
-  const normalized = normalizeLimits(result);
+  const normalized = Array.isArray(result.normalizedLimits)
+    ? { limits: result.normalizedLimits, cards: Array.isArray(result.normalizedCards) ? result.normalizedCards : [] }
+    : normalizeLimits(result);
   if (!normalized.limits.length) return false;
   const limits = merge
     ? mergeNormalizedLimits(state.limits, result)
@@ -3037,6 +3040,91 @@ function readAuthIdentity() {
   }
 }
 
+function readCodexCredentials() {
+  const authPath = path.join(codexHomeRoot(), "auth.json");
+  if (!exists(authPath)) return null;
+  try {
+    const root = JSON.parse(fs.readFileSync(authPath, "utf8"));
+    const tokens = root.tokens && typeof root.tokens === "object" ? root.tokens : {};
+    const accessToken = tokens.access_token || tokens.accessToken || "";
+    if (!accessToken) return null;
+    return {
+      accessToken,
+      accountID: tokens.account_id || tokens.accountId || null
+    };
+  } catch {
+    return null;
+  }
+}
+
+function fetchJSON(url, { headers = {}, timeout = 6000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const request = https.request(url, {
+      method: "GET",
+      timeout,
+      headers
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        const body = Buffer.concat(chunks).toString("utf8");
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          reject(new Error(`HTTP ${response.statusCode}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    request.on("timeout", () => {
+      request.destroy(new Error("request timeout"));
+    });
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+async function fetchWhamUsageRateLimits() {
+  const credentials = readCodexCredentials();
+  if (!credentials) return null;
+  const headers = {
+    Accept: "application/json",
+    Authorization: `Bearer ${credentials.accessToken}`,
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+    originator: "Codex Desktop"
+  };
+  if (credentials.accountID) {
+    headers["ChatGPT-Account-Id"] = credentials.accountID;
+  }
+  try {
+    const result = await fetchJSON("https://chatgpt.com/backend-api/wham/usage", {
+      headers,
+      timeout: 6000
+    });
+    const normalized = normalizeLimits(result);
+    return normalized.limits.length ? result : null;
+  } catch (error) {
+    console.warn(`[CodexPulse] wham usage rate limits unavailable: ${error.message}`);
+    return null;
+  }
+}
+
+function mergeAuthoritativeRateLimitResult(baseResult, authoritativeResult) {
+  if (!authoritativeResult) return baseResult;
+  const base = normalizeLimits(baseResult);
+  const authoritative = normalizeLimits(authoritativeResult);
+  if (!authoritative.limits.length) return baseResult;
+  return {
+    ...baseResult,
+    normalizedLimits: reconcileNormalizedLimits(base.limits, authoritative.limits, false),
+    normalizedCards: base.cards.length ? base.cards : authoritative.cards
+  };
+}
+
 function checkAuthIdentity() {
   const next = readAuthIdentity();
   if (next === null) return;
@@ -3227,8 +3315,19 @@ function refreshLimits() {
   limitsRefreshInFlight = true;
   limitsRefreshPromise = (async () => {
     try {
-      const result = await client.request("account/rateLimits/read", {}, 25000);
+      const [rpcResult, directResult] = await Promise.allSettled([
+        client.request("account/rateLimits/read", {}, 25000),
+        fetchWhamUsageRateLimits()
+      ]);
+      if (rpcResult.status === "rejected"
+          && (directResult.status !== "fulfilled" || !directResult.value)) {
+        throw rpcResult.reason;
+      }
       if (client !== rpc || generation !== accountGeneration) return;
+      const result = mergeAuthoritativeRateLimitResult(
+        rpcResult.status === "fulfilled" ? rpcResult.value : {},
+        directResult.status === "fulfilled" ? directResult.value : null
+      );
       applyRateLimitPayload(result, { acceptedAt: requestedAt, merge: false });
     } catch (error) {
       if (client === rpc && generation === accountGeneration) {

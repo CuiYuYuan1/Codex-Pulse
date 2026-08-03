@@ -100,16 +100,27 @@ enum RateLimitsWireParser {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw CodexServerError.invalidResponse("rateLimits root not object")
         }
-        let single = parseSnapshot(root["rateLimits"] as? [String: Any])
+        return parse(root)
+    }
+
+    static func parse(_ rawRoot: [String: Any]) -> WireGetAccountRateLimitsResponse {
+        let root = (rawRoot["data"] as? [String: Any])
+            ?? (rawRoot["result"] as? [String: Any])
+            ?? rawRoot
+        let single = parseSnapshot(
+            firstDictionary(root, keys: ["rateLimits", "rate_limits"])
+        )
         var byId: [String: WireRateLimitSnapshot] = [:]
-        if let map = root["rateLimitsByLimitId"] as? [String: Any] {
+        if let map = firstDictionary(root, keys: ["rateLimitsByLimitId", "rate_limits_by_limit_id"]) {
             for (key, value) in map {
                 if let dict = value as? [String: Any], let snap = parseSnapshot(dict) {
                     byId[key] = snap
                 }
             }
         }
-        let credits = parseResetCredits(root["rateLimitResetCredits"] as? [String: Any])
+        let credits = parseResetCredits(
+            firstDictionary(root, keys: ["rateLimitResetCredits", "rate_limit_reset_credits"])
+        )
         return WireGetAccountRateLimitsResponse(
             rateLimits: single,
             rateLimitsByLimitId: byId.isEmpty ? nil : byId,
@@ -120,35 +131,42 @@ enum RateLimitsWireParser {
     private static func parseSnapshot(_ dict: [String: Any]?) -> WireRateLimitSnapshot? {
         guard let dict else { return nil }
         return WireRateLimitSnapshot(
-            limitId: dict["limitId"] as? String,
-            limitName: dict["limitName"] as? String,
+            limitId: string(dict["limitId"] ?? dict["limit_id"]),
+            limitName: string(dict["limitName"] ?? dict["limit_name"]),
             primary: parseWindow(dict["primary"] as? [String: Any]),
             secondary: parseWindow(dict["secondary"] as? [String: Any]),
             credits: parseCredits(dict["credits"] as? [String: Any]),
-            planType: dict["planType"] as? String,
+            planType: string(dict["planType"] ?? dict["plan_type"]),
             rateLimitReachedType: {
                 if let s = dict["rateLimitReachedType"] as? String { return s }
+                if let s = dict["rate_limit_reached_type"] as? String { return s }
                 if dict["rateLimitReachedType"] is NSNull { return nil }
+                if dict["rate_limit_reached_type"] is NSNull { return nil }
                 if let n = dict["rateLimitReachedType"] { return "\(n)" }
+                if let n = dict["rate_limit_reached_type"] { return "\(n)" }
                 return nil
             }(),
-            spendControlReached: dict["spendControlReached"] as? Bool
+            spendControlReached: bool(dict["spendControlReached"] ?? dict["spend_control_reached"])
         )
     }
 
     private static func parseWindow(_ dict: [String: Any]?) -> WireRateLimitWindow? {
         guard let dict else { return nil }
         return WireRateLimitWindow(
-            usedPercent: number(dict["usedPercent"]),
-            windowDurationMins: number(dict["windowDurationMins"]),
-            resetsAt: number(dict["resetsAt"])
+            usedPercent: number(dict["usedPercent"] ?? dict["used_percent"]),
+            windowDurationMins: number(
+                dict["windowDurationMins"]
+                    ?? dict["window_duration_mins"]
+                    ?? dict["window_minutes"]
+            ),
+            resetsAt: number(dict["resetsAt"] ?? dict["resets_at"])
         )
     }
 
     private static func parseCredits(_ dict: [String: Any]?) -> WireCreditsSnapshot? {
         guard let dict else { return nil }
         return WireCreditsSnapshot(
-            hasCredits: dict["hasCredits"] as? Bool,
+            hasCredits: bool(dict["hasCredits"] ?? dict["has_credits"]),
             unlimited: dict["unlimited"] as? Bool,
             balance: number(dict["balance"])
         )
@@ -160,27 +178,57 @@ enum RateLimitsWireParser {
         if let arr = dict["credits"] as? [[String: Any]] {
             list = arr.map { c in
                 WireRateLimitResetCredit(
-                    id: c["id"] as? String,
-                    resetType: c["resetType"] as? String,
-                    status: c["status"] as? String,
-                    grantedAt: number(c["grantedAt"]),
-                    expiresAt: number(c["expiresAt"]),
-                    title: c["title"] as? String,
-                    description: c["description"] as? String
+                    id: string(c["id"]),
+                    resetType: string(c["resetType"] ?? c["reset_type"]),
+                    status: string(c["status"]),
+                    grantedAt: number(c["grantedAt"] ?? c["granted_at"]),
+                    expiresAt: number(c["expiresAt"] ?? c["expires_at"]),
+                    title: string(c["title"]),
+                    description: string(c["description"])
                 )
             }
         }
         let count: Int?
-        if let i = dict["availableCount"] as? Int {
+        let rawAvailable = dict["availableCount"] ?? dict["available_count"]
+        if let i = rawAvailable as? Int {
             count = i
-        } else if let d = dict["availableCount"] as? Double {
+        } else if let d = rawAvailable as? Double {
             count = Int(d)
-        } else if let s = dict["availableCount"] as? String, let i = Int(s) {
+        } else if let s = rawAvailable as? String, let i = Int(s) {
             count = i
         } else {
             count = nil
         }
         return WireRateLimitResetCreditsSummary(availableCount: count, credits: list)
+    }
+
+    private static func firstDictionary(_ root: [String: Any], keys: [String]) -> [String: Any]? {
+        for key in keys {
+            if let value = root[key] as? [String: Any] {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private static func string(_ any: Any?) -> String? {
+        switch any {
+        case let s as String: return s
+        case let n as NSNumber: return n.stringValue
+        default: return nil
+        }
+    }
+
+    private static func bool(_ any: Any?) -> Bool? {
+        switch any {
+        case let value as Bool: return value
+        case let value as NSNumber: return value.boolValue
+        case let value as String:
+            if ["true", "1", "yes"].contains(value.lowercased()) { return true }
+            if ["false", "0", "no"].contains(value.lowercased()) { return false }
+            return nil
+        default: return nil
+        }
     }
 
     private static func number(_ any: Any?) -> Double? {

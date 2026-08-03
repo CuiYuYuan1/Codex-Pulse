@@ -102,4 +102,24 @@ const localSnakeCase = {
 const locallyMerged = mergeNormalizedLimits(normalized.limits, localSnakeCase);
 assert.strictEqual(primaryQuotaLimit(locallyMerged).remainingPercent, 2);
 
+const whamUsage = {
+  rate_limits_by_limit_id: {
+    codex: {
+      limit_id: "codex",
+      limit_name: "Codex",
+      primary: {
+        used_percent: 9,
+        window_minutes: 10_080,
+        resets_at: resetAt
+      }
+    }
+  },
+  rate_limit_reset_credits: {
+    available_count: 1
+  }
+};
+const whamNormalized = normalizeLimits(whamUsage);
+assert.strictEqual(primaryQuotaLimit(whamNormalized.limits).remainingPercent, 91);
+assert.strictEqual(whamNormalized.cards.length, 1);
+
 console.log("quota freshness fixtures: PASS");

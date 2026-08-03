@@ -341,6 +341,16 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
         return URLSession(configuration: configuration)
     }()
 
+    private static let whamUsageSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.urlCache = nil
+        configuration.timeoutIntervalForRequest = 6
+        configuration.timeoutIntervalForResource = 8
+        configuration.waitsForConnectivity = false
+        return URLSession(configuration: configuration)
+    }()
+
     // MARK: - Connect / disconnect
 
     func connect() async throws {
@@ -504,13 +514,25 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
         // App Server 的额度响应目前只包含重置卡数量；官方桌面端另用该接口读取卡片明细。
         // 两个请求并发进行，明细失败不会拖垮或覆盖主额度数据。
         async let resetCreditDetails = readResetCreditDetailsSafely()
-        let data = try await rpcRaw(
-            method: "account/rateLimits/read",
-            params: [:],
-            timeout: profileRPCTimeout
-        )
+        async let directUsageLimits = readWhamUsageRateLimitsSafely()
+        let data: Data
+        do {
+            data = try await rpcRaw(
+                method: "account/rateLimits/read",
+                params: [:],
+                timeout: profileRPCTimeout
+            )
+        } catch {
+            if let direct = await directUsageLimits, !direct.buckets.isEmpty {
+                return direct
+            }
+            throw error
+        }
         let wire = try RateLimitsWireParser.parse(data)
         var snapshot = ProtocolMapper.rateLimits(from: wire)
+        if let direct = await directUsageLimits, !direct.buckets.isEmpty {
+            snapshot = mergeAuthoritativeRateLimits(base: snapshot, authoritative: direct)
+        }
         if let details = await resetCreditDetails,
            let cards = details.cards,
            !cards.isEmpty || details.availableCount == 0 {
@@ -731,6 +753,110 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
             throw CodexServerError.invalidResponse("reset credit details HTTP \(http.statusCode)")
         }
         return try Self.parseResetCreditDetails(data)
+    }
+
+    private func readWhamUsageRateLimitsSafely() async -> RateLimitSnapshot? {
+        do {
+            return try await fetchWhamUsageRateLimits()
+        } catch {
+            PulseLog.write("wham usage rate limits unavailable: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func fetchWhamUsageRateLimits() async throws -> RateLimitSnapshot {
+        let credentials = try readCodexCredentials()
+        guard let url = URL(string: "https://chatgpt.com/backend-api/wham/usage") else {
+            throw CodexServerError.invalidResponse("invalid wham usage URL")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 6
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(credentials.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("Codex Desktop", forHTTPHeaderField: "originator")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        if let accountID = credentials.accountID, !accountID.isEmpty {
+            request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+        }
+
+        let (data, response) = try await Self.whamUsageSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw CodexServerError.invalidResponse("wham usage response is not HTTP")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            if http.statusCode == 401 || http.statusCode == 403 {
+                throw CodexServerError.unauthorized
+            }
+            throw CodexServerError.invalidResponse("wham usage HTTP \(http.statusCode)")
+        }
+        let wire = try RateLimitsWireParser.parse(data)
+        let snapshot = ProtocolMapper.rateLimits(from: wire)
+        guard !snapshot.buckets.isEmpty else {
+            throw CodexServerError.invalidResponse("wham usage missing rate limits")
+        }
+        return snapshot
+    }
+
+    private func mergeAuthoritativeRateLimits(
+        base: RateLimitSnapshot,
+        authoritative: RateLimitSnapshot
+    ) -> RateLimitSnapshot {
+        guard !authoritative.buckets.isEmpty else { return base }
+        guard !base.buckets.isEmpty else {
+            return RateLimitSnapshot(
+                buckets: authoritative.buckets,
+                resetCards: base.resetCards.isEmpty ? authoritative.resetCards : base.resetCards,
+                updatedAt: authoritative.updatedAt
+            )
+        }
+
+        var buckets = base.buckets
+        for incoming in authoritative.buckets {
+            if let index = matchingRateLimitIndex(for: incoming, in: buckets) {
+                buckets[index] = RateLimitBucket(
+                    id: buckets[index].id,
+                    name: buckets[index].name,
+                    usedPercent: incoming.usedPercent,
+                    windowDurationSeconds: incoming.windowDurationSeconds ?? buckets[index].windowDurationSeconds,
+                    resetsAt: incoming.resetsAt ?? buckets[index].resetsAt,
+                    isLimitReached: incoming.isLimitReached || incoming.usedPercent >= 100,
+                    remainingCredits: buckets[index].remainingCredits ?? incoming.remainingCredits
+                )
+            } else {
+                buckets.append(incoming)
+            }
+        }
+        return RateLimitSnapshot(
+            buckets: buckets.sorted {
+                let lhs = $0.windowDurationSeconds ?? .greatestFiniteMagnitude
+                let rhs = $1.windowDurationSeconds ?? .greatestFiniteMagnitude
+                if lhs != rhs { return lhs < rhs }
+                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            },
+            resetCards: base.resetCards.isEmpty ? authoritative.resetCards : base.resetCards,
+            updatedAt: max(base.updatedAt, authoritative.updatedAt)
+        )
+    }
+
+    private func matchingRateLimitIndex(
+        for incoming: RateLimitBucket,
+        in existing: [RateLimitBucket]
+    ) -> Int? {
+        if let index = existing.firstIndex(where: { $0.id == incoming.id }) {
+            return index
+        }
+        if let incomingDuration = incoming.windowDurationSeconds,
+           let index = existing.firstIndex(where: {
+               guard let duration = $0.windowDurationSeconds else { return false }
+               return abs(duration - incomingDuration) < 60
+           }) {
+            return index
+        }
+        return existing.firstIndex(where: { $0.name == incoming.name })
     }
 
     private func readCodexCredentials() throws -> CodexLocalCredentials {

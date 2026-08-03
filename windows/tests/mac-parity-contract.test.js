@@ -961,6 +961,19 @@ includes(html, 'id="cachedTokensDetail"', "Windows detail displays cached Token 
 includes(html, 'id="uncachedTokensDetail"', "Windows detail displays uncached Token volume");
 includes(html, 'id="todayCostDetail"', "Windows detail displays today's estimated cost");
 includes(html, 'id="totalCostDetail"', "Windows detail displays lifetime estimated cost");
+includes(html, 'class="metrics-summary usage-metrics-grid"', "Windows detail uses the macOS 2x4 usage metric grid");
+includes(html, '<small>今日 Token</small>', "Windows detail displays today's Token label");
+includes(html, '<small id="totalMetricLabel">累计 Token</small>', "Windows detail displays lifetime Token label");
+includes(html, '<small>缓存 Token</small>', "Windows detail displays cached Token label");
+includes(html, '<small>未缓存 Token</small>', "Windows detail displays uncached Token label");
+includes(html, '<small>缓存命中率</small>', "Windows detail displays cache hit label");
+includes(html, '<small>成本</small>', "Windows detail displays today cost label");
+includes(html, '<small>累计成本</small>', "Windows detail displays lifetime cost label");
+includes(html, '<small id="taskMetricLabel">任务时间</small>', "Windows detail displays active task duration label");
+assert(!html.includes("本机近 7 日"), "Windows detail must not ship the old three-metric local 7-day layout");
+assert(!html.includes("在线天数"), "Windows detail must not ship the old online-days detail metric");
+includes(renderer, 'setText(elements.taskMetricLabel, "任务时间")', "Windows detail keeps the task-time label aligned with macOS");
+assert(!renderer.includes('setText(elements.taskMetricLabel, hasActiveTask ? "任务时间" : "在线天数")'), "Windows detail must not switch back to online-days");
 includes(
   localUsageReader,
   "estimatedCostUSD: hasPricedUsage ? estimatedCostUSD : nil",
