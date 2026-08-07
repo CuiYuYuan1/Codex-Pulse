@@ -52,6 +52,32 @@ function windowForRole(snapshot, role) {
   return snapshot[role] ?? snapshot[camel] ?? snapshot[snake] ?? null;
 }
 
+function isDedicatedCodexModelLimit(snapshot, fallbackLimitID) {
+  if (!snapshot || typeof snapshot !== "object") return false;
+  const raw = [
+    fallbackLimitID,
+    snapshot.limitId,
+    snapshot.limit_id,
+    snapshot.id,
+    snapshot.slug,
+    snapshot.limitName,
+    snapshot.limit_name,
+    snapshot.name,
+    snapshot.title,
+    snapshot.displayName,
+    snapshot.display_name,
+    snapshot.planType,
+    snapshot.plan_type
+  ]
+    .filter((value) => value !== null && value !== undefined)
+    .map(String)
+    .join(" ")
+    .toLowerCase();
+  const normalized = raw.replace(/[\s_]+/g, "-");
+  if (normalized.includes("codex-spark")) return true;
+  return normalized.includes("gpt-5.3") && normalized.includes("spark");
+}
+
 function windowDurationMins(window) {
   const minutes = windowValue(
     window,
@@ -88,13 +114,24 @@ function windowUsedPercent(window) {
 
 function snapshotWindows(snapshot, fallbackLimitID, sourcePriority) {
   if (!snapshot || typeof snapshot !== "object") return [];
+  if (isDedicatedCodexModelLimit(snapshot, fallbackLimitID)) return [];
   const limitID = String(
     snapshot.limitId
       ?? snapshot.limit_id
+      ?? snapshot.id
+      ?? snapshot.slug
       ?? fallbackLimitID
       ?? "legacy"
   );
-  const limitName = String(snapshot.limitName ?? snapshot.limit_name ?? "").trim();
+  const limitName = String(
+    snapshot.limitName
+      ?? snapshot.limit_name
+      ?? snapshot.name
+      ?? snapshot.title
+      ?? snapshot.displayName
+      ?? snapshot.display_name
+      ?? ""
+  ).trim();
   const reached = snapshot.rateLimitReachedType
     ?? snapshot.rate_limit_reached_type
     ?? null;

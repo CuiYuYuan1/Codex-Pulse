@@ -266,6 +266,10 @@ enum ProtocolMapper {
     }
 
     private static func windows(from snap: WireRateLimitSnapshot, fallbackId: String) -> [RateLimitBucket] {
+        guard !isDedicatedCodexModelLimit(snap, fallbackId: fallbackId) else {
+            return []
+        }
+
         var result: [RateLimitBucket] = []
         if let p = snap.primary {
             result.append(bucket(
@@ -284,6 +288,28 @@ enum ProtocolMapper {
             ))
         }
         return result
+    }
+
+    private static func isDedicatedCodexModelLimit(
+        _ snap: WireRateLimitSnapshot,
+        fallbackId: String
+    ) -> Bool {
+        let raw = [
+            fallbackId,
+            snap.limitId,
+            snap.limitName,
+            snap.planType
+        ]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
+        let normalized = raw
+            .replacingOccurrences(of: "_", with: "-")
+            .replacingOccurrences(of: " ", with: "-")
+        if normalized.contains("codex-spark") {
+            return true
+        }
+        return normalized.contains("gpt-5.3") && normalized.contains("spark")
     }
 
     private static func bucket(id: String, name: String, window: WireRateLimitWindow, limitReached: Bool) -> RateLimitBucket {

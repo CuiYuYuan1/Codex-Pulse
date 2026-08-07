@@ -172,6 +172,39 @@ enum RateLimitFreshnessSmoke {
         precondition(desktopWham.primaryBucket?.resetsAt == resetAt)
         precondition(desktopWham.availableResetCardCount == 2)
 
+        // Pro accounts can receive a separate GPT-5.3-Codex-Spark weekly
+        // entitlement. That model-specific bucket must not become the generic
+        // Pro quota headline.
+        let proWithSparkEntitlement = """
+        {
+          "rate_limits_by_limit_id": {
+            "codex": {
+              "limit_id": "codex",
+              "limit_name": "通用使用限额",
+              "primary": {
+                "used_percent": 17,
+                "window_minutes": 10080,
+                "resets_at": 1785903155
+              }
+            },
+            "gpt-5.3-codex-spark": {
+              "limit_id": "gpt-5.3-codex-spark",
+              "limit_name": "GPT-5.3-Codex-Spark 使用限额",
+              "primary": {
+                "used_percent": 0,
+                "window_minutes": 10080,
+                "resets_at": 1785989555
+              }
+            }
+          }
+        }
+        """
+        let proWire = try RateLimitsWireParser.parse(Data(proWithSparkEntitlement.utf8))
+        let proLimits = ProtocolMapper.rateLimits(from: proWire)
+        precondition(proLimits.buckets.count == 1)
+        precondition(proLimits.primaryBucket?.remainingPercent == 83)
+        precondition(!proLimits.buckets.contains { $0.id.lowercased().contains("spark") })
+
         print("Rate limit freshness smoke: PASS")
     }
 

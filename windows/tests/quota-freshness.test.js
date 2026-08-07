@@ -178,4 +178,35 @@ const whamNormalized = normalizeLimits(whamUsage);
 assert.strictEqual(primaryQuotaLimit(whamNormalized.limits).remainingPercent, 91);
 assert.strictEqual(whamNormalized.cards.length, 1);
 
+const proWithSparkEntitlement = {
+  rate_limits_by_limit_id: {
+    codex: {
+      limit_id: "codex",
+      limit_name: "通用使用限额",
+      primary: {
+        used_percent: 17,
+        window_minutes: 10_080,
+        resets_at: resetAt
+      }
+    },
+    "gpt-5.3-codex-spark": {
+      limit_id: "gpt-5.3-codex-spark",
+      limit_name: "GPT-5.3-Codex-Spark 使用限额",
+      primary: {
+        used_percent: 0,
+        window_minutes: 10_080,
+        resets_at: resetAt + 86_400
+      }
+    }
+  }
+};
+const proWithSparkNormalized = normalizeLimits(proWithSparkEntitlement);
+assert.strictEqual(proWithSparkNormalized.limits.length, 1);
+assert.strictEqual(primaryQuotaLimit(proWithSparkNormalized.limits).remainingPercent, 83);
+assert.strictEqual(
+  proWithSparkNormalized.limits.some((limit) => /spark/i.test(`${limit.id} ${limit.limitID} ${limit.name}`)),
+  false,
+  "GPT-5.3-Codex-Spark entitlement must not appear as generic Pro quota"
+);
+
 console.log("quota freshness fixtures: PASS");

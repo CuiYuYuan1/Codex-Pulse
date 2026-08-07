@@ -134,8 +134,15 @@ enum RateLimitsWireParser {
     private static func parseSnapshot(_ dict: [String: Any]?) -> WireRateLimitSnapshot? {
         guard let dict else { return nil }
         return WireRateLimitSnapshot(
-            limitId: string(dict["limitId"] ?? dict["limit_id"]),
-            limitName: string(dict["limitName"] ?? dict["limit_name"]),
+            limitId: string(dict["limitId"] ?? dict["limit_id"] ?? dict["id"] ?? dict["slug"]),
+            limitName: string(
+                dict["limitName"]
+                    ?? dict["limit_name"]
+                    ?? dict["name"]
+                    ?? dict["title"]
+                    ?? dict["displayName"]
+                    ?? dict["display_name"]
+            ),
             primary: parseWindow(
                 (dict["primary"] as? [String: Any])
                     ?? (dict["primary_window"] as? [String: Any])
