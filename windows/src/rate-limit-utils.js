@@ -54,28 +54,49 @@ function windowForRole(snapshot, role) {
 
 function isDedicatedCodexModelLimit(snapshot, fallbackLimitID) {
   if (!snapshot || typeof snapshot !== "object") return false;
-  const raw = [
-    fallbackLimitID,
-    snapshot.limitId,
-    snapshot.limit_id,
-    snapshot.id,
-    snapshot.slug,
+  const explicitID = normalizedIdentifier(
+    snapshot.limitId
+      ?? snapshot.limit_id
+      ?? snapshot.id
+      ?? snapshot.slug
+  );
+  if (explicitID) {
+    if (isGenericCodexLimitID(explicitID)) return false;
+    if (isSparkLimitIdentifier(explicitID)) return true;
+  }
+
+  const fallback = normalizedIdentifier(fallbackLimitID);
+  if (fallback && !isGenericCodexLimitID(fallback) && isSparkLimitIdentifier(fallback)) {
+    return true;
+  }
+
+  const display = normalizedIdentifier([
     snapshot.limitName,
     snapshot.limit_name,
     snapshot.name,
     snapshot.title,
     snapshot.displayName,
-    snapshot.display_name,
-    snapshot.planType,
-    snapshot.plan_type
+    snapshot.display_name
   ]
     .filter((value) => value !== null && value !== undefined)
-    .map(String)
-    .join(" ")
-    .toLowerCase();
-  const normalized = raw.replace(/[\s_]+/g, "-");
-  if (normalized.includes("codex-spark")) return true;
-  return normalized.includes("gpt-5.3") && normalized.includes("spark");
+    .join(" "));
+  return isSparkLimitIdentifier(display);
+}
+
+function normalizedIdentifier(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/g, "-");
+}
+
+function isGenericCodexLimitID(value) {
+  return new Set(["codex", "codex-rate-limit", "codex-rate-limits", "legacy"]).has(value);
+}
+
+function isSparkLimitIdentifier(value) {
+  if (value.includes("codex-spark")) return true;
+  return value.includes("gpt-5.3") && value.includes("spark");
 }
 
 function windowDurationMins(window) {

@@ -110,19 +110,27 @@ enum RateLimitsWireParser {
         // App Server 使用 rateLimits/rate_limits；Codex Desktop 的 wham/usage
         // 则返回单数 rate_limit，且窗口字段采用 primary_window。两种都是
         // 当前登录账号的权威额度，不能因字段风格不同而退回历史缓存。
+        let usageRoot = firstDictionary(root, keys: ["usage"])
         let single = parseSnapshot(
             firstDictionary(root, keys: ["rateLimits", "rate_limits", "rateLimit", "rate_limit"])
+                ?? firstDictionary(usageRoot, keys: ["rateLimits", "rate_limits", "rateLimit", "rate_limit"])
         )
         var byId: [String: WireRateLimitSnapshot] = [:]
-        if let map = firstDictionary(root, keys: ["rateLimitsByLimitId", "rate_limits_by_limit_id"]) {
-            for (key, value) in map {
-                if let dict = value as? [String: Any], let snap = parseSnapshot(dict) {
-                    byId[key] = snap
+        for source in [
+            firstDictionary(root, keys: ["rateLimitsByLimitId", "rate_limits_by_limit_id"]),
+            firstDictionary(usageRoot, keys: ["rateLimitsByLimitId", "rate_limits_by_limit_id"])
+        ] {
+            if let map = source {
+                for (key, value) in map {
+                    if let dict = value as? [String: Any], let snap = parseSnapshot(dict) {
+                        byId[key] = snap
+                    }
                 }
             }
         }
         let credits = parseResetCredits(
             firstDictionary(root, keys: ["rateLimitResetCredits", "rate_limit_reset_credits"])
+                ?? firstDictionary(usageRoot, keys: ["rateLimitResetCredits", "rate_limit_reset_credits"])
         )
         return WireGetAccountRateLimitsResponse(
             rateLimits: single,
@@ -236,7 +244,8 @@ enum RateLimitsWireParser {
         return WireRateLimitResetCreditsSummary(availableCount: count, credits: list)
     }
 
-    private static func firstDictionary(_ root: [String: Any], keys: [String]) -> [String: Any]? {
+    private static func firstDictionary(_ root: [String: Any]?, keys: [String]) -> [String: Any]? {
+        guard let root else { return nil }
         for key in keys {
             if let value = root[key] as? [String: Any] {
                 return value

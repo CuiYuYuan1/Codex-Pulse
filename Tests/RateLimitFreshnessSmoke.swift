@@ -172,6 +172,44 @@ enum RateLimitFreshnessSmoke {
         precondition(desktopWham.primaryBucket?.resetsAt == resetAt)
         precondition(desktopWham.availableResetCardCount == 2)
 
+        let nestedDesktopWhamUsage = """
+        {
+          "account_id": "active-desktop-account",
+          "usage": {
+            "rate_limit": {
+              "primary_window": {
+                "used_percent": 23,
+                "limit_window_seconds": 604800,
+                "reset_at": 1785903155
+              }
+            }
+          }
+        }
+        """
+        let nestedDesktopWhamWire = try RateLimitsWireParser.parse(Data(nestedDesktopWhamUsage.utf8))
+        let nestedDesktopWham = ProtocolMapper.rateLimits(from: nestedDesktopWhamWire)
+        precondition(nestedDesktopWham.primaryBucket?.usedPercent == 23)
+        precondition(nestedDesktopWham.primaryBucket?.remainingPercent == 77)
+        precondition(nestedDesktopWham.primaryBucket?.windowDurationSeconds == 604_800)
+
+        let genericCodexWithSparkPlan = """
+        {
+          "rate_limit": {
+            "limit_id": "codex",
+            "limit_name": "通用使用限额",
+            "plan_type": "gpt-5.3-codex-spark",
+            "primary_window": {
+              "used_percent": 29,
+              "limit_window_seconds": 604800,
+              "reset_at": 1785903155
+            }
+          }
+        }
+        """
+        let genericWire = try RateLimitsWireParser.parse(Data(genericCodexWithSparkPlan.utf8))
+        let genericLimits = ProtocolMapper.rateLimits(from: genericWire)
+        precondition(genericLimits.primaryBucket?.remainingPercent == 71)
+
         // Pro accounts can receive a separate GPT-5.3-Codex-Spark weekly
         // entitlement. That model-specific bucket must not become the generic
         // Pro quota headline.

@@ -294,22 +294,39 @@ enum ProtocolMapper {
         _ snap: WireRateLimitSnapshot,
         fallbackId: String
     ) -> Bool {
-        let raw = [
-            fallbackId,
-            snap.limitId,
-            snap.limitName,
-            snap.planType
-        ]
-            .compactMap { $0 }
-            .joined(separator: " ")
-            .lowercased()
-        let normalized = raw
-            .replacingOccurrences(of: "_", with: "-")
-            .replacingOccurrences(of: " ", with: "-")
-        if normalized.contains("codex-spark") {
+        let explicitId = normalizedIdentifier(snap.limitId)
+        if !explicitId.isEmpty {
+            if isGenericCodexLimitID(explicitId) { return false }
+            if isSparkLimitIdentifier(explicitId) { return true }
+        }
+
+        let fallback = normalizedIdentifier(fallbackId)
+        if !fallback.isEmpty,
+           !isGenericCodexLimitID(fallback),
+           isSparkLimitIdentifier(fallback) {
             return true
         }
-        return normalized.contains("gpt-5.3") && normalized.contains("spark")
+
+        return isSparkLimitIdentifier(normalizedIdentifier(snap.limitName))
+    }
+
+    private static func normalizedIdentifier(_ value: String?) -> String {
+        (value ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+            .replacingOccurrences(of: " ", with: "-")
+    }
+
+    private static func isGenericCodexLimitID(_ value: String) -> Bool {
+        ["codex", "codex-rate-limit", "codex-rate-limits", "legacy"].contains(value)
+    }
+
+    private static func isSparkLimitIdentifier(_ value: String) -> Bool {
+        if value.contains("codex-spark") {
+            return true
+        }
+        return value.contains("gpt-5.3") && value.contains("spark")
     }
 
     private static func bucket(id: String, name: String, window: WireRateLimitWindow, limitReached: Bool) -> RateLimitBucket {

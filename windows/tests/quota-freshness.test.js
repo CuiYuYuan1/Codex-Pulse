@@ -136,6 +136,41 @@ assert.strictEqual(
   "camel-case Wham accountId must remain compatible"
 );
 
+const nestedCockpitWham = {
+  account_id: "desktop-current-account",
+  usage: {
+    rate_limit: {
+      primary_window: {
+        used_percent: 23,
+        limit_window_seconds: 604_800,
+        reset_at: resetAt
+      }
+    }
+  }
+};
+const nestedCockpitWhamNormalized = normalizeLimits(nestedCockpitWham);
+assert.strictEqual(nestedCockpitWhamNormalized.limits.length, 1);
+assert.strictEqual(primaryQuotaLimit(nestedCockpitWhamNormalized.limits).remainingPercent, 77);
+assert.strictEqual(primaryQuotaLimit(nestedCockpitWhamNormalized.limits).windowDurationMins, 10_080);
+
+const genericCodexWithSparkPlan = {
+  rate_limit: {
+    limit_id: "codex",
+    limit_name: "通用使用限额",
+    plan_type: "gpt-5.3-codex-spark",
+    primary_window: {
+      used_percent: 29,
+      limit_window_seconds: 604_800,
+      reset_at: resetAt
+    }
+  }
+};
+assert.strictEqual(
+  primaryQuotaLimit(normalizeLimits(genericCodexWithSparkPlan).limits).remainingPercent,
+  71,
+  "explicit codex generic quota must not be filtered by unrelated Spark fields"
+);
+
 const oldAccountExhausted = normalizeLimits({
   rateLimitsByLimitId: {
     codex: {
