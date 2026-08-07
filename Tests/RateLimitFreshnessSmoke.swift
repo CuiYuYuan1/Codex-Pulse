@@ -144,6 +144,34 @@ enum RateLimitFreshnessSmoke {
         precondition(wham.primaryBucket?.remainingPercent == 91)
         precondition(wham.availableResetCardCount == 1)
 
+        // Current Codex Desktop wham/usage shape is singular rate_limit with
+        // primary_window + seconds. It must not be mistaken for an empty quota
+        // response, otherwise the app falls back to a previous account cache.
+        let desktopWhamUsage = """
+        {
+          "account_id": "active-desktop-account",
+          "email": "active@example.com",
+          "rate_limit": {
+            "primary_window": {
+              "used_percent": 44,
+              "limit_window_seconds": 604800,
+              "reset_at": 1785903155
+            },
+            "secondary_window": null
+          },
+          "rate_limit_reset_credits": {
+            "available_count": 2
+          }
+        }
+        """
+        let desktopWhamWire = try RateLimitsWireParser.parse(Data(desktopWhamUsage.utf8))
+        let desktopWham = ProtocolMapper.rateLimits(from: desktopWhamWire)
+        precondition(desktopWham.primaryBucket?.usedPercent == 44)
+        precondition(desktopWham.primaryBucket?.remainingPercent == 56)
+        precondition(desktopWham.primaryBucket?.windowDurationSeconds == 604_800)
+        precondition(desktopWham.primaryBucket?.resetsAt == resetAt)
+        precondition(desktopWham.availableResetCardCount == 2)
+
         print("Rate limit freshness smoke: PASS")
     }
 

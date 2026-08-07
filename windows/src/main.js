@@ -30,9 +30,11 @@ const {
   rectangleDistance
 } = require("./codex-dock-geometry");
 const {
+  mergeAuthoritativeLimits,
   mergeNormalizedLimits,
   normalizeLimits,
-  reconcileNormalizedLimits
+  reconcileNormalizedLimits,
+  whamResponseMatchesAccount
 } = require("./rate-limit-utils");
 const APP_VERSION = require("../package.json").version;
 const processStartedAt = process.hrtime.bigint();
@@ -92,6 +94,8 @@ let rpc;
 let refreshTimer;
 let limitsRefreshInFlight = false;
 let limitsRefreshPromise = null;
+let limitsRefreshGeneration = null;
+let limitsRefreshClient = null;
 let limitsRefreshQueued = false;
 let lastAcceptedLimitsAt = 0;
 let limitsNotificationRefreshTimer;
@@ -115,6 +119,16 @@ let authIdentity = null;
 let accountReloadInFlight = false;
 let pendingAccountRestart = false;
 let accountGeneration = 0;
+// Account-scoped quota data is invalid until account/read (or the active
+// Cockpit account) confirms the current generation. Local session JSONL has
+// no account identity, so it must never refill quota after a switch.
+let confirmedAccountGeneration = null;
+let confirmedQuotaScopeIdentity = null;
+let localSessionRateLimitsDisabledAfterAccountSwitch = false;
+let forceWhamQuotaScope = false;
+// A Wham reply that explicitly names a different Cockpit account puts the
+// current generation into direct-only mode until a matching reply arrives.
+let whamScopeRejectedGeneration = null;
 // 本机 session 没有账号标识，因此今日、近 7 日和累计 Token 都采用设备口径；
 // 登录账号只影响额度与重置卡，不影响本地 Token 聚合。
 let localUsageDayKey = null;
@@ -1139,7 +1153,7 @@ class CodexRPC {
       else pending.resolve(message.result ?? {});
       return;
     }
-    if (message.method) handleNotification(message.method, message.params || {});
+    if (message.method) handleNotification(message.method, message.params || {}, this);
   }
 
   failAll(error) {
@@ -1186,7 +1200,10 @@ function notificationStatus(params) {
   return null;
 }
 
-function handleNotification(method, params = {}) {
+function handleNotification(method, params = {}, sourceRPC = null) {
+  // The old app-server can flush one final notification while a replacement
+  // process is starting. Never let that process write account-scoped state.
+  if (sourceRPC && sourceRPC !== rpc) return;
   const lower = method.toLowerCase();
   if (lower === "item/agentmessage/delta") {
     const delta = typeof params.delta === "string" ? params.delta : "";
@@ -1236,14 +1253,22 @@ function handleNotification(method, params = {}) {
     publish({ task: { state: "idle", label: "空闲", title: null, project: null, model: null, reasoningEffort: null, startedAt: null, threadID: null, activeCount: 0, conversation: [] } });
     setTimeout(() => refreshAll(true), 120);
   } else if (lower.includes("account/updated")) {
-    scheduleAccountTransition(false);
+    // Prevent this process from sending an old quota notification during the
+    // debounce before the replacement desktop session is connected.
+    invalidateConfirmedQuotaScope();
+    scheduleAccountTransition(true);
   } else if (lower.includes("ratelimits")) {
     const snapshot = params?.rateLimits ?? params?.rate_limits;
     if (snapshot && typeof snapshot === "object") {
       const fallbackID = snapshot.limitId ?? snapshot.limit_id ?? "codex";
       applyRateLimitPayload(
         { rateLimitsByLimitId: { [fallbackID]: snapshot } },
-        { acceptedAt: Date.now(), merge: true }
+        {
+          acceptedAt: Date.now(),
+          merge: true,
+          source: "rpc",
+          scopeGeneration: accountGeneration
+        }
       );
     }
     scheduleRateLimitsRefresh(100);
@@ -1272,31 +1297,53 @@ function numberValue(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-function normalizeAccount(result) {
+function normalizeAccount(result, desktopAccount = null) {
   const account = result.account || {};
   const type = account.type || "none";
+  const accountEmail = account.email || null;
+  const email = desktopAccount?.email || accountEmail;
+  let auth = type === "chatgpt"
+    ? "ChatGPT"
+    : type === "apiKey" || type === "amazonBedrock" ? "API Key" : type;
+  if (desktopAccount && (!auth || auth === "none")) auth = "ChatGPT";
   return {
-    email: account.email || null,
-    maskedEmail: maskEmail(account.email),
+    email,
+    maskedEmail: maskEmail(email),
     plan: account.planType || "—",
-    auth: type === "chatgpt"
-      ? "ChatGPT"
-      : type === "apiKey" || type === "amazonBedrock" ? "API Key" : type
+    auth
   };
 }
 
 function applyRateLimitPayload(result, {
   acceptedAt = Date.now(),
-  merge = false
+  merge = false,
+  source = "rpc",
+  scopeGeneration = accountGeneration,
+  authScopeIdentity = null,
+  authoritative = false
 } = {}) {
+  if (scopeGeneration !== accountGeneration) return false;
+  if (authScopeIdentity !== null && authScopeIdentity !== readAuthIdentity()) return false;
+  const requiresWham = source === "wham" ? forceWhamQuotaScope : refreshQuotaSourcePolicy();
+  // A Cockpit-selected desktop account can differ from auth.json's token
+  // account. In that case only the direct Wham call carries the selected
+  // account scope; stale app-server and session events are not safe fallbacks.
+  if (source !== "wham" && requiresWham) return false;
+  if (source === "session" && localSessionRateLimitsDisabledAfterAccountSwitch) return false;
+  if (source !== "wham" && (
+    confirmedAccountGeneration !== scopeGeneration
+      || confirmedQuotaScopeIdentity !== readAuthIdentity()
+  )) return false;
   if (!result || acceptedAt < lastAcceptedLimitsAt) return false;
   const normalized = Array.isArray(result.normalizedLimits)
     ? { limits: result.normalizedLimits, cards: Array.isArray(result.normalizedCards) ? result.normalizedCards : [] }
     : normalizeLimits(result);
   if (!normalized.limits.length) return false;
-  const limits = merge
-    ? mergeNormalizedLimits(state.limits, result)
-    : reconcileNormalizedLimits(state.limits, normalized.limits, false);
+  const limits = authoritative
+    ? normalized.limits
+    : merge
+      ? mergeNormalizedLimits(state.limits, result)
+      : reconcileNormalizedLimits(state.limits, normalized.limits, false);
   const patch = {
     limits,
     limitsUpdatedAt: acceptedAt
@@ -2891,13 +2938,22 @@ async function refreshLocalSessionState(paths = null) {
     .sort((left, right) => right.rateLimitsAt - left.rateLimitsAt)[0];
   if (newestRateLimits) {
     lastLocalRateLimitEventAt = newestRateLimits.rateLimitsAt;
-    const raw = newestRateLimits.rateLimits;
-    const payload = raw.rateLimits || raw.rate_limits || raw.rateLimitsByLimitId || raw.rate_limits_by_limit_id
-      ? raw
-      : raw.primary || raw.secondary
-        ? { rateLimitsByLimitId: { codex: raw } }
-        : { rateLimitsByLimitId: raw };
-    applyRateLimitPayload(payload, { acceptedAt: Date.now(), merge: true });
+    // Session JSONL has no account id. It remains useful before any account
+    // transition, but must not replay a prior account's quota after switching.
+    if (!localSessionRateLimitsDisabledAfterAccountSwitch) {
+      const raw = newestRateLimits.rateLimits;
+      const payload = raw.rateLimits || raw.rate_limits || raw.rateLimitsByLimitId || raw.rate_limits_by_limit_id
+        ? raw
+        : raw.primary || raw.secondary
+          ? { rateLimitsByLimitId: { codex: raw } }
+          : { rateLimitsByLimitId: raw };
+      applyRateLimitPayload(payload, {
+        acceptedAt: Date.now(),
+        merge: true,
+        source: "session",
+        scopeGeneration: accountGeneration
+      });
+    }
   }
 
   const active = activeSnapshots[0];
@@ -3015,9 +3071,67 @@ function shortSecretHash(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 20);
 }
 
+function firstNonEmptyAccountValue(candidates, keys) {
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    for (const key of keys) {
+      const value = candidate[key];
+      if (typeof value !== "string") continue;
+      const normalized = value.trim();
+      if (normalized) return normalized;
+    }
+  }
+  return null;
+}
+
+// Codex Desktop records the account currently selected in its Cockpit UI here.
+// It can deliberately differ from auth.json's token account, so it is the
+// source of truth for the Wham account header and account-switch detection.
+function readCockpitDesktopAccount() {
+  const authPath = path.join(codexHomeRoot(), ".cockpit_codex_auth.json");
+  if (!exists(authPath)) return null;
+  try {
+    const root = JSON.parse(fs.readFileSync(authPath, "utf8"));
+    const candidates = [
+      root,
+      root.activeAccount,
+      root.active_account,
+      root.currentAccount,
+      root.current_account,
+      root.account,
+      root.data
+    ];
+    const accountID = firstNonEmptyAccountValue(candidates, ["account_id", "accountId"]);
+    const email = firstNonEmptyAccountValue(candidates, ["email", "email_address", "emailAddress"]);
+    return accountID || email ? { accountID, email } : null;
+  } catch {
+    // Cockpit writes this file atomically in most cases, but avoid treating a
+    // short-lived partial write as either a logout or a fallback to old quota.
+    return undefined;
+  }
+}
+
+function tokenAccountIdentity(tokens, claims) {
+  const openAIAuth = claims["https://api.openai.com/auth"] || {};
+  return {
+    accountID: tokens.account_id || tokens.accountId
+      || openAIAuth.chatgpt_account_id || openAIAuth.account_id
+      || claims.chatgpt_account_id || claims.account_id || null,
+    userID: openAIAuth.user_id || claims.user_id || claims.sub || null,
+    email: claims.email || null
+  };
+}
+
 function readAuthIdentity() {
   const authPath = path.join(codexHomeRoot(), "auth.json");
-  if (!exists(authPath)) return "none";
+  const cockpit = readCockpitDesktopAccount();
+  if (cockpit === undefined) return null;
+  const fingerprint = (value) => value ? shortSecretHash(value) : "";
+  if (!exists(authPath)) {
+    return cockpit
+      ? `cockpit:${fingerprint(cockpit.accountID)}:${fingerprint(cockpit.email)}`
+      : "none";
+  }
   try {
     const root = JSON.parse(fs.readFileSync(authPath, "utf8"));
     const apiKey = root.OPENAI_API_KEY || root.openai_api_key || root.apiKey;
@@ -3025,17 +3139,40 @@ function readAuthIdentity() {
     const tokens = root.tokens && typeof root.tokens === "object" ? root.tokens : {};
     const accessToken = tokens.access_token || tokens.accessToken || "";
     const claims = decodeJWTClaims(accessToken);
-    const openAIAuth = claims["https://api.openai.com/auth"] || {};
-    const accountID = tokens.account_id || tokens.accountId
-      || openAIAuth.chatgpt_account_id || openAIAuth.account_id
-      || claims.chatgpt_account_id || claims.account_id;
-    const userID = openAIAuth.user_id || claims.user_id || claims.sub;
-    const email = claims.email;
-    if (accountID || userID || email) return `chatgpt:${accountID || ""}:${userID || ""}:${email || ""}`;
+    const tokenIdentity = tokenAccountIdentity(tokens, claims);
+    const accountID = cockpit?.accountID || tokenIdentity.accountID;
+    const email = cockpit?.email || tokenIdentity.email;
+    const source = cockpit ? "cockpit" : "token";
+    if (accountID || tokenIdentity.userID || email) {
+      // authIdentity is retained in memory by the file watcher. Keep only
+      // fingerprints here—never raw account/user IDs from desktop auth files.
+      return `chatgpt:${source}:${fingerprint(accountID)}:${fingerprint(tokenIdentity.userID)}:${fingerprint(email)}`;
+    }
     if (accessToken) return `chatgpt-token:${shortSecretHash(accessToken)}`;
     return `mode:${root.auth_mode || root.authMode || "none"}`;
   } catch {
     // 写入中的临时半文件不应被误判成登出，等待下一次文件事件。
+    return null;
+  }
+}
+
+function desktopQuotaAuthorityRequirement(credentials = readCodexCredentials()) {
+  if (credentials) return credentials.requiresDesktopAuthority === true;
+  const cockpit = readCockpitDesktopAccount();
+  if (cockpit === undefined) return null;
+  if (!cockpit?.accountID) return false;
+  const authPath = path.join(codexHomeRoot(), "auth.json");
+  if (!exists(authPath)) return true;
+  try {
+    const root = JSON.parse(fs.readFileSync(authPath, "utf8"));
+    // A configured API key does not belong to a selected ChatGPT account.
+    if (root.OPENAI_API_KEY || root.openai_api_key || root.apiKey) return false;
+    const tokens = root.tokens && typeof root.tokens === "object" ? root.tokens : {};
+    const accessToken = tokens.access_token || tokens.accessToken || "";
+    const tokenIdentity = tokenAccountIdentity(tokens, decodeJWTClaims(accessToken));
+    return cockpit.accountID !== tokenIdentity.accountID;
+  } catch {
+    // Keep the existing safety policy while either auth file is being written.
     return null;
   }
 }
@@ -3048,13 +3185,72 @@ function readCodexCredentials() {
     const tokens = root.tokens && typeof root.tokens === "object" ? root.tokens : {};
     const accessToken = tokens.access_token || tokens.accessToken || "";
     if (!accessToken) return null;
+    const claims = decodeJWTClaims(accessToken);
+    const tokenIdentity = tokenAccountIdentity(tokens, claims);
+    const cockpit = readCockpitDesktopAccount();
+    if (cockpit === undefined) return null;
+    const accountID = cockpit?.accountID || tokenIdentity.accountID || null;
     return {
       accessToken,
-      accountID: tokens.account_id || tokens.accountId || null
+      accountID,
+      email: cockpit?.email || tokenIdentity.email || null,
+      tokenAccountID: tokenIdentity.accountID || null,
+      cockpitAccount: cockpit || null,
+      // A selected Cockpit account remains authoritative even when the token
+      // omits account_id entirely; app-server cannot safely fill that gap.
+      requiresDesktopAuthority: Boolean(
+        cockpit?.accountID
+          && cockpit.accountID !== tokenIdentity.accountID
+      )
     };
   } catch {
     return null;
   }
+}
+
+function refreshQuotaSourcePolicy(credentials = readCodexCredentials()) {
+  // Keep a previously observed Cockpit override active while its file is being
+  // rewritten. Falling back to an old app-server in that short window would
+  // recreate the exact cross-account leak this guard prevents.
+  const desktopAuthority = desktopQuotaAuthorityRequirement(credentials);
+  if (desktopAuthority !== null) {
+    forceWhamQuotaScope = desktopAuthority
+      || whamScopeRejectedGeneration === accountGeneration;
+  } else if (whamScopeRejectedGeneration === accountGeneration) {
+    forceWhamQuotaScope = true;
+  }
+  return forceWhamQuotaScope;
+}
+
+function clearQuotaForScope(scopeGeneration, message) {
+  if (scopeGeneration !== accountGeneration) return;
+  lastAcceptedLimitsAt = 0;
+  publish({
+    limits: [],
+    limitsUpdatedAt: null,
+    resetCards: [],
+    message
+  });
+}
+
+function clearUntrustedQuota(scopeGeneration, message) {
+  if (!forceWhamQuotaScope) return;
+  clearQuotaForScope(scopeGeneration, message);
+}
+
+function rejectWhamScope(scopeGeneration) {
+  if (scopeGeneration !== accountGeneration) return;
+  // Do not let an app-server notification refill the panel after Wham has
+  // positively identified a different account for this Cockpit selection.
+  whamScopeRejectedGeneration = scopeGeneration;
+  forceWhamQuotaScope = true;
+  clearQuotaForScope(scopeGeneration, "当前 Codex 桌面账号额度正在重新确认…");
+}
+
+function invalidateConfirmedQuotaScope() {
+  confirmedAccountGeneration = null;
+  confirmedQuotaScopeIdentity = null;
+  localSessionRateLimitsDisabledAfterAccountSwitch = true;
 }
 
 function fetchJSON(url, { headers = {}, timeout = 6000 } = {}) {
@@ -3087,9 +3283,10 @@ function fetchJSON(url, { headers = {}, timeout = 6000 } = {}) {
   });
 }
 
-async function fetchWhamUsageRateLimits() {
-  const credentials = readCodexCredentials();
+async function fetchWhamUsageRateLimits(credentials = readCodexCredentials()) {
   if (!credentials) return null;
+  const scopeIdentity = readAuthIdentity();
+  if (scopeIdentity === null) return null;
   const headers = {
     Accept: "application/json",
     Authorization: `Bearer ${credentials.accessToken}`,
@@ -3105,22 +3302,44 @@ async function fetchWhamUsageRateLimits() {
       headers,
       timeout: 6000
     });
+    // Do not return a response that was authenticated before Cockpit switched
+    // its active account while this request was in flight.
+    if (scopeIdentity !== readAuthIdentity()) return null;
+    const activeCockpitAccountID = credentials.cockpitAccount?.accountID || null;
+    if (!whamResponseMatchesAccount(result, activeCockpitAccountID)) {
+      // Never log account identifiers. The caller keeps the current panel
+      // empty and retries against the active desktop account instead.
+      return { payload: null, scopeIdentity, scopeRejected: true };
+    }
     const normalized = normalizeLimits(result);
-    return normalized.limits.length ? result : null;
+    return normalized.limits.length
+      ? {
+          payload: result,
+          scopeIdentity,
+          requiresDesktopAuthority: credentials.requiresDesktopAuthority === true
+        }
+      : null;
   } catch (error) {
     console.warn(`[CodexPulse] wham usage rate limits unavailable: ${error.message}`);
     return null;
   }
 }
 
-function mergeAuthoritativeRateLimitResult(baseResult, authoritativeResult) {
+function mergeAuthoritativeRateLimitResult(baseResult, authoritativeResult, whamOnly = false) {
   if (!authoritativeResult) return baseResult;
   const base = normalizeLimits(baseResult);
   const authoritative = normalizeLimits(authoritativeResult);
   if (!authoritative.limits.length) return baseResult;
+  if (whamOnly) {
+    return {
+      ...authoritativeResult,
+      normalizedLimits: authoritative.limits,
+      normalizedCards: authoritative.cards
+    };
+  }
   return {
     ...baseResult,
-    normalizedLimits: reconcileNormalizedLimits(base.limits, authoritative.limits, false),
+    normalizedLimits: mergeAuthoritativeLimits(base.limits, authoritative.limits),
     normalizedCards: base.cards.length ? base.cards : authoritative.cards
   };
 }
@@ -3128,6 +3347,7 @@ function mergeAuthoritativeRateLimitResult(baseResult, authoritativeResult) {
 function checkAuthIdentity() {
   const next = readAuthIdentity();
   if (next === null) return;
+  refreshQuotaSourcePolicy();
   if (authIdentity === null) {
     authIdentity = next;
     return;
@@ -3159,9 +3379,13 @@ function startAuthMonitoring() {
   stopAuthMonitoring();
   const home = codexHomeRoot();
   authIdentity = readAuthIdentity();
+  refreshQuotaSourcePolicy();
   try {
     authWatcher = fs.watch(home, (_event, filename) => {
-      if (!filename || String(filename).toLowerCase() === "auth.json") scheduleAuthIdentityCheck();
+      const changed = String(filename || "").toLowerCase();
+      if (!filename || changed === "auth.json" || changed === ".cockpit_codex_auth.json") {
+        scheduleAuthIdentityCheck();
+      }
     });
     authWatcher.on("error", () => {
       if (authWatcher) authWatcher.close();
@@ -3191,6 +3415,9 @@ async function performAccountTransition(restartRPC) {
   }
   accountReloadInFlight = true;
   accountGeneration += 1;
+  invalidateConfirmedQuotaScope();
+  whamScopeRejectedGeneration = null;
+  refreshQuotaSourcePolicy();
   lastAcceptedLimitsAt = 0;
   clearTimeout(refreshTimer);
   clearTimeout(limitsNotificationRefreshTimer);
@@ -3276,9 +3503,19 @@ function normalizeTask(result) {
 }
 
 async function refreshAccount() {
-  if (!rpc) return;
+  const client = rpc;
+  const generation = accountGeneration;
+  if (!client) return false;
+  const credentials = readCodexCredentials();
+  const scopeIdentity = readAuthIdentity();
+  if (scopeIdentity === null) return false;
+  refreshQuotaSourcePolicy(credentials);
   try {
-    const account = normalizeAccount(await rpc.request("account/read", { refreshToken: false }));
+    const account = normalizeAccount(
+      await client.request("account/read", { refreshToken: false }),
+      credentials?.cockpitAccount || null
+    );
+    if (client !== rpc || generation !== accountGeneration || scopeIdentity !== readAuthIdentity()) return false;
     const previousIdentity = `${state.account?.auth || ""}:${state.account?.email || ""}`;
     const nextIdentity = `${account.auth || ""}:${account.email || ""}`;
     // "—" is the startup placeholder; every other auth value represents a
@@ -3287,6 +3524,8 @@ async function refreshAccount() {
     const changed = hadKnownAccount && previousIdentity !== nextIdentity;
     if (changed) {
       accountGeneration += 1;
+      invalidateConfirmedQuotaScope();
+      whamScopeRejectedGeneration = null;
       lastAcceptedLimitsAt = 0;
     }
     publish(changed
@@ -3298,13 +3537,26 @@ async function refreshAccount() {
           usage: deviceLocalUsageSnapshot(state.usage)
         }
       : { account });
+    // For a Cockpit override, the desktop-selected identity has already been
+    // established locally; only Wham can confirm its quota. For normal mode,
+    // this successful account/read authorizes the matching RPC scope.
+    confirmedAccountGeneration = accountGeneration;
+    confirmedQuotaScopeIdentity = scopeIdentity;
+    return true;
   }
-  catch (error) { publish({ message: error.message }); }
+  catch (error) {
+    if (client === rpc && generation === accountGeneration) {
+      publish({ message: error.message });
+    }
+    return false;
+  }
 }
 
 function refreshLimits() {
   if (!rpc) return Promise.resolve();
-  if (limitsRefreshPromise) {
+  if (limitsRefreshPromise
+      && limitsRefreshGeneration === accountGeneration
+      && limitsRefreshClient === rpc) {
     limitsRefreshQueued = true;
     return limitsRefreshPromise;
   }
@@ -3312,37 +3564,94 @@ function refreshLimits() {
   const client = rpc;
   const generation = accountGeneration;
   const requestedAt = Date.now();
+  const credentials = readCodexCredentials();
+  const whamOnly = refreshQuotaSourcePolicy(credentials);
+  const scopeIdentity = readAuthIdentity();
   limitsRefreshInFlight = true;
-  limitsRefreshPromise = (async () => {
+  limitsRefreshGeneration = generation;
+  limitsRefreshClient = client;
+  let refreshPromise;
+  refreshPromise = (async () => {
     try {
       const [rpcResult, directResult] = await Promise.allSettled([
-        client.request("account/rateLimits/read", {}, 25000),
-        fetchWhamUsageRateLimits()
+        whamOnly
+          ? Promise.resolve(null)
+          : client.request("account/rateLimits/read", {}, 25000),
+        fetchWhamUsageRateLimits(credentials)
       ]);
+      // Both direct and app-server responses were started under this exact
+      // identity. Never select either after the desktop account changed.
+      if (scopeIdentity === null || scopeIdentity !== readAuthIdentity()) return;
+      const direct = directResult.status === "fulfilled" ? directResult.value : null;
+      const directScopeRejected = Boolean(
+        direct?.scopeRejected
+          && direct.scopeIdentity === scopeIdentity
+          && scopeIdentity === readAuthIdentity()
+      );
+      if (directScopeRejected) {
+        if (client === rpc && generation === accountGeneration) {
+          rejectWhamScope(generation);
+        }
+        return;
+      }
+      const directPayload = direct
+        && direct.scopeIdentity === scopeIdentity
+        && scopeIdentity === readAuthIdentity()
+        ? direct.payload
+        : null;
+      if (whamOnly && !directPayload) {
+        if (client === rpc && generation === accountGeneration) {
+          clearUntrustedQuota(generation, "当前 Codex 桌面账号额度暂不可用，正在重试…");
+        }
+        return;
+      }
       if (rpcResult.status === "rejected"
-          && (directResult.status !== "fulfilled" || !directResult.value)) {
+          && !directPayload) {
         throw rpcResult.reason;
       }
       if (client !== rpc || generation !== accountGeneration) return;
-      const result = mergeAuthoritativeRateLimitResult(
-        rpcResult.status === "fulfilled" ? rpcResult.value : {},
-        directResult.status === "fulfilled" ? directResult.value : null
-      );
-      applyRateLimitPayload(result, { acceptedAt: requestedAt, merge: false });
+      if (directPayload && whamScopeRejectedGeneration === generation) {
+        whamScopeRejectedGeneration = null;
+        refreshQuotaSourcePolicy(credentials);
+      }
+      const result = directPayload
+        ? mergeAuthoritativeRateLimitResult(
+            rpcResult.status === "fulfilled" ? rpcResult.value : {},
+            directPayload,
+            whamOnly
+          )
+        : rpcResult.status === "fulfilled" ? rpcResult.value : null;
+      if (!result) return;
+      applyRateLimitPayload(result, {
+        acceptedAt: requestedAt,
+        merge: false,
+        source: directPayload ? "wham" : "rpc",
+        scopeGeneration: generation,
+        authScopeIdentity: scopeIdentity,
+        authoritative: Boolean(directPayload)
+      });
     } catch (error) {
       if (client === rpc && generation === accountGeneration) {
+        if (whamOnly) {
+          clearUntrustedQuota(generation, "当前 Codex 桌面账号额度暂不可用，正在重试…");
+          return;
+        }
         publish({ message: `额度刷新失败：${error.message}` });
       }
     }
   })().finally(() => {
+    if (limitsRefreshPromise !== refreshPromise) return;
     limitsRefreshPromise = null;
+    limitsRefreshGeneration = null;
+    limitsRefreshClient = null;
     limitsRefreshInFlight = false;
     if (limitsRefreshQueued) {
       limitsRefreshQueued = false;
       scheduleRateLimitsRefresh(0);
     }
   });
-  return limitsRefreshPromise;
+  limitsRefreshPromise = refreshPromise;
+  return refreshPromise;
 }
 
 async function refreshUsage() {

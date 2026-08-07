@@ -2,13 +2,24 @@ import Foundation
 
 /// Map official app-server wire types → domain models
 enum ProtocolMapper {
-    static func account(from wire: WireGetAccountResponse, cliVersion: String? = nil) -> AccountInfo {
+    static func account(
+        from wire: WireGetAccountResponse,
+        cliVersion: String? = nil,
+        accountScopeID: String? = nil,
+        activeDesktopEmail: String? = nil
+    ) -> AccountInfo {
+        let normalizedDesktopEmail = activeDesktopEmail?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let desktopEmail = normalizedDesktopEmail?.isEmpty == false
+            ? normalizedDesktopEmail
+            : nil
         guard let acc = wire.account else {
             return AccountInfo(
-                email: nil,
+                email: desktopEmail,
+                accountScopeID: accountScopeID,
                 planType: .unknown,
-                authMode: .none,
-                isLoggedIn: false,
+                authMode: desktopEmail == nil ? .none : .chatGPT,
+                isLoggedIn: desktopEmail != nil,
                 workspaceName: nil,
                 cliVersion: cliVersion,
                 lastSyncedAt: Date()
@@ -18,6 +29,7 @@ enum ProtocolMapper {
         case .apiKey:
             return AccountInfo(
                 email: nil,
+                accountScopeID: accountScopeID,
                 planType: .unknown,
                 authMode: .apiKey,
                 isLoggedIn: true,
@@ -27,7 +39,8 @@ enum ProtocolMapper {
             )
         case .chatgpt(let email, let plan):
             return AccountInfo(
-                email: email,
+                email: desktopEmail ?? email,
+                accountScopeID: accountScopeID,
                 planType: mapPlan(plan),
                 authMode: .chatGPT,
                 isLoggedIn: true,
@@ -38,6 +51,7 @@ enum ProtocolMapper {
         case .amazonBedrock:
             return AccountInfo(
                 email: nil,
+                accountScopeID: accountScopeID,
                 planType: .unknown,
                 authMode: .apiKey,
                 isLoggedIn: true,
@@ -47,10 +61,11 @@ enum ProtocolMapper {
             )
         case .unknown:
             return AccountInfo(
-                email: nil,
+                email: desktopEmail,
+                accountScopeID: accountScopeID,
                 planType: .unknown,
-                authMode: .none,
-                isLoggedIn: wire.requiresOpenaiAuth == false,
+                authMode: desktopEmail == nil ? .none : .chatGPT,
+                isLoggedIn: desktopEmail != nil || wire.requiresOpenaiAuth == false,
                 workspaceName: nil,
                 cliVersion: cliVersion,
                 lastSyncedAt: Date()

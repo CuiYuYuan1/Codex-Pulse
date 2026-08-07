@@ -70,10 +70,6 @@ final class PulseStore {
     private var postTurnRefreshTask: Task<Void, Never>?
     private var localUsageRefreshTask: Task<Void, Never>?
     private var localUsageRefreshRevision = 0
-    /// 本地 session 额度只用于覆盖已经由当前账号远端确认过的桶。
-    /// 单独保存已接受的桶，防止慢 RPC 完成后把更新的本地百分比写回旧值。
-    private var latestLocalRateLimitObservation: RateLimitSnapshot?
-    private var lastLocalRateLimitEventAt: Date = .distantPast
     private var reconnectTask: Task<Void, Never>?
     private var reconnectRecoveryID: UUID?
     private var startupDataRecoveryTask: Task<Void, Never>?
@@ -169,8 +165,6 @@ final class PulseStore {
         localUsageRefreshTask?.cancel()
         localUsageRefreshTask = nil
         localUsageRefreshRevision &+= 1
-        latestLocalRateLimitObservation = nil
-        lastLocalRateLimitEventAt = .distantPast
         authenticationReconnectTask?.cancel()
         authenticationReconnectRequested = false
         accountTransitionRecoveryTask?.cancel()
@@ -451,8 +445,6 @@ final class PulseStore {
                 threadTokenSampleTimes.removeAll()
                 smoothedTokenVelocity = nil
                 lastRealtimeVelocityAt = nil
-                latestLocalRateLimitObservation = nil
-                lastLocalRateLimitEventAt = .distantPast
                 notifiedThresholds.removeAll()
                 didRestoreNotifiedThresholds = false
                 PulseLog.write("account identity changed; quota cleared and device Token totals preserved")
@@ -1379,64 +1371,19 @@ final class PulseStore {
     }
 
     /// 活跃 Codex 进程会把本次响应附带的 rate_limits 写入 session JSONL。
-    /// 该值只更新当前账号已经由远端建立的桶，避免账号切换期间从历史会话自行建桶。
+    /// Session JSONL 没有账号归属。多账号切换后，旧会话可能继续写入与新账号
+    /// 相同 reset 周期的 99% used；若按“本地用量只增不减”合并，会把新账号
+    /// 56% 剩余错误压回 1%。因此账号额度只接受 app-server/wham 的可验证来源，
+    /// 本地 session 仍用于 Token、成本和任务状态，但不再覆盖额度。
     private func applyLocalRateLimitObservation(_ limits: RateLimitSnapshot) {
-        let observedAt = limits.updatedAt
-        guard observedAt != .distantPast, observedAt > lastLocalRateLimitEventAt else { return }
-
-        guard didStart,
-              !isAccountTransitioning,
-              confirmedAccountRevision == accountRevision,
-              snapshot.account.isLoggedIn,
-              snapshot.account.authMode == .chatGPT else {
-            return
-        }
-        lastLocalRateLimitEventAt = observedAt
-
-        // 启动时 session 文件事件可能比首次远端额度响应更早到达。先暂存，
-        // 等远端建立当前账号的桶后再按窗口和重置周期匹配，仍不允许本地自行建桶。
-        guard !snapshot.rateLimits.buckets.isEmpty else {
-            latestLocalRateLimitObservation = limits
-            return
-        }
-        guard let result = RateLimitFreshness.mergeLocal(
-            current: snapshot.rateLimits,
-            observation: limits
-        ) else {
-            return
-        }
-
-        latestLocalRateLimitObservation = result.acceptedObservation
-        let previous = snapshot
-        var next = previous
-        next.rateLimits = result.merged
-        next.updatedAt = Date()
-        apply(next)
-        evaluateAlerts(previous: previous, current: next)
-
-        let remaining = result.merged.primaryBucket.map {
-            String(format: "%.0f%%", $0.remainingPercent)
-        } ?? "—"
-        PulseLog.write("local session rateLimits applied: remaining=\(remaining)")
+        guard !limits.buckets.isEmpty else { return }
+        PulseLog.write("ignored unscoped local session rateLimits to protect active account quota")
     }
 
-    /// 若远端请求发起后又收到了本地 session 额度，慢响应不能把新百分比覆盖回旧值。
-    /// 一次在本地事件之后才发起、且返回了更新快照的远端请求则重新成为权威源。
+    /// 额度仅接受已经按当前账号作用域验证的远端结果。保留集中入口，使完整刷新、
+    /// 轮询和通知路径都遵循同一条“不用无归属 session 覆盖额度”的规则。
     private func reconciledRemoteRateLimits(_ remote: RateLimitSnapshot) -> RateLimitSnapshot {
-        guard let local = latestLocalRateLimitObservation else { return remote }
-        // App Server 会给刚完成的 RPC 写入一个新的 updatedAt，即使后端返回的
-        // usedPercent 仍来自旧缓存，因此不能拿响应时间判断数据一定更新。同一
-        // resetsAt 周期始终保持 usedPercent 单调递增；只有远端进入新周期或
-        // 返回更高用量时，下面的 merge 才会拒绝本地覆盖并恢复远端权威。
-        guard let result = RateLimitFreshness.mergeLocal(
-            current: remote,
-            observation: local
-        ) else {
-            // 远端已经进入更新的周期或百分比更高时，应恢复远端权威。
-            latestLocalRateLimitObservation = nil
-            return remote
-        }
-        return result.merged
+        remote
     }
 
     /// refreshAll 在额度请求后还可能等待 usage；这段时间到达的事件必须保留下来。
@@ -1909,8 +1856,6 @@ final class PulseStore {
         localUsageRefreshTask?.cancel()
         localUsageRefreshTask = nil
         localUsageRefreshRevision &+= 1
-        latestLocalRateLimitObservation = nil
-        lastLocalRateLimitEventAt = .distantPast
         threadTokenTotals.removeAll()
         threadTokenSampleTimes.removeAll()
         smoothedTokenVelocity = nil
@@ -1948,6 +1893,7 @@ final class PulseStore {
             value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         }
         return lhs.authMode == rhs.authMode
+            && normalized(lhs.accountScopeID) == normalized(rhs.accountScopeID)
             && normalized(lhs.email) == normalized(rhs.email)
             && normalized(lhs.workspaceName) == normalized(rhs.workspaceName)
     }

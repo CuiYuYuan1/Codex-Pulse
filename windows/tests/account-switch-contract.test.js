@@ -93,5 +93,25 @@ assert(
   windowsMain.includes("generation !== accountGeneration"),
   "Windows stale account requests must be rejected"
 );
+assert(
+  windowsMain.includes('".cockpit_codex_auth.json"'),
+  "Windows must observe the selected Cockpit desktop account"
+);
+assert(
+  windowsMain.includes("requiresDesktopAuthority"),
+  "Windows must prefer the desktop account when token account_id is absent or differs"
+);
+assert(
+  windowsMain.includes("whamResponseMatchesAccount(result, activeCockpitAccountID)"),
+  "Windows must reject a Wham response for a different Cockpit account"
+);
+assert(
+  windowsMain.includes("if (scopeIdentity === null || scopeIdentity !== readAuthIdentity()) return;"),
+  "Windows must reject every in-flight quota response after the desktop account changes"
+);
+assert(
+  windowsMain.includes("confirmedQuotaScopeIdentity !== readAuthIdentity()"),
+  "Windows notifications must be bound to the currently confirmed account scope"
+);
 
 console.log("account switch contract: PASS");

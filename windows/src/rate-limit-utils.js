@@ -11,6 +11,81 @@ function windowValue(window, camel, snake, legacySnake = null) {
   return numberValue(window?.[camel] ?? window?.[snake] ?? (legacySnake ? window?.[legacySnake] : null));
 }
 
+function timestampValue(value) {
+  const direct = numberValue(value);
+  if (direct !== null) {
+    // Wham can return a Unix timestamp in either seconds or milliseconds.
+    return direct > 10_000_000_000 ? Math.round(direct / 1000) : direct;
+  }
+  if (typeof value !== "string") return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? Math.round(parsed / 1000) : null;
+}
+
+// Wham replies carry the account scope at the response root.  Keep this
+// parsing deliberately tiny and side-effect free so callers can reject an
+// unexpected response before it ever reaches persisted UI state.
+function whamResponseAccountID(result) {
+  const roots = [result, result?.data, result?.usage];
+  for (const root of roots) {
+    if (!root || typeof root !== "object") continue;
+    const value = root.accountID ?? root.accountId ?? root.account_id;
+    if (value === null || value === undefined) continue;
+    const accountID = String(value).trim();
+    if (accountID) return accountID;
+  }
+  return null;
+}
+
+function whamResponseMatchesAccount(result, activeAccountID) {
+  if (activeAccountID === null || activeAccountID === undefined) return true;
+  const expected = String(activeAccountID).trim();
+  if (!expected) return true;
+  const received = whamResponseAccountID(result);
+  return !received || received === expected;
+}
+
+function windowForRole(snapshot, role) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const camel = role === "primary" ? "primaryWindow" : "secondaryWindow";
+  const snake = role === "primary" ? "primary_window" : "secondary_window";
+  return snapshot[role] ?? snapshot[camel] ?? snapshot[snake] ?? null;
+}
+
+function windowDurationMins(window) {
+  const minutes = windowValue(
+    window,
+    "windowDurationMins",
+    "window_duration_mins",
+    "window_minutes"
+  );
+  if (minutes !== null) return minutes;
+  const seconds = numberValue(
+    window?.limitWindowSeconds
+      ?? window?.limit_window_seconds
+      ?? window?.windowDurationSeconds
+      ?? window?.window_duration_seconds
+  );
+  return seconds === null ? null : seconds / 60;
+}
+
+function windowUsedPercent(window) {
+  const used = numberValue(
+    window?.usedPercent
+      ?? window?.used_percent
+      ?? window?.usedPercentage
+      ?? window?.used_percentage
+  );
+  if (used !== null) return Math.min(100, Math.max(0, used));
+  const remaining = numberValue(
+    window?.remainingPercent
+      ?? window?.remaining_percent
+      ?? window?.remainingPercentage
+      ?? window?.remaining_percentage
+  );
+  return remaining === null ? 0 : Math.min(100, Math.max(0, 100 - remaining));
+}
+
 function snapshotWindows(snapshot, fallbackLimitID, sourcePriority) {
   if (!snapshot || typeof snapshot !== "object") return [];
   const limitID = String(
@@ -26,18 +101,10 @@ function snapshotWindows(snapshot, fallbackLimitID, sourcePriority) {
   const result = [];
 
   for (const [role, fallbackName] of [["primary", "每周用量"], ["secondary", "5 小时用量"]]) {
-    const window = snapshot?.[role];
+    const window = windowForRole(snapshot, role);
     if (!window || typeof window !== "object") continue;
-    const duration = windowValue(
-      window,
-      "windowDurationMins",
-      "window_duration_mins",
-      "window_minutes"
-    );
-    const used = Math.min(
-      100,
-      Math.max(0, windowValue(window, "usedPercent", "used_percent") || 0)
-    );
+    const duration = windowDurationMins(window);
+    const used = windowUsedPercent(window);
     const roundedDuration = Number.isFinite(duration) ? Math.round(duration) : null;
     const id = `${limitID}:${role}:${roundedDuration ?? "unknown"}`;
     const name = roundedDuration !== null && Math.abs(roundedDuration - 300) <= 5
@@ -53,7 +120,12 @@ function snapshotWindows(snapshot, fallbackLimitID, sourcePriority) {
       windowDurationMins: duration,
       usedPercent: used,
       remainingPercent: 100 - used,
-      resetsAt: windowValue(window, "resetsAt", "resets_at"),
+      resetsAt: timestampValue(
+        window?.resetsAt
+          ?? window?.resets_at
+          ?? window?.resetAt
+          ?? window?.reset_at
+      ),
       isLimitReached: Boolean(reached) || used >= 100,
       sourcePriority
     });
@@ -121,6 +193,23 @@ function normalizeLimits(result) {
       legacy,
       legacy.limitId ?? legacy.limit_id ?? "legacy",
       0
+    ));
+  }
+
+  // The desktop Cockpit /wham/usage response is not app-server shaped. Its
+  // rate_limit.primary_window uses seconds + reset_at instead of the normal
+  // primary.windowDurationMins + resetsAt envelope.
+  const whamRateLimit = result?.rateLimit
+    ?? result?.rate_limit
+    ?? result?.data?.rateLimit
+    ?? result?.data?.rate_limit
+    ?? result?.usage?.rateLimit
+    ?? result?.usage?.rate_limit;
+  if (whamRateLimit && typeof whamRateLimit === "object") {
+    collected.push(...snapshotWindows(
+      whamRateLimit,
+      whamRateLimit.limitId ?? whamRateLimit.limit_id ?? "codex",
+      40
     ));
   }
 
@@ -242,10 +331,32 @@ function mergeNormalizedLimits(existingLimits, updateResult) {
   );
 }
 
+// A direct authenticated Wham response identifies the account that owns the
+// quota. Unlike normal rolling updates, it must be allowed to lower used
+// percent within the same reset cycle after an account switch.
+function mergeAuthoritativeLimits(existingLimits, authoritativeLimits, retainUnmentioned = true) {
+  const existing = Array.isArray(existingLimits) ? existingLimits.filter(Boolean) : [];
+  const incoming = Array.isArray(authoritativeLimits) ? authoritativeLimits.filter(Boolean) : [];
+  if (!incoming.length) return retainUnmentioned ? finalizeLimits(existing) : [];
+
+  const result = retainUnmentioned
+    ? new Map(existing.map((limit) => [limit.id, { ...limit, headline: false }]))
+    : new Map();
+  for (const limit of incoming) {
+    const match = matchingLimit(existing, limit);
+    if (match && match.id !== limit.id) result.delete(match.id);
+    result.set(limit.id, { ...limit, headline: false });
+  }
+  return finalizeLimits([...result.values()]);
+}
+
 module.exports = {
   mergeNormalizedLimits,
+  mergeAuthoritativeLimits,
   normalizeLimits,
   primaryQuotaLimit,
   reconcileNormalizedLimits,
-  snapshotWindows
+  snapshotWindows,
+  whamResponseAccountID,
+  whamResponseMatchesAccount
 };

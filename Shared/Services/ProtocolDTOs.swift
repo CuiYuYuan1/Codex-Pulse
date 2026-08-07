@@ -107,8 +107,11 @@ enum RateLimitsWireParser {
         let root = (rawRoot["data"] as? [String: Any])
             ?? (rawRoot["result"] as? [String: Any])
             ?? rawRoot
+        // App Server 使用 rateLimits/rate_limits；Codex Desktop 的 wham/usage
+        // 则返回单数 rate_limit，且窗口字段采用 primary_window。两种都是
+        // 当前登录账号的权威额度，不能因字段风格不同而退回历史缓存。
         let single = parseSnapshot(
-            firstDictionary(root, keys: ["rateLimits", "rate_limits"])
+            firstDictionary(root, keys: ["rateLimits", "rate_limits", "rateLimit", "rate_limit"])
         )
         var byId: [String: WireRateLimitSnapshot] = [:]
         if let map = firstDictionary(root, keys: ["rateLimitsByLimitId", "rate_limits_by_limit_id"]) {
@@ -133,8 +136,16 @@ enum RateLimitsWireParser {
         return WireRateLimitSnapshot(
             limitId: string(dict["limitId"] ?? dict["limit_id"]),
             limitName: string(dict["limitName"] ?? dict["limit_name"]),
-            primary: parseWindow(dict["primary"] as? [String: Any]),
-            secondary: parseWindow(dict["secondary"] as? [String: Any]),
+            primary: parseWindow(
+                (dict["primary"] as? [String: Any])
+                    ?? (dict["primary_window"] as? [String: Any])
+                    ?? (dict["primaryWindow"] as? [String: Any])
+            ),
+            secondary: parseWindow(
+                (dict["secondary"] as? [String: Any])
+                    ?? (dict["secondary_window"] as? [String: Any])
+                    ?? (dict["secondaryWindow"] as? [String: Any])
+            ),
             credits: parseCredits(dict["credits"] as? [String: Any]),
             planType: string(dict["planType"] ?? dict["plan_type"]),
             rateLimitReachedType: {
@@ -154,12 +165,28 @@ enum RateLimitsWireParser {
         guard let dict else { return nil }
         return WireRateLimitWindow(
             usedPercent: number(dict["usedPercent"] ?? dict["used_percent"]),
-            windowDurationMins: number(
-                dict["windowDurationMins"]
-                    ?? dict["window_duration_mins"]
-                    ?? dict["window_minutes"]
-            ),
-            resetsAt: number(dict["resetsAt"] ?? dict["resets_at"])
+            windowDurationMins: {
+                if let minutes = number(
+                    dict["windowDurationMins"]
+                        ?? dict["window_duration_mins"]
+                        ?? dict["window_minutes"]
+                ) {
+                    return minutes
+                }
+                if let seconds = number(
+                    dict["limit_window_seconds"]
+                        ?? dict["window_duration_seconds"]
+                        ?? dict["window_seconds"]
+                ) {
+                    return seconds / 60
+                }
+                return nil
+            }(),
+            resetsAt: number(
+                dict["resetsAt"]
+                    ?? dict["resets_at"]
+                    ?? dict["reset_at"]
+            )
         )
     }
 

@@ -1,6 +1,6 @@
 {
   "name": "codex-pulse-windows",
-  "version": "0.1.38",
+  "version": "0.1.39",
   "private": true,
   "description": "Codex-Pulse for Windows",
   "main": "src/main.js",

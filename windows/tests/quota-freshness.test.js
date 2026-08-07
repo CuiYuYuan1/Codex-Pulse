@@ -2,10 +2,12 @@
 
 const assert = require("assert");
 const {
+  mergeAuthoritativeLimits,
   mergeNormalizedLimits,
   normalizeLimits,
   primaryQuotaLimit,
-  reconcileNormalizedLimits
+  reconcileNormalizedLimits,
+  whamResponseMatchesAccount
 } = require("../src/rate-limit-utils");
 
 const resetAt = 1_786_003_200;
@@ -101,6 +103,60 @@ const localSnakeCase = {
 };
 const locallyMerged = mergeNormalizedLimits(normalized.limits, localSnakeCase);
 assert.strictEqual(primaryQuotaLimit(locallyMerged).remainingPercent, 2);
+
+const cockpitWham = {
+  account_id: "desktop-current-account",
+  rate_limit: {
+    limit_id: "codex",
+    primary_window: {
+      used_percent: 44,
+      limit_window_seconds: 604_800,
+      reset_at: resetAt
+    }
+  }
+};
+const cockpitWhamNormalized = normalizeLimits(cockpitWham);
+assert.strictEqual(cockpitWhamNormalized.limits.length, 1);
+assert.strictEqual(primaryQuotaLimit(cockpitWhamNormalized.limits).remainingPercent, 56);
+assert.strictEqual(primaryQuotaLimit(cockpitWhamNormalized.limits).windowDurationMins, 10_080);
+assert.strictEqual(primaryQuotaLimit(cockpitWhamNormalized.limits).resetsAt, resetAt);
+assert.strictEqual(
+  whamResponseMatchesAccount(cockpitWham, "desktop-current-account"),
+  true,
+  "a Wham root account_id must be accepted for the active Cockpit account"
+);
+assert.strictEqual(
+  whamResponseMatchesAccount(cockpitWham, "previous-account"),
+  false,
+  "a Wham root account_id for a previous account must be rejected"
+);
+assert.strictEqual(
+  whamResponseMatchesAccount({ accountId: "desktop-current-account" }, "desktop-current-account"),
+  true,
+  "camel-case Wham accountId must remain compatible"
+);
+
+const oldAccountExhausted = normalizeLimits({
+  rateLimitsByLimitId: {
+    codex: {
+      limitId: "codex",
+      primary: {
+        usedPercent: 99,
+        windowDurationMins: 10_080,
+        resetsAt: resetAt
+      }
+    }
+  }
+}).limits;
+const currentAccountAuthoritative = mergeAuthoritativeLimits(
+  oldAccountExhausted,
+  cockpitWhamNormalized.limits
+);
+assert.strictEqual(
+  primaryQuotaLimit(currentAccountAuthoritative).remainingPercent,
+  56,
+  "a direct current-account response must replace old-account 1% within the same reset cycle"
+);
 
 const whamUsage = {
   rate_limits_by_limit_id: {

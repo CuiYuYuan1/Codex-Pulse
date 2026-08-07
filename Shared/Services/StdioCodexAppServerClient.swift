@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 #if os(macOS)
 import AppKit
@@ -155,13 +156,16 @@ private final class CodexAuthenticationFileWatcher: @unchecked Sendable {
     }
 
     private struct FileState: Equatable {
-        let signature: Signature?
+        let cliAuth: Signature?
+        /// Codex Desktop 会把当前选中的账号写入此文件；它不含 access token，
+        /// 但可能比 auth.json 更早完成切号。
+        let desktopAccount: Signature?
     }
 
     private let queue = DispatchQueue(label: "com.codexpulse.auth-watcher", qos: .utility)
     private let onChange: @Sendable () -> Void
     private var timer: DispatchSourceTimer?
-    private var authURL: URL?
+    private var codexHomeURL: URL?
     private var lastState: FileState?
     private var pendingState: FileState?
 
@@ -179,10 +183,9 @@ private final class CodexAuthenticationFileWatcher: @unchecked Sendable {
                 ?? FileManager.default.homeDirectoryForCurrentUser
                     .appendingPathComponent(".codex", isDirectory: true).path
             let expandedRoot = NSString(string: root).expandingTildeInPath
-            let url = URL(fileURLWithPath: expandedRoot, isDirectory: true)
-                .appendingPathComponent("auth.json", isDirectory: false)
-            self.authURL = url
-            self.lastState = FileState(signature: self.signature(of: url))
+            let rootURL = URL(fileURLWithPath: expandedRoot, isDirectory: true)
+            self.codexHomeURL = rootURL
+            self.lastState = self.state(in: rootURL)
             self.pendingState = nil
 
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
@@ -207,14 +210,14 @@ private final class CodexAuthenticationFileWatcher: @unchecked Sendable {
     private func stopLocked() {
         timer?.cancel()
         timer = nil
-        authURL = nil
+        codexHomeURL = nil
         lastState = nil
         pendingState = nil
     }
 
     private func poll() {
-        guard let authURL else { return }
-        let next = FileState(signature: signature(of: authURL))
+        guard let codexHomeURL else { return }
+        let next = state(in: codexHomeURL)
         guard let lastState else {
             self.lastState = next
             return
@@ -250,6 +253,13 @@ private final class CodexAuthenticationFileWatcher: @unchecked Sendable {
         )
     }
 
+    private func state(in codexHome: URL) -> FileState {
+        FileState(
+            cliAuth: signature(of: codexHome.appendingPathComponent("auth.json", isDirectory: false)),
+            desktopAccount: signature(of: codexHome.appendingPathComponent(".cockpit_codex_auth.json", isDirectory: false))
+        )
+    }
+
     /// FNV-1a 仅用于变更比较；认证内容不会离开当前进程。
     private static func fingerprint(_ data: Data) -> UInt64 {
         var value: UInt64 = 14_695_981_039_346_656_037
@@ -270,7 +280,54 @@ private final class CodexAuthenticationFileWatcher: @unchecked Sendable {
 
 private struct CodexLocalCredentials: Sendable {
     let accessToken: String
+    /// auth.json 中与 access token 配对的账号；仅用于判断 Desktop 是否切换到了另一账号。
+    let tokenAccountID: String?
+    /// 当前 Codex Desktop 选中的账号。Desktop metadata 优先于旧 CLI auth.json，
+    /// 使 wham 请求和本机展示与用户正在使用的 Codex 账号一致。
     let accountID: String?
+    let accountScopeID: String?
+    let desktopEmail: String?
+
+    var requiresDesktopAuthority: Bool {
+        // auth.json 尚未写入 account_id 时，仍应优先信任 Cockpit 已选中的
+        // Desktop 账号；否则 app-server 可能继续返回上一个账号的额度。
+        guard let accountID else { return false }
+        return accountID != tokenAccountID
+    }
+}
+
+/// Codex Desktop 的账号选择元数据。该文件不含 token；这里只读取账号作用域以
+/// 隔离缓存和旧会话事件，绝不输出原始 account_id。
+private struct CodexDesktopAccountMetadata: Sendable {
+    let accountID: String?
+    let email: String?
+
+    static func read(from codexHome: URL) -> Self? {
+        let url = codexHome.appendingPathComponent(".cockpit_codex_auth.json", isDirectory: false)
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let accountID = normalized(root["account_id"] ?? root["accountId"])
+        let email = normalized(root["email"])
+        guard accountID != nil || email != nil else { return nil }
+        return Self(accountID: accountID, email: email)
+    }
+
+    private static func normalized(_ value: Any?) -> String? {
+        let raw: String?
+        switch value {
+        case let string as String:
+            raw = string
+        case let number as NSNumber:
+            raw = number.stringValue
+        default:
+            raw = nil
+        }
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 }
 
 private struct ResetCreditDetailsResponse: Sendable {
@@ -301,13 +358,23 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
     private var serverCodexHome: String?
     private var cliVersionHint: String?
     private let cacheQueue = DispatchQueue(label: "com.codexpulse.appserver.cache")
-    private var rateLimitsCache: (value: RateLimitSnapshot, fetchedAt: Date)?
+    private var rateLimitsCache: (
+        value: RateLimitSnapshot,
+        fetchedAt: Date,
+        accountScopeID: String?
+    )?
     private var usageCache: (value: UsageStats, fetchedAt: Date, dayKey: String)?
-    private var resetCreditDetailsCache: (value: ResetCreditDetailsResponse, fetchedAt: Date)?
+    private var resetCreditDetailsCache: (
+        value: ResetCreditDetailsResponse,
+        fetchedAt: Date,
+        accountScopeID: String?
+    )?
     /// 最近一次 thread/list 返回的线程顺序，供不走 RPC 的实时本地状态通道定位旧会话文件。
     private var recentThreadIDs: [String] = []
     private var rateLimitsRetryAfter: Date?
     private var rateLimitsFailureCount = 0
+    /// 退避同样必须按账号隔离；否则 A 账号的临时失败会让 B 账号继续沿用旧额度。
+    private var rateLimitsRetryScopeID: String?
     /// 高频今日指标与全历史汇总使用独立 actor，避免首次历史扫描占住串行队列，
     /// 导致缓存命中率和今日成本虽然已收到文件事件却迟迟不能显示。
     private let realtimeLocalUsageReader = LocalCodexUsageReader()
@@ -462,26 +529,38 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
     func readAccount() async throws -> AccountInfo {
         let data = try await rpcRaw(method: "account/read", params: ["refreshToken": false])
         let wire = try decode(WireGetAccountResponse.self, from: data)
-        return ProtocolMapper.account(from: wire, cliVersion: cliVersionHint)
+        let credentials = try? readCodexCredentials()
+        return ProtocolMapper.account(
+            from: wire,
+            cliVersion: cliVersionHint,
+            accountScopeID: credentials?.accountScopeID,
+            activeDesktopEmail: credentials?.desktopEmail
+        )
     }
 
     func readRateLimits(forceRefresh: Bool) async throws -> RateLimitSnapshot {
+        let scopeID = currentAccountScopeID()
         if !forceRefresh {
-            if let cached = cachedRateLimits(maxAge: rateLimitsCacheTTL) {
+            if let cached = cachedRateLimits(maxAge: rateLimitsCacheTTL, accountScopeID: scopeID) {
                 PulseLog.write("rateLimits cache hit")
                 return cached
             }
-            if isRateLimitsBackoffActive() {
+            if isRateLimitsBackoffActive(accountScopeID: scopeID) {
                 throw CodexServerError.requestDeferred
             }
         }
 
         do {
             let limits = try await fetchRateLimitsWithRetry()
-            storeRateLimitsCache(limits)
+            // 切号恰好发生在请求过程中时，旧响应无权进入新账号缓存。
+            guard scopeID == currentAccountScopeID() else {
+                invalidateAccountScopedState()
+                throw CodexServerError.requestDeferred
+            }
+            storeRateLimitsCache(limits, accountScopeID: scopeID)
             return limits
         } catch {
-            let delay = deferRateLimitsRetry()
+            let delay = deferRateLimitsRetry(accountScopeID: scopeID)
             PulseLog.write("rateLimits remote retry deferred for \(Int(delay))s")
             throw error
         }
@@ -515,6 +594,24 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
         // 两个请求并发进行，明细失败不会拖垮或覆盖主额度数据。
         async let resetCreditDetails = readResetCreditDetailsSafely()
         async let directUsageLimits = readWhamUsageRateLimitsSafely()
+
+        // Codex Desktop 与 CLI auth.json 的账号不一致时，独立 app-server 仍可能
+        // 持有上一个账号的凭据。此时只接受按 Desktop 当前 account_id 发出的
+        // wham/usage 结果，宁可短暂显示同步中，也不能把旧账号额度继续展示。
+        let requiresDesktopAuthority = (try? readCodexCredentials())?.requiresDesktopAuthority == true
+        if requiresDesktopAuthority {
+            guard var direct = await directUsageLimits, !direct.buckets.isEmpty else {
+                throw CodexServerError.requestDeferred
+            }
+            if let details = await resetCreditDetails,
+               let cards = details.cards,
+               !cards.isEmpty || details.availableCount == 0 {
+                direct.resetCards = cards
+            }
+            PulseLog.write("rateLimits accepted from active Codex Desktop account")
+            return direct
+        }
+
         let data: Data
         do {
             data = try await rpcRaw(
@@ -643,6 +740,7 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
             resetCreditDetailsCache = nil
             rateLimitsRetryAfter = nil
             rateLimitsFailureCount = 0
+            rateLimitsRetryScopeID = nil
         }
         cancelPendingAccountRequests()
         PulseLog.write("account-scoped caches and rate-limit backoff cleared")
@@ -712,17 +810,26 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
     /// 官方 App Server 汇总仅返回 availableCount。此处复用 Codex 本地登录凭据访问
     /// ChatGPT 官方桌面端使用的明细接口，不读取浏览器 Cookie，也不记录任何令牌。
     private func readResetCreditDetailsSafely() async -> ResetCreditDetailsResponse? {
-        if let cached = cachedResetCreditDetails(maxAge: resetCreditDetailsCacheTTL) {
+        let scopeID = currentAccountScopeID()
+        if let cached = cachedResetCreditDetails(
+            maxAge: resetCreditDetailsCacheTTL,
+            accountScopeID: scopeID
+        ) {
             return cached
         }
 
         do {
             let details = try await fetchResetCreditDetails()
-            storeResetCreditDetails(details)
+            // 与主额度相同：请求期间切号时，旧卡片也不能进入新账号缓存。
+            guard scopeID == currentAccountScopeID() else { return nil }
+            storeResetCreditDetails(details, accountScopeID: scopeID)
             return details
         } catch {
             PulseLog.write("reset credit details unavailable: \(error.localizedDescription)")
-            return cachedResetCreditDetails(maxAge: .greatestFiniteMagnitude)
+            return cachedResetCreditDetails(
+                maxAge: .greatestFiniteMagnitude,
+                accountScopeID: scopeID
+            )
         }
     }
 
@@ -793,6 +900,20 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
             }
             throw CodexServerError.invalidResponse("wham usage HTTP \(http.statusCode)")
         }
+        // 只要响应给出了 account_id，就必须与当前选中账号一致。Desktop 与
+        // auth.json 不一致时更严格：缺少该标识也不接受，避免旧凭据的 HTTP 200
+        // 响应重新写回新账号 UI。
+        let responseAccountID = Self.whamResponseAccountID(from: data)
+        if let expectedAccountID = credentials.accountID,
+           let receivedAccountID = responseAccountID,
+           receivedAccountID != expectedAccountID {
+            throw CodexServerError.invalidResponse("wham usage account scope mismatch")
+        }
+        if credentials.requiresDesktopAuthority,
+           credentials.accountID != nil,
+           responseAccountID == nil {
+            throw CodexServerError.invalidResponse("wham usage account scope mismatch")
+        }
         let wire = try RateLimitsWireParser.parse(data)
         let snapshot = ProtocolMapper.rateLimits(from: wire)
         guard !snapshot.buckets.isEmpty else {
@@ -860,12 +981,7 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
     }
 
     private func readCodexCredentials() throws -> CodexLocalCredentials {
-        let codexHome: URL
-        if let serverCodexHome, !serverCodexHome.isEmpty {
-            codexHome = URL(fileURLWithPath: serverCodexHome)
-        } else {
-            codexHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
-        }
+        let codexHome = resolvedCodexHome()
         let authURL = codexHome.appendingPathComponent("auth.json")
         let data = try Data(contentsOf: authURL, options: .mappedIfSafe)
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -874,10 +990,67 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
               !accessToken.isEmpty else {
             throw CodexServerError.unauthorized
         }
+
+        let tokenAccountID = Self.normalizedAccountIdentifier(
+            tokens["account_id"] ?? tokens["accountId"]
+        )
+        let desktop = CodexDesktopAccountMetadata.read(from: codexHome)
+        let activeAccountID = desktop?.accountID ?? tokenAccountID
         return CodexLocalCredentials(
             accessToken: accessToken,
-            accountID: tokens["account_id"] as? String
+            tokenAccountID: tokenAccountID,
+            accountID: activeAccountID,
+            // 没有账号 ID 时不以 access token 派生可持久化标识，避免把认证材料的
+            // 摘要写进共享状态；此时让缓存 scope 为 nil，并依靠认证文件变更失效。
+            accountScopeID: activeAccountID.map(Self.accountScopeID(for:)),
+            desktopEmail: desktop?.email
         )
+    }
+
+    private func resolvedCodexHome() -> URL {
+        if let serverCodexHome, !serverCodexHome.isEmpty {
+            return URL(fileURLWithPath: serverCodexHome, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex", isDirectory: true)
+    }
+
+    /// 每次额度读取前轻量比较当前本地账号作用域。值仅用于进程内/共享快照的
+    /// 隔离，使用 SHA-256 截断摘要，不会保存或输出原始 account_id/token。
+    private func currentAccountScopeID() -> String? {
+        (try? readCodexCredentials())?.accountScopeID
+    }
+
+    private static func normalizedAccountIdentifier(_ value: Any?) -> String? {
+        let raw: String?
+        switch value {
+        case let string as String:
+            raw = string
+        case let number as NSNumber:
+            raw = number.stringValue
+        default:
+            raw = nil
+        }
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func accountScopeID(for material: String) -> String {
+        let digest = SHA256.hash(data: Data(material.utf8))
+        return digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// wham/usage 的当前结构在顶层给出 account_id。只在 Desktop 与 CLI
+    /// 账号不一致时强制校验，避免无账号标记的旧兼容响应影响正常单账号使用。
+    private static func whamResponseAccountID(from data: Data) -> String? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let payload = (root["data"] as? [String: Any])
+            ?? (root["result"] as? [String: Any])
+            ?? root
+        return normalizedAccountIdentifier(payload["account_id"] ?? payload["accountId"])
     }
 
     private static func parseResetCreditDetails(_ data: Data) throws -> ResetCreditDetailsResponse {
@@ -963,17 +1136,24 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
         }
     }
 
-    private func cachedResetCreditDetails(maxAge: TimeInterval) -> ResetCreditDetailsResponse? {
+    private func cachedResetCreditDetails(
+        maxAge: TimeInterval,
+        accountScopeID: String?
+    ) -> ResetCreditDetailsResponse? {
         cacheQueue.sync {
             guard let cache = resetCreditDetailsCache,
+                  cache.accountScopeID == accountScopeID,
                   Date().timeIntervalSince(cache.fetchedAt) <= maxAge else { return nil }
             return cache.value
         }
     }
 
-    private func storeResetCreditDetails(_ details: ResetCreditDetailsResponse) {
+    private func storeResetCreditDetails(
+        _ details: ResetCreditDetailsResponse,
+        accountScopeID: String?
+    ) {
         cacheQueue.sync {
-            resetCreditDetailsCache = (details, Date())
+            resetCreditDetailsCache = (details, Date(), accountScopeID)
         }
     }
 
@@ -1162,31 +1342,49 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
         }
     }
 
-    private func cachedRateLimits(maxAge: TimeInterval) -> RateLimitSnapshot? {
+    private func cachedRateLimits(
+        maxAge: TimeInterval,
+        accountScopeID: String?
+    ) -> RateLimitSnapshot? {
         cacheQueue.sync {
             guard let cache = rateLimitsCache,
+                  cache.accountScopeID == accountScopeID,
                   Date().timeIntervalSince(cache.fetchedAt) <= maxAge else { return nil }
             return cache.value
         }
     }
 
-    private func storeRateLimitsCache(_ limits: RateLimitSnapshot) {
+    private func storeRateLimitsCache(
+        _ limits: RateLimitSnapshot,
+        accountScopeID: String?
+    ) {
         cacheQueue.sync {
-            rateLimitsCache = (limits, Date())
+            rateLimitsCache = (limits, Date(), accountScopeID)
             rateLimitsRetryAfter = nil
             rateLimitsFailureCount = 0
+            rateLimitsRetryScopeID = nil
         }
     }
 
-    private func isRateLimitsBackoffActive() -> Bool {
+    private func isRateLimitsBackoffActive(accountScopeID: String?) -> Bool {
         cacheQueue.sync {
+            guard rateLimitsRetryScopeID == accountScopeID else {
+                rateLimitsRetryAfter = nil
+                rateLimitsFailureCount = 0
+                rateLimitsRetryScopeID = nil
+                return false
+            }
             guard let retryAfter = rateLimitsRetryAfter else { return false }
             return retryAfter > Date()
         }
     }
 
-    private func deferRateLimitsRetry() -> TimeInterval {
+    private func deferRateLimitsRetry(accountScopeID: String?) -> TimeInterval {
         cacheQueue.sync {
+            if rateLimitsRetryScopeID != accountScopeID {
+                rateLimitsFailureCount = 0
+            }
+            rateLimitsRetryScopeID = accountScopeID
             rateLimitsFailureCount += 1
             let exponent = min(rateLimitsFailureCount - 1, 4)
             let delay = min(
@@ -1200,11 +1398,14 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
 
     private func mergeRateLimitsCache(_ incoming: RateLimitSnapshot) {
         guard !incoming.buckets.isEmpty else { return }
+        let currentScopeID = currentAccountScopeID()
         cacheQueue.sync {
-            guard let cached = rateLimitsCache else {
-                rateLimitsCache = (incoming, Date())
+            guard let cached = rateLimitsCache,
+                  cached.accountScopeID == currentScopeID else {
+                rateLimitsCache = (incoming, Date(), currentScopeID)
                 rateLimitsRetryAfter = nil
                 rateLimitsFailureCount = 0
+                rateLimitsRetryScopeID = nil
                 return
             }
 
@@ -1225,9 +1426,10 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
                     : incoming.resetCards,
                 updatedAt: Date()
             )
-            rateLimitsCache = (merged, Date())
+            rateLimitsCache = (merged, Date(), currentScopeID)
             rateLimitsRetryAfter = nil
             rateLimitsFailureCount = 0
+            rateLimitsRetryScopeID = nil
         }
     }
 
@@ -1382,6 +1584,12 @@ final class StdioCodexAppServerClient: CodexAppServerClient, @unchecked Sendable
             eventContinuation?.yield(.accountUpdated)
 
         case "account/rateLimits/updated":
+            // Desktop 已切换到与 CLI auth.json 不同的账号时，旧 app-server
+            // 通知没有可验证的账号归属；只能等待带当前 account_id 的 wham 结果。
+            if (try? readCodexCredentials())?.requiresDesktopAuthority == true {
+                PulseLog.write("ignored unscoped app-server rate-limit notification after desktop account switch")
+                return
+            }
             if let rateLimits = params["rateLimits"] {
                 if let data = try? JSONSerialization.data(withJSONObject: ["rateLimits": rateLimits]),
                    let wire = try? RateLimitsWireParser.parse(data) {

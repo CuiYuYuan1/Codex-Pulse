@@ -3,6 +3,9 @@ import Foundation
 /// Codex 账号信息，对应 `account/read`
 struct AccountInfo: Codable, Equatable, Sendable {
     var email: String?
+    /// 账号作用域的不可逆标识，仅用于隔离本机缓存和晚到事件；绝不展示或记录原始 account_id。
+    /// 可选字段保证旧版共享快照仍可正常解码。
+    var accountScopeID: String? = nil
     var planType: PlanType
     var authMode: AuthMode
     var isLoggedIn: Bool
